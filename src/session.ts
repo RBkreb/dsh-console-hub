@@ -601,6 +601,12 @@ export class ConsoleSession {
     return this.status()
   }
 
+  /** Record that the reaper, not a caller, ended this console. */
+  recordIdleReap(): void {
+    this.lastError = { code: 'idle-timeout', message: 'the console was closed after sitting idle' }
+    this.record('system', 'reap', 'closed after the idle window elapsed')
+  }
+
   /** Release every resource; safe to call repeatedly. */
   async dispose(): Promise<void> {
     if (this.pagingTimer !== undefined) {
