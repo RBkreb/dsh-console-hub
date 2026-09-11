@@ -4,7 +4,9 @@
 用 Telnet 或 Raw TCP 连上设备的 console，做会话管理、命令交互与分页输出处理，
 并把配置管理放进侧边栏标签页，把模型侧能力收敛成 `console_*` 工具。
 
-> 状态：**PHASE 0（脚手架）**。本文件随每一步实现更新。
+> 状态：**Phase 0 完成**。宿主半与浏览器半均已落地，单元/集成用例与真机验收用例全部通过。
+> 真机验收（`pnpm test:live`）已在 DPtech 防火墙 `10.133.6.253:10003` 与交换机
+> `10.133.5.253:10015` 上跑通。
 
 ## 能力范围
 
@@ -24,6 +26,9 @@
 未安装时插件照常加载，只是不出现该标签页）。宿主半边不依赖 PTY，只用 `node:net` 打开 TCP 连接，
 因此不受 `node-pty` 原生依赖降级的影响。
 
+两个半边**不互相 import**：它们只在 `/dsh-console-hub/api` 这个路由上汇合
+（见 `src/hub-route.ts`）。浏览器包只允许 `require` `react` 与 `react/jsx-runtime`。
+
 ## 安装
 
 ```sh
@@ -32,11 +37,22 @@ dsh plugin --profile <profile> add link:D:\dsh-hub\dsh-console-hub
 
 host 半改动需要重启 Host；client 半由 `/plugins` 通道下发，刷新页面即可。
 
+### 插件行配置
+
+`cordis.yml` 的该插件行可配 `dsh-console-hub` 自己的宿主级参数：
+
+| 字段 | 默认 | 说明 |
+| --- | --- | --- |
+| `requestBodyLimitBytes` | `1048576` | 插件 API 单次请求体上限 |
+| `sessionIdleSweepMs` | `15000` | 空闲会话回收器与「延迟策略生效」检查的间隔 |
+| `trustedHosts` | `[]` | 非回环部署必须声明自己被访问的 `host:port`，否则 Host 栅栏会拒绝所有请求 |
+
 ## 开发
 
 ```sh
 pnpm install
-pnpm test        # vitest（宿主半 + 浏览器半）
+pnpm test        # vitest（宿主半 + 浏览器半），不含真机用例
+pnpm test:live   # 连真实设备验收（需 lab 网络可达）
 pnpm typecheck   # 两份 tsconfig：全量 + 纯浏览器声明面
 pnpm build       # lib/index.js + lib/client.js + lib/types
 ```
@@ -45,17 +61,42 @@ pnpm build       # lib/index.js + lib/client.js + lib/types
 > `net use` 来优化 realpath，受限环境里该子进程会被拒（EPERM）并让测试直接起不来。
 > 预载把这个纯环境探测短路掉，不影响任何被测逻辑。
 
-### 实时联调（可选）
+### 实时联调
 
-`tests/live/` 下的用例会连真实设备，默认不参与 `pnpm test`；设置 `DSH_CONSOLE_LIVE=1` 后单独运行。
+`tests/live/` 下的用例会连真实设备，默认**不参与** `pnpm test`：
+
+```sh
+pnpm test:live
+```
+
+`vitest.config.ts` 里对 `tests/live/**` 的排除是**有条件**的：vitest 无法把已被配置排除的
+文件再从命令行加回来，所以写死排除会让这套用例永远跑不了。`scripts/test-live.mjs` 在 vitest
+读取配置**之前**设置 `DSH_CONSOLE_LIVE=1`（Windows 上 shell 的 `VAR=1 cmd` 写法不可用）。
+
+## 真机实测结论（重要）
+
+实验室两台设备（DPtech 防火墙 / 交换机）**连接后只发 Telnet 协商字节，然后完全静默**：
+6 个字节 `IAC WILL ECHO` + `IAC WILL SGA`，没有 banner，也没有提示符，直到有按键才回应。
+按一次回车才会出现提示符（防火墙 `<DUT1>`、交换机 `<SWITCH>`）。
+
+因此插件提供了 `wakeOnConnect`（**默认关闭**）：仅当 banner 窗口内没等到任何提示符时，
+才补发一个回车。已经在连接时打过招呼的设备**不会**收到这个多余的按键
+（在某些 CLI 上回车是真实按键，会有副作用）。
+
+排查同类设备时可用：
+
+```sh
+node scripts/probe-console.mjs 10.133.6.253:10003 4   # 裸看字节
+node --import ./scripts/test-preload.mjs scripts/probe-live.mjs 10.133.6.253:10003 "show version"
+```
 
 ## 目录
 
 ```
-src/            宿主半（配置、凭据、编解码、会话、路由、模型工具）
-src/client/     浏览器半（侧边栏标签页、配置面板、控制台视图）
-tests/          与 src 镜像的用例；tests/live/ 为真实设备验收
-scripts/        构建/测试辅助脚本
+src/                  宿主半（配置、凭据、编解码、会话、路由、模型工具）
+src/client/           浏览器半（侧边栏标签页、配置面板、控制台视图）
+tests/                与 src 镜像的用例；tests/live/ 为真实设备验收
+scripts/              构建/测试辅助脚本（含真机探针）
 ```
 
 ## 安全说明
@@ -64,6 +105,8 @@ scripts/        构建/测试辅助脚本
   也可用环境变量引用（`DSH_CONSOLE_<RECORDID>`）覆盖；两者都不进入设置文档、HTTP 响应或工具返回值。
 - 高危指令拦截是**防护栏**而非沙箱：设备侧通常接受缩写（如 `conf`、`reboot`），
   建议同时在设备上限制权限。完整的指令正则与审批模式可在插件设置里调整。
+- 插件 API 与内置 `/api` 享受同一套 Host/Origin 栅栏；部署若组合了 connection seam，
+  其浏览器鉴权也会叠加在本插件路由之上。
 
 ## License
 
