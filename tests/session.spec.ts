@@ -316,6 +316,32 @@ describe('ConsoleSession paging', () => {
     }
   })
 
+  it('reports a pager the caller may act on via waitFor too', async () => {
+    const server = await startFakeConsole({ greeting: '<DUT1>' })
+    const session = track(sessionFor(server, { pagingMode: 'manual' }), server)
+    await session.open()
+    server.push('\r\nlines\r\n--More--')
+    // The pager stays pending, so a read says so.
+    await until(() => session.read({ after: 0 }).paging.active)
+    expect(session.read({ after: 0 }).pager).toBe('--More--')
+    // Discharging it (as the panel's "next page" button does) clears the flag.
+    await session.send('', { submit: false })
+    expect(session.status().paging.active).toBe(false)
+  })
+
+  it('advances the pager for the caller on demand', async () => {
+    const server = await startFakeConsole({ greeting: '<DUT1>' })
+    const session = track(sessionFor(server, { pagingMode: 'manual' }), server)
+    await session.open()
+    server.push('\r\nlines\r\n--More--')
+    await until(() => session.status().paging.active)
+    // The panel's "next page" button is a bare space, not a command line.
+    await session.send(' ', { submit: false })
+    await until(() => server.received.join('').includes(' '))
+    expect(server.received.join('')).toContain(' ')
+    expect(session.status().paging.active).toBe(false)
+  })
+
   it('leaves the pager to the caller in manual mode', async () => {
     const server = await startFakeConsole({ greeting: '<DUT1>' })
     const session = track(sessionFor(server, { pagingMode: 'manual' }), server)
@@ -337,6 +363,67 @@ describe('ConsoleSession lifecycle', () => {
     const closed = await session.close()
     expect(closed.state).toBe('closed')
     expect(closed.closedAt).not.toBeNull()
+  })
+
+  it('blocks on waitFor until the prompt returns', async () => {
+    const server = await startFakeConsole({ greeting: '<DUT1>' })
+    const session = track(sessionFor(server), server)
+    await session.open()
+    await session.send('show version')
+    // The answer arrives a moment later; waitFor must resolve on it rather than
+    // making the caller poll.
+    setTimeout(() => server.push('\r\nVersion 1.2.3\r\n<DUT1>'), 60)
+    const waited = await session.waitFor({ for: 'prompt', timeoutMs: 2000 })
+    expect(waited.matched).toBe(true)
+    expect(waited.reason).toBe('matched')
+    expect(waited.matchedText).toBe('<DUT1>')
+    expect(waited.elapsedMs).toBeGreaterThanOrEqual(0)
+  })
+
+  it('waits for a custom pattern and for quiet output', async () => {
+    const server = await startFakeConsole({ greeting: '<DUT1>' })
+    const session = track(sessionFor(server), server)
+    await session.open()
+    await session.send('show version')
+    setTimeout(() => server.push('\r\nERROR: something broke\r\n'), 40)
+    const byPattern = await session.waitFor({ for: 'pattern', pattern: 'ERROR:.*', timeoutMs: 2000 })
+    expect(byPattern.matched).toBe(true)
+    expect(byPattern.matchedText).toContain('ERROR')
+
+    setTimeout(() => server.push('\r\ntrailing whisper\r\n'), 40)
+    const byIdle = await session.waitFor({ for: 'idle', idleMs: 150, timeoutMs: 2000 })
+    expect(byIdle.matched).toBe(true)
+    expect(byIdle.reason).toBe('matched')
+  })
+
+  it('reports a timeout rather than hanging when nothing arrives', async () => {
+    const server = await startFakeConsole({ greeting: '<DUT1>' })
+    const session = track(sessionFor(server), server)
+    await session.open()
+    const waited = await session.waitFor({ for: 'pattern', pattern: 'NEVER-APPEARS', timeoutMs: 120 })
+    expect(waited.matched).toBe(false)
+    expect(waited.reason).toBe('timeout')
+    expect(waited.elapsedMs).toBeGreaterThanOrEqual(100)
+  })
+
+  it('wakes a waiter when the session closes under it', async () => {
+    const server = await startFakeConsole({ greeting: '<DUT1>' })
+    const session = track(sessionFor(server), server)
+    await session.open()
+    // Wait from the current end of the window, so the greeting prompt that is
+    // already there cannot satisfy the condition.
+    const after = session.read({ after: 0 }).cursor
+    setTimeout(() => server.hangup(), 40)
+    const waited = await session.waitFor({ for: 'prompt', after, timeoutMs: 3000 })
+    expect(waited.matched).toBe(false)
+    expect(waited.reason).toBe('closed')
+  })
+
+  it('rejects an uncompilable wait pattern instead of silently never matching', async () => {
+    const server = await startFakeConsole({ greeting: '<DUT1>' })
+    const session = track(sessionFor(server), server)
+    await session.open()
+    await expect(session.waitFor({ for: 'pattern', pattern: '(', timeoutMs: 50 })).rejects.toThrow()
   })
 
   it('force-closes a session the peer is holding open', async () => {

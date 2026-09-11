@@ -14,7 +14,7 @@
  * @module dsh-console-hub/session
  */
 import { Socket } from 'node:net'
-import type { PagingMode, ConsoleKind } from './config-shared.ts'
+import { compilePattern, type PagingMode, type ConsoleKind } from './config-shared.ts'
 import {
   createRingBuffer,
   decodeBytes,
@@ -92,6 +92,42 @@ export interface ConsoleConnectResult extends ConsoleSessionState {
   /** Everything the device said on connect (bounded), telnet noise removed. */
   banner: string
 }
+
+/** What one `waitFor` waits for. */
+export type ConsoleWaitCondition = 'prompt' | 'idle' | 'pattern'
+
+/** Options for {@link ConsoleSession.waitFor}. */
+export interface ConsoleWaitOptions {
+  /** What to watch for: the CLI prompt, quiet output, or a custom pattern. */
+  for?: ConsoleWaitCondition
+  /** Required when `for` is `pattern`; a case-insensitive regular expression body. */
+  pattern?: string
+  /** Budget in milliseconds; defaults to the session's read timeout. */
+  timeoutMs?: number
+  /** Cursor the wait starts from (the caller's last read cursor). */
+  after?: number
+  /** Quiet window that satisfies the `idle` condition. */
+  idleMs?: number
+}
+
+/** The outcome of one `waitFor`. */
+export interface ConsoleWaitResult {
+  /** Whether the condition was met inside the budget. */
+  matched: boolean
+  /** The prompt or pattern text that satisfied it. */
+  matchedText?: string
+  /** Cursor to pass as the next `read`'s `after`. */
+  cursor: number
+  /** Milliseconds spent waiting. */
+  elapsedMs: number
+  /** Why it ended. */
+  reason: 'matched' | 'timeout' | 'closed'
+  /** Pager state after the wait. */
+  paging: ConsolePagingState
+}
+
+/** How often a wait re-examines the tail of the output. */
+const WAIT_POLL_MS = 25
 
 /** What one `read` returns. */
 export interface ConsoleReadResult {
@@ -465,6 +501,74 @@ export class ConsoleSession {
   resumePaging(): void {
     this.pagingAbandoned = false
     this.paging = { active: false, pagesConsumed: 0, reason: null }
+  }
+
+  /**
+   * Wait until output satisfies a condition, the budget runs out, or the
+   * session closes. This is the one blocking read every caller uses, so no
+   * caller needs a polling loop of its own.
+   * @param options - condition, starting cursor, and budget.
+   * @returns the outcome, including why it ended.
+   */
+  async waitFor(options: ConsoleWaitOptions = {}): Promise<ConsoleWaitResult> {
+    const started = Date.now()
+    const budgetMs = options.timeoutMs ?? this.options.readTimeoutMs
+    const after = options.after ?? 0
+    const condition = options.for ?? 'prompt'
+    const matcher = condition === 'pattern' ? compilePattern(options.pattern ?? '') : undefined
+    const idleMs = options.idleMs ?? 250
+
+    let lastGrowthAt = Date.now()
+    let lastWritten = this.ring.written
+
+    for (;;) {
+      const tail = this.tailText()
+      if (condition === 'prompt') {
+        const prompt = matchPrompt(tail, this.options.promptPattern)
+        if (prompt !== undefined && this.ring.written > after) {
+          return this.waitResult(true, prompt, after, started, 'matched')
+        }
+      } else if (condition === 'pattern' && matcher !== undefined) {
+        const found = matcher.exec(tail)
+        if (found !== null) return this.waitResult(true, found[0], after, started, 'matched')
+      } else if (condition === 'idle') {
+        // Quiet means: bytes have stopped arriving for the idle window.
+        if (this.ring.written !== lastWritten) {
+          lastWritten = this.ring.written
+          lastGrowthAt = Date.now()
+        } else if (Date.now() - lastGrowthAt >= idleMs) {
+          return this.waitResult(true, undefined, after, started, 'matched')
+        }
+      }
+      if (this.phase === 'closed' || this.phase === 'error') {
+        return this.waitResult(false, undefined, after, started, 'closed')
+      }
+      if (Date.now() - started >= budgetMs) {
+        return this.waitResult(false, undefined, after, started, 'timeout')
+      }
+      await new Promise(resolve => setTimeout(resolve, WAIT_POLL_MS))
+    }
+  }
+
+  /** Assemble one wait outcome. */
+  private waitResult(
+    matched: boolean,
+    matchedText: string | undefined,
+    after: number,
+    started: number,
+    reason: ConsoleWaitResult['reason'],
+  ): ConsoleWaitResult {
+    this.lastActivityMs = Date.now()
+    return {
+      matched,
+      ...matchedText === undefined ? {} : { matchedText },
+      // Everything received up to now is the caller's to read; hand back the
+      // current end so a following `read` starts where the wait left off.
+      cursor: Math.max(after, 0),
+      elapsedMs: Date.now() - started,
+      reason,
+      paging: { ...this.paging },
+    }
   }
 
   /**
