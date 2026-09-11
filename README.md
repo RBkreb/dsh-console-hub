@@ -73,6 +73,45 @@ pnpm test:live
 文件再从命令行加回来，所以写死排除会让这套用例永远跑不了。`scripts/test-live.mjs` 在 vitest
 读取配置**之前**设置 `DSH_CONSOLE_LIVE=1`（Windows 上 shell 的 `VAR=1 cmd` 写法不可用）。
 
+### 工具 schema：两种写法，极易混淆（踩过两次）
+
+同一个工具定义里有**两套不同的 schema 写法**，混淆的后果分别是「工具静默消失」和
+「整场对话无法开始」：
+
+| 字段 | 写法 | 谁校验 |
+| --- | --- | --- |
+| `output.schema` | **raw JSON Schema** | `register()` 会校，不过会被拒 |
+| `parameters` | **raw JSON Schema** | `register()` **完全不校**，直接发给模型 API |
+
+而 `required` 的两种拼写就是陷阱本身：
+
+- **授权 DSL**（`defineTool` 的入参）：`required: true` 写在**每个属性上**。
+- **raw JSON Schema**：`required: ['a','b']` 写在 **object 节点上**，属性里**不能**有 `required`。
+
+`register()` 走的是 raw 路径，它只校 `output.schema`。`parameters` 经 `schemaOf()`
+**原样透传**给模型，所以若写成 DSL，顶层就没有 `type`，厂商会整份工具列表拒掉：
+
+```
+Invalid schema for function 'console_close':
+  schema must be a JSON Schema of 'type: "object"', got 'type: null'
+```
+
+所以本仓库的 `parameters` 一律交给 harness 自己的编译器：
+
+```ts
+parameters: parameterSchemaSpecToJsonSchema({ /* 可读的 DSL */ })
+```
+
+这样手写不可能写错。改完用两个闸门验：
+
+```sh
+pnpm check:tools   # 拿真实校验器查全部定义（parameters + output.schema）
+pnpm test          # 测试替身会对 parameters 跑 assertObjectJsonSchema
+```
+
+`pnpm check:tools` 存在的原因：`register()` 不检查 `parameters`，harness 在请求发出前
+也不会发现——不主动查就只能等模型 API 报错。
+
 ## 真机实测结论（重要）
 
 实验室两台设备（DPtech 防火墙 / 交换机）**连接后只发 Telnet 协商字节，然后完全静默**：
