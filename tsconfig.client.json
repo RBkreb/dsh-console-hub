@@ -1,0 +1,12 @@
+// Client-side declarations: the browser bundle never touches Node, and the
+// client declarations this plugin ships must stay readable without
+// `@types/node` (mirrors dsh-better-sidebar's consumer-types contract).
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": [],
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "noEmit": true
+  },
+  "include": ["src/client"]
+}

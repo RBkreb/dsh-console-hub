@@ -1,0 +1,17 @@
+# dsh-console-hub bundle patch
+#
+# This file is the `dsh.bundle.patch` layer of the package: when it is installed
+# through the official CLI —
+#
+#   dsh plugin --profile <name> add dsh-console-hub
+#
+# — the command appends `dsh-console-hub` to `dsh.profile.bundles` and the
+# profile boot merges THIS patch (a single `insert` of the plugin row) exactly
+# like a manual cordis.patch.yml mount line.
+#
+# The plugin's browser half is discovered through package.json's `dsh.client`
+# declaration and its `exports["./client"]` bundle, so this row needs no extra
+# wiring for the sidebar tab.
+- insert:
+    - id: dsh-console-hub
+      name: dsh-console-hub

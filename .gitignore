@@ -1,0 +1,20 @@
+# Build output
+lib/
+
+# Dependencies
+node_modules/
+
+# Test output
+coverage/
+*.tsbuildinfo
+
+# Logs / local scratch
+*.log
+.dsh-console-hub/
+
+# Editors / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json

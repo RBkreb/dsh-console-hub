@@ -1,0 +1,27 @@
+packages:
+  - .
+
+allowBuilds:
+  node-pty: set this to true or false
+
+# The plugin's optional `dsh-better-sidebar` peer drags in node-pty, whose
+# native build script this package never needs: the browser half only registers
+# a tab through `ctx.betterSidebar`, and the host half opens raw TCP sockets
+# rather than PTYs. Ignoring the build keeps `pnpm install` non-interactive
+# while leaving the optional peer resolvable for type checks.
+ignoredBuiltDependencies:
+  - node-pty
+
+# The DSH packages this plugin's peers resolve to are frequently published
+# inside the supply-chain cooling-off window (rc lines especially), and
+# `pnpm test` re-verifies the lockfile against that policy on every run.
+# Excluding the two fast-moving families keeps local runs reproducible; every
+# other dependency still ages normally.
+minimumReleaseAgeExclude:
+  - '@deepseek-ai/*'
+  - '@csstools/*'
+
+# `pnpm test` / `pnpm build` otherwise re-run a dependency status check that can
+# rewrite the tree mid-command; the explicit `pnpm install` is this repository's
+# only install step.
+verifyDepsBeforeRun: false
