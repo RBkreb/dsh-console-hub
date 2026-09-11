@@ -70,6 +70,37 @@ const CONSOLE_ID = {
   description: 'Console handle returned by console_connect or console_list.',
 } as const
 
+/**
+ * Build an `output.schema` object node.
+ *
+ * The output contract is a RAW JSON Schema in the harness's enforced subset,
+ * which is NOT the same DSL as `parameters`. In particular `required` is a
+ * STRING ARRAY on the object node -- writing `required: true` on each property
+ * (the `parameters` spelling) is rejected by `assertSupportedJsonSchema`, and
+ * a rejected definition makes `register` throw, so the tool silently never
+ * appears. This helper makes the two spellings impossible to confuse.
+ *
+ * @param properties - the declared property schemas.
+ * @param required - names that must be present; must be a subset of `properties`.
+ * @returns the object-rooted schema node.
+ */
+function outputSchema(
+  properties: Record<string, unknown>,
+  required: readonly string[],
+): Record<string, unknown> {
+  for (const name of required) {
+    if (!(name in properties)) {
+      // A required name with no property is rejected by the subset too, but
+      // failing here names the author's mistake instead of the schema's shape.
+      throw new Error(`console-hub: output schema requires undeclared property "${name}"`)
+    }
+  }
+  return { type: 'object', additionalProperties: false, properties, required: [...required] }
+}
+
+/** Names of the properties marked `required: true` in a `parameters` tree. */
+const CONSOLE_REQUIRED = ['consoleId'] as const
+
 /** A small text renderer (the canonical value is already structured). */
 function text(value: string): { type: 'text', text: string }[] {
   return [{ type: 'text', text: value }]
@@ -186,30 +217,21 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
       + 'or to find a console you forgot to close.',
     parameters: {},
     output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          consoles: {
-            type: 'array',
-            required: true,
-            items: {
-              type: 'object',
-              additionalProperties: false,
-              properties: {
-                consoleId: { type: 'string', required: true },
-                label: { type: 'string', required: true },
-                host: { type: 'string', required: true },
-                port: { type: 'number', required: true },
-                kind: { type: 'string', required: true },
-                state: { type: 'string', required: true },
-                secure: { type: 'boolean', required: true },
-                idleMs: { type: 'number', required: true },
-              },
-            },
-          },
+      schema: outputSchema({
+        consoles: {
+          type: 'array',
+          items: outputSchema({
+            consoleId: { type: 'string' },
+            label: { type: 'string' },
+            host: { type: 'string' },
+            port: { type: 'number' },
+            kind: { type: 'string' },
+            state: { type: 'string' },
+            secure: { type: 'boolean' },
+            idleMs: { type: 'number' },
+          }, ['consoleId', 'label', 'host', 'port', 'kind', 'state', 'secure', 'idleMs']),
         },
-      },
+      }, ['consoles']),
       render: (_args: unknown, value: unknown) => {
         const consoles = (value as { consoles: ConsoleEntry[] }).consoles
         if (consoles.length === 0) return text('No device consoles are open in this session.')
@@ -257,22 +279,18 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
       },
     },
     output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          consoleId: { type: 'string', required: true },
-          state: { type: 'string', required: true },
-          label: { type: 'string', required: true },
-          host: { type: 'string', required: true },
-          port: { type: 'number', required: true },
-          secure: { type: 'boolean', required: true },
-          banner: { type: 'string', required: true },
-          prompt: { type: 'string' },
-          lastErrorCode: { type: 'string' },
-          lastErrorMessage: { type: 'string' },
-        },
-      },
+      schema: outputSchema({
+        consoleId: { type: 'string' },
+        state: { type: 'string' },
+        label: { type: 'string' },
+        host: { type: 'string' },
+        port: { type: 'number' },
+        secure: { type: 'boolean' },
+        banner: { type: 'string' },
+        prompt: { type: 'string' },
+        lastErrorCode: { type: 'string' },
+        lastErrorMessage: { type: 'string' },
+      }, ['consoleId', 'state', 'label', 'host', 'port', 'secure', 'banner']),
       render: (_args: unknown, value: unknown) => {
         const result = value as {
           consoleId: string
@@ -343,16 +361,12 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
       encoding: { type: 'string', description: 'Encoding override for this write.' },
     },
     output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          consoleId: { type: 'string', required: true },
-          state: { type: 'string', required: true },
-          written: { type: 'number', required: true },
-          pagingActive: { type: 'boolean' },
-        },
-      },
+      schema: outputSchema({
+        consoleId: { type: 'string' },
+        state: { type: 'string' },
+        written: { type: 'number' },
+        pagingActive: { type: 'boolean' },
+      }, ['consoleId', 'state', 'written']),
       render: (_args: unknown, value: unknown) => {
         const result = value as { consoleId: string, state: string, pagingActive?: boolean }
         const paging = result.pagingActive === true ? ' A pager prompt is waiting; read the output or send a page key.' : ''
@@ -407,20 +421,16 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
       maxBytes: { type: 'number', description: 'Cap on returned text bytes for this read.' },
     },
     output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          text: { type: 'string', required: true },
-          cursor: { type: 'number', required: true },
-          truncated: { type: 'boolean', required: true },
-          bytes: { type: 'number', required: true },
-          encoding: { type: 'string', required: true },
-          prompt: { type: 'string' },
-          pager: { type: 'string' },
-          pagingActive: { type: 'boolean', required: true },
-        },
-      },
+      schema: outputSchema({
+        text: { type: 'string' },
+        cursor: { type: 'number' },
+        truncated: { type: 'boolean' },
+        bytes: { type: 'number' },
+        encoding: { type: 'string' },
+        prompt: { type: 'string' },
+        pager: { type: 'string' },
+        pagingActive: { type: 'boolean' },
+      }, ['text', 'cursor', 'truncated', 'bytes', 'encoding', 'pagingActive']),
       render: (_args: unknown, value: unknown) => {
         const result = value as {
           text: string
@@ -487,17 +497,13 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
       idleMs: { type: 'number', description: 'Quiet window that satisfies `for: "idle"`.' },
     },
     output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          matched: { type: 'boolean', required: true },
-          reason: { type: 'string', required: true },
-          matchedText: { type: 'string' },
-          cursor: { type: 'number', required: true },
-          elapsedMs: { type: 'number', required: true },
-        },
-      },
+      schema: outputSchema({
+        matched: { type: 'boolean' },
+        reason: { type: 'string' },
+        matchedText: { type: 'string' },
+        cursor: { type: 'number' },
+        elapsedMs: { type: 'number' },
+      }, ['matched', 'reason', 'cursor', 'elapsedMs']),
       render: (_args: unknown, value: unknown) => {
         const result = value as {
           matched: boolean
@@ -565,14 +571,10 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
       force: { type: 'boolean', description: 'Destroy the socket instead of closing it gracefully.' },
     },
     output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          consoleId: { type: 'string', required: true },
-          closed: { type: 'boolean', required: true },
-        },
-      },
+      schema: outputSchema({
+        consoleId: { type: 'string' },
+        closed: { type: 'boolean' },
+      }, ['consoleId', 'closed']),
       render: (_args: unknown, value: unknown) => text(`Closed console ${(value as { consoleId: string }).consoleId}.`),
     },
     execute: async (args: unknown, exec: ConsoleToolRunContext) => {
@@ -595,40 +597,34 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
       + 'audit trail of who sent what. Use it to understand what already happened on a console before acting.',
     parameters: { consoleId: CONSOLE_ID },
     output: {
-      schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          consoleId: { type: 'string', required: true },
-          label: { type: 'string', required: true },
-          host: { type: 'string', required: true },
-          port: { type: 'number', required: true },
-          kind: { type: 'string', required: true },
-          state: { type: 'string', required: true },
-          encoding: { type: 'string', required: true },
-          idleMs: { type: 'number', required: true },
-          bytesReceived: { type: 'number', required: true },
-          bytesWritten: { type: 'number', required: true },
-          prompt: { type: 'string' },
-          pagingActive: { type: 'boolean', required: true },
-          pagesConsumed: { type: 'number', required: true },
-          lastErrorCode: { type: 'string' },
-          audit: {
-            type: 'array',
-            required: true,
-            items: {
-              type: 'object',
-              additionalProperties: false,
-              properties: {
-                at: { type: 'string', required: true },
-                actor: { type: 'string', required: true },
-                action: { type: 'string', required: true },
-                detail: { type: 'string', required: true },
-              },
-            },
-          },
+      schema: outputSchema({
+        consoleId: { type: 'string' },
+        label: { type: 'string' },
+        host: { type: 'string' },
+        port: { type: 'number' },
+        kind: { type: 'string' },
+        state: { type: 'string' },
+        encoding: { type: 'string' },
+        idleMs: { type: 'number' },
+        bytesReceived: { type: 'number' },
+        bytesWritten: { type: 'number' },
+        prompt: { type: 'string' },
+        pagingActive: { type: 'boolean' },
+        pagesConsumed: { type: 'number' },
+        lastErrorCode: { type: 'string' },
+        audit: {
+          type: 'array',
+          items: outputSchema({
+            at: { type: 'string' },
+            actor: { type: 'string' },
+            action: { type: 'string' },
+            detail: { type: 'string' },
+          }, ['at', 'actor', 'action', 'detail']),
         },
-      },
+      }, [
+        'consoleId', 'label', 'host', 'port', 'kind', 'state', 'encoding', 'idleMs',
+        'bytesReceived', 'bytesWritten', 'pagingActive', 'pagesConsumed', 'audit',
+      ]),
       render: (_args: unknown, value: unknown) => {
         const result = value as {
           consoleId: string

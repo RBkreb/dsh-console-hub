@@ -12,6 +12,7 @@ import { PortManager } from '../src/port-manager.ts'
 import { DEFAULT_PAGER_PATTERN, DEFAULT_PROMPT_PATTERN } from '../src/config-shared.ts'
 import type { ConsoleToolRegistry, ConsoleToolRunContext } from '../src/context-types.ts'
 import type { ConsoleView } from '../src/config-shared.ts'
+import { assertSupportedJsonSchema } from '@deepseek-ai/dsh-tools'
 
 /** A minimal tool definition as the fake registry sees it. */
 interface FrozenTool {
@@ -22,13 +23,23 @@ interface FrozenTool {
   execute: (args: unknown, exec: ConsoleToolRunContext) => Promise<unknown>
 }
 
-/** A registry stub that keeps every registered definition. */
+/**
+ * A registry stub that validates every definition the way the real one does.
+ *
+ * The validation is the point. An earlier version of this fake only read
+ * `definition.name`, so all seven tools passed here while the REAL registry
+ * rejected every one of them (`output.schema` used the `parameters` spelling of
+ * `required`) and registered nothing. A fake that accepts anything cannot
+ * notice that its subject is unregisterable.
+ */
 function fakeRegistry(): ConsoleToolRegistry & { tools: Map<string, FrozenTool> } {
   const tools = new Map<string, FrozenTool>()
   return {
     tools,
     register(tool) {
       const frozen = tool as FrozenTool
+      // Same enforced-subset check the runtime applies before accepting a tool.
+      assertSupportedJsonSchema(frozen.output.schema)
       tools.set(frozen.name, frozen)
       return () => tools.delete(frozen.name)
     },

@@ -93,15 +93,30 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
 
   useEffect(() => uiPrefs.subscribe(setPrefs), [])
 
-  /** Reload the saved views and the live consoles. */
+  /**
+   * Reload the saved views and the live consoles.
+   *
+   * The two reads are settled INDEPENDENTLY on purpose. They come from
+   * different halves of the API (the settings document vs the live session
+   * registry), so one failing says nothing about the other -- and a shared
+   * `Promise.all` made the console registry's failure discard a perfectly good
+   * inventory read. The visible effect was the worst possible one: a device was
+   * saved to disk, and the list stayed empty, so the user could not tell whether
+   * the save had worked.
+   */
   const refresh = useCallback(async () => {
-    try {
-      const [list, live] = await Promise.all([hub.listViews(sessionId), hub.listConsoles(sessionId)])
-      setViews(list.views)
-      setConsoles(live.consoles)
-    } catch (failure) {
-      setError(messageOf(failure))
-    }
+    const [inventory, live] = await Promise.allSettled([
+      hub.listViews(sessionId),
+      hub.listConsoles(sessionId),
+    ])
+    if (inventory.status === 'fulfilled') setViews(inventory.value.views)
+    if (live.status === 'fulfilled') setConsoles(live.value.consoles)
+    // Report whichever failed, so a broken read is never mistaken for an empty
+    // result -- but only after the successful half has been applied.
+    const failures: string[] = []
+    if (inventory.status === 'rejected') failures.push(messageOf(inventory.reason))
+    if (live.status === 'rejected') failures.push(messageOf(live.reason))
+    setError(failures.length === 0 ? null : failures.join('\n'))
   }, [hub, sessionId])
 
   useEffect(() => {
