@@ -105,12 +105,19 @@ describe('resolveConsoleHubConfig', () => {
     expect(resolveConsoleHubConfig(undefined)).toEqual({
       requestBodyLimitBytes: 1 << 20,
       sessionIdleSweepMs: 15000,
+      // Empty by default: loopback needs no declaration, and a non-loopback
+      // deployment must opt in explicitly rather than be trusted by accident.
+      trustedHosts: [],
     })
   })
 
   it('honours provided values and validates them through the schema', () => {
     expect(resolveConsoleHubConfig({ requestBodyLimitBytes: 2048, sessionIdleSweepMs: 1000 }))
-      .toEqual({ requestBodyLimitBytes: 2048, sessionIdleSweepMs: 1000 })
+      .toEqual({ requestBodyLimitBytes: 2048, sessionIdleSweepMs: 1000, trustedHosts: [] })
+    // A deployment reached by name must be able to declare it, or the plugin's
+    // own Host fence would refuse every non-loopback call.
+    expect(resolveConsoleHubConfig({ trustedHosts: ['harness.internal:43120'] }).trustedHosts)
+      .toEqual(['harness.internal:43120'])
     expect(() => resolveConsoleHubConfig({ requestBodyLimitBytes: 0 })).toThrow()
   })
 

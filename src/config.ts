@@ -185,18 +185,30 @@ export interface ConsoleHubConfig {
   requestBodyLimitBytes?: number
   /** How often the idle-session reaper runs (ms). */
   sessionIdleSweepMs?: number
+  /**
+   * Authorities this deployment serves beyond loopback: exact `host:port`, or a
+   * port-less `host` matching any port.
+   *
+   * The plugin's route fences every request by Host, so a non-loopback bind must
+   * declare the names it is reached by or every call is a 403. Mirror the
+   * connection seam's `trustedHosts` here; when that seam is composed its own
+   * `requestRejection` also runs, and both must agree.
+   */
+  trustedHosts?: string[]
 }
 
 /** Schemastery schema for the plugin row configuration. */
 export const Config: z<ConsoleHubConfig> = z.object({
   requestBodyLimitBytes: z.number().step(1).min(1024).max(64 * 1024 * 1024).default(1 << 20),
   sessionIdleSweepMs: z.number().step(1).min(1000).max(3_600_000).default(15_000),
+  trustedHosts: z.array(z.string()).default([]),
 })
 
 /** Fully defaulted host configuration. */
 export interface ResolvedConsoleHubConfig {
   requestBodyLimitBytes: number
   sessionIdleSweepMs: number
+  trustedHosts: readonly string[]
 }
 
 /**

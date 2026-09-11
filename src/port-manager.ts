@@ -185,6 +185,18 @@ export class PortManager {
   }
 
   /**
+   * How many consoles are open across every session.
+   *
+   * The manager's own reconfiguration reads this: a policy change must not
+   * discard a live console, so the host defers it until this reaches zero.
+   *
+   * @returns the number of tracked consoles.
+   */
+  openCount(): number {
+    return this.consoles.size
+  }
+
+  /**
    * Every console owned by one session, with a live status.
    * @param ownerSessionId - the owning session.
    * @returns the owner's consoles, oldest first.

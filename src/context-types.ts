@@ -31,6 +31,18 @@ export interface Context {
    * the callback produced, coerced to a plain disposer.
    */
   effect(effect: () => void | (() => void), label?: string): () => void
+  /**
+   * Resolved services, declared structurally.
+   *
+   * Cordis hands an `inject`ed service to the callback as a property of the
+   * context it passes in, so the injected names must exist here as optional
+   * members. They are optional because a context without that seam is exactly
+   * the case the host half must survive.
+   */
+  settings?: ConsoleSettingsService
+  webServer?: ConsoleWebServer
+  tools?: ConsoleToolRegistry
+  systemPrompt?: ConsolePromptRegistry
   /** Plugin logger. */
   logger?: {
     info(message: string, ...args: unknown[]): void
@@ -167,6 +179,28 @@ export interface ConsoleApprovalService {
     reason: string
     signal?: AbortSignal
   }): Promise<ConsoleApprovalOutcome>
+}
+
+// ── Host: system prompt ─────────────────────────────────────────────────────
+
+/**
+ * The system-prompt registry slice this plugin uses.
+ *
+ * Only `section` is mirrored: the plugin contributes one ordered text section
+ * and reads nothing back, so the rest of the registry is not part of its
+ * contract with the harness.
+ */
+export interface ConsolePromptRegistry {
+  /**
+   * Register an ordered prompt section in the calling scope.
+   * @param section - name, order, and text (or a provider evaluated per assembly).
+   * @returns the disposer removing it.
+   */
+  section(section: {
+    name: string
+    order: number
+    text: string | ((context: unknown) => string)
+  }): () => void
 }
 
 // ── Client: better-sidebar ──────────────────────────────────────────────────
