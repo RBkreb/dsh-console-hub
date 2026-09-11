@@ -51,6 +51,20 @@ export interface ConsoleSessionApi {
   defaultEncoding(): string
   /** The plugin's engine defaults. */
   defaults(): ConsoleConnectDefaults
+  /**
+   * Fence one panel-issued command.
+   *
+   * The panel's user is already the human in the loop, so the interface path
+   * does NOT go through `ctx.approval` (that seam requires an open agent turn,
+   * which a sidebar click has none of). What it does require is the returned
+   * one-shot token: the panel must present the refusal, get a second explicit
+   * confirmation, and replay the call with the token.
+   */
+  fenceForUser?(request: { sessionId: string, consoleId: string, label: string, text: string }):
+    | { risk: 'safe' }
+    | { risk: 'high', confirmationToken: string, reason: string }
+  /** Validate a confirmation token minted by {@link fenceForUser}. */
+  consumeConfirmation?(sessionId: string, consoleId: string, token: string): boolean
 }
 
 /** One dispatchable console method. */
@@ -194,6 +208,25 @@ function consoleHandlers(api: ConsoleSessionApi): Record<string, Handler> {
       const actor = optionalString(payload, 'actor')
       if (actor !== undefined && !['user', 'model', 'system'].includes(actor)) {
         throw new HubError('bad-request', `"actor" must be user, model, or system (got "${actor}")`)
+      }
+      // The panel's path fences a high-risk command behind a one-shot
+      // confirmation token: the first call refuses and mints the token, the
+      // confirmed replay consumes it. A safe command goes straight through.
+      const confirmation = optionalString(payload, 'confirmToken')
+      if (api.fenceForUser !== undefined || api.consumeConfirmation !== undefined) {
+        const fenced = api.fenceForUser?.({
+          sessionId,
+          consoleId,
+          label: api.manager.get(sessionId, consoleId)?.label ?? consoleId,
+          text,
+        })
+        if (fenced?.risk === 'high') {
+          const valid = confirmation !== undefined
+            && api.consumeConfirmation?.(sessionId, consoleId, confirmation) === true
+          if (!valid) {
+            throw new HubError('forbidden', `high-risk command needs confirmation: ${fenced.reason}`, 403)
+          }
+        }
       }
       try {
         const entry = await api.manager.send(sessionId, consoleId, text, {

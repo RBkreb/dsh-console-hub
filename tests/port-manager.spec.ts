@@ -176,11 +176,13 @@ describe('PortManager idle reaping', () => {
 
   it('reaps only the idle console when several are open', async () => {
     const device = await startDevice()
-    const manager = track(managerFor({ idleTimeoutMs: 70, idleSweepMs: 10 }), device)
+    // Wide margins on purpose: the first console must clear the idle window and
+    // the second must be nowhere near it, so scheduler jitter cannot decide the
+    // outcome.
+    const manager = track(managerFor({ idleTimeoutMs: 200, idleSweepMs: 10 }), device)
     const first = await manager.connect(descriptorFor(device, { label: 'first' }))
-    await new Promise(resolve => setTimeout(resolve, 40))
+    await new Promise(resolve => setTimeout(resolve, 260))
     const second = await manager.connect(descriptorFor(device, { label: 'second' }))
-    await new Promise(resolve => setTimeout(resolve, 40))
     const reaped = await manager.sweep()
     expect(reaped).toContain(first.consoleId)
     expect(reaped).not.toContain(second.consoleId)

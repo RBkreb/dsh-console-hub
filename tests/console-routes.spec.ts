@@ -88,6 +88,12 @@ function apiFor(): {
         kind: 'raw' as const,
         pagingMode: 'manual' as const,
       }),
+      // The panel path's fence: a high-risk command is refused until the panel
+      // replays it with the one-shot token this minted. Safe commands pass.
+      fenceForUser: ({ text }) => text.includes('config') || text.includes('restart')
+        ? { risk: 'high' as const, confirmationToken: `tok-${text}`, reason: `"${text}" is high risk` }
+        : { risk: 'safe' as const },
+      consumeConfirmation: (_sessionId, _consoleId, token) => token.startsWith('tok-'),
     },
     manager,
   }
@@ -460,6 +466,53 @@ describe('console.control / console.close', () => {
     expect(closed.status).toBe(200)
     expect((closed.body as { value: { closed: number } }).value.closed).toBe(2)
     expect(manager.list('session-a')).toHaveLength(0)
+  })
+})
+
+describe('panel-path high-risk fence', () => {
+  it('sends a safe command without any confirmation', async () => {
+    const { api } = await scene()
+    const connected = await call(api, 'console.connect', { sessionId: 'session-a', viewId: 'v-known' })
+    const consoleId = (connected.body as { value: { consoleId: string } }).value.consoleId
+    const sent = await call(api, 'console.send', { sessionId: 'session-a', consoleId, text: 'show version' })
+    expect(sent.status).toBe(200)
+  })
+
+  it('refuses a high-risk command until the panel replays it with the token', async () => {
+    const { api, device } = await scene()
+    const connected = await call(api, 'console.connect', { sessionId: 'session-a', viewId: 'v-known' })
+    const consoleId = (connected.body as { value: { consoleId: string } }).value.consoleId
+
+    const refused = await call(api, 'console.send', { sessionId: 'session-a', consoleId, text: 'config terminal' })
+    expect(refused.status).toBe(403)
+    expect(refused.body).toMatchObject({ ok: false, error: { code: 'forbidden' } })
+    // The refusal must name why, so the panel can show it before confirming.
+    expect((refused.body as { error: { message: string } }).error.message).toMatch(/high-risk|high risk/)
+    // Nothing reached the device.
+    expect(device.received.join('')).not.toContain('config')
+
+    const confirmed = await call(api, 'console.send', {
+      sessionId: 'session-a',
+      consoleId,
+      text: 'config terminal',
+      confirmToken: 'tok-config terminal',
+    })
+    expect(confirmed.status).toBe(200)
+    await until(() => device.received.join('').includes('config terminal'))
+    expect(device.received.join('')).toContain('config terminal')
+  })
+
+  it('refuses a confirmation token the fence did not mint', async () => {
+    const { api } = await scene()
+    const connected = await call(api, 'console.connect', { sessionId: 'session-a', viewId: 'v-known' })
+    const consoleId = (connected.body as { value: { consoleId: string } }).value.consoleId
+    const refused = await call(api, 'console.send', {
+      sessionId: 'session-a',
+      consoleId,
+      text: 'restart',
+      confirmToken: 'not-a-real-token',
+    })
+    expect(refused.status).toBe(403)
   })
 })
 
