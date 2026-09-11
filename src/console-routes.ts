@@ -248,6 +248,27 @@ function consoleHandlers(api: ConsoleSessionApi): Record<string, Handler> {
       }
     },
 
+    async 'console.fence'(payload) {
+      // Pre-flight, never a write: the panel must be able to learn that a command
+      // is high-risk AND receive the token it will replay, before anything
+      // reaches the device. `console.send` alone cannot do that — its refusal is
+      // a 403 envelope, which carries a message but no token.
+      const sessionId = await requireSession(api, payload)
+      const consoleId = requireConsoleId(payload)
+      const text = optionalString(payload, 'text') ?? ''
+      if (text === '') throw new HubError('bad-request', 'missing or invalid "text"')
+      const entry = api.manager.get(sessionId, consoleId)
+      if (entry === undefined) {
+        throw new HubError('not-found', `console "${consoleId}" not found for this session`, 404)
+      }
+      if (api.fenceForUser === undefined) {
+        // No fence composed: nothing can be high-risk, so the panel may send.
+        return { risk: 'safe' as const }
+      }
+      return api.fenceForUser({ sessionId, consoleId, label: entry.label, text })
+    },
+
+
     async 'console.read'(payload) {
       const sessionId = await requireSession(api, payload)
       const consoleId = requireConsoleId(payload)

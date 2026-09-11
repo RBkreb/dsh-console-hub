@@ -514,7 +514,45 @@ describe('panel-path high-risk fence', () => {
     })
     expect(refused.status).toBe(403)
   })
+
+
+  it('lets the panel learn the risk before it writes anything', async () => {
+    // The refusal path is not enough on its own: the 403 carries a message but
+    // no token, so a panel that only ever calls `console.send` can never obtain
+    // the confirmation it needs to replay. `console.fence` answers the same
+    // question as a pure pre-flight, and mints the token the panel replays.
+    const { api, device } = await scene()
+    const connected = await call(api, 'console.connect', { sessionId: 'session-a', viewId: 'v-known' })
+    const consoleId = (connected.body as { value: { consoleId: string } }).value.consoleId
+
+    const safe = await call(api, 'console.fence', { sessionId: 'session-a', consoleId, text: 'show version' })
+    expect(safe.status).toBe(200)
+    expect(safe.body).toMatchObject({ ok: true, value: { risk: 'safe' } })
+
+    const risky = await call(api, 'console.fence', { sessionId: 'session-a', consoleId, text: 'config terminal' })
+    expect(risky.status).toBe(200)
+    expect(risky.body).toMatchObject({
+      ok: true,
+      value: { risk: 'high', confirmationToken: 'tok-config terminal' },
+    })
+    expect((risky.body as { value: { reason: string } }).value.reason).toMatch(/high risk/)
+
+    // Pre-flight is a question, not an action: the device saw nothing.
+    expect(device.received.join('')).not.toContain('show version')
+    expect(device.received.join('')).not.toContain('config')
+  })
+
+  it('answers console.fence for a console it does not own as not-found', async () => {
+    const { api } = await scene()
+    const refused = await call(api, 'console.fence', {
+      sessionId: 'session-a',
+      consoleId: 'c0000000000000000000000000000000',
+      text: 'show version',
+    })
+    expect(refused.status).toBe(404)
+  })
 })
+
 
 describe('console id validation', () => {
   it('requires a consoleId on every console method', async () => {
