@@ -130,6 +130,17 @@ export interface ConsoleHubSettings {
   promptPattern: string
   /** Default pager pattern for views that do not override it. */
   pagerPattern: string
+  /**
+   * Send one bare Enter when a device says nothing on connect.
+   *
+   * Some console servers stay completely silent until a key is pressed: no
+   * banner, no prompt. Against such a device every read is empty and the model
+   * has nothing to key off, even though the console is fine. One Enter wakes it.
+   *
+   * Off by default, because a device that does not need it must never receive an
+   * unsolicited keystroke.
+   */
+  wakeOnConnect: boolean
   /** Prompt snippet appended to the model-facing rules (kept as a separate
    *  field so deployments can add their own site conventions). */
   agentInstructions: string
@@ -156,6 +167,7 @@ export const DEFAULT_CONSOLE_HUB_SETTINGS: ConsoleHubSettings = {
   highRiskPatterns: [...DEFAULT_HIGH_RISK_PATTERNS],
   promptPattern: DEFAULT_PROMPT_PATTERN,
   pagerPattern: DEFAULT_PAGER_PATTERN,
+  wakeOnConnect: false,
   agentInstructions: '',
   agentConsoleTools: true,
   views: {},

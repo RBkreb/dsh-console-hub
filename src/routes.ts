@@ -86,6 +86,8 @@ function defaultsFor(settings: ConsoleHubSettings): {
   highRiskPatterns: string[]
   promptPattern: string
   pagerPattern: string
+  /** Whether a silent console is woken with one bare Enter on connect. */
+  wakeOnConnect: boolean
   connectTimeoutMs: number
   readTimeoutMs: number
   idleTimeoutMs: number
@@ -104,6 +106,7 @@ function defaultsFor(settings: ConsoleHubSettings): {
     highRiskPatterns: [...settings.highRiskPatterns],
     promptPattern: settings.promptPattern,
     pagerPattern: settings.pagerPattern,
+    wakeOnConnect: settings.wakeOnConnect,
     connectTimeoutMs: settings.connectTimeoutMs,
     readTimeoutMs: settings.readTimeoutMs,
     idleTimeoutMs: settings.idleTimeoutMs,

@@ -193,6 +193,19 @@ export interface ConsoleSessionOptions {
   password?: string
   /** How long `open` waits for a banner/prompt before reporting what it has. */
   bannerWindowMs?: number
+  /**
+   * Send one bare Enter when the device says nothing on connect.
+   *
+   * Some console servers -- both lab devices among them -- send only the Telnet
+   * negotiation burst and then stay silent until a key is pressed. With no
+   * banner and no prompt there is nothing for the caller (or the model) to key
+   * off, so the console looks dead when it is merely asleep. One Enter turns it
+   * into an ordinary CLI.
+   *
+   * The Enter is sent ONLY when the banner window elapsed without a prompt, so
+   * a device that greets on connect never receives an unsolicited keystroke.
+   */
+  wakeOnConnect?: boolean
 }
 
 /** Default page size cap when the caller declares none. */
@@ -359,6 +372,21 @@ export class ConsoleSession {
     while (Date.now() < deadline && this.currentPrompt === null && this.phase === 'open') {
       await new Promise(resolve => setTimeout(resolve, 10))
     }
+
+    // A device that stayed silent through the whole window is very likely
+    // asleep rather than absent: some console servers emit nothing at all until
+    // a key arrives. One bare Enter wakes it, and only then do we wait the
+    // second window for the prompt it produces. A device that already spoke is
+    // never sent an unsolicited keystroke.
+    if (this.options.wakeOnConnect === true && this.currentPrompt === null && this.phase === 'open') {
+      this.write(encodeText('\r', this.options.encoding === '' ? 'utf-8' : this.options.encoding))
+      this.record('system', 'wake', 'sent a bare Enter to wake a silent console')
+      const wakeDeadline = Date.now() + bannerWindowMs
+      while (Date.now() < wakeDeadline && this.currentPrompt === null && this.phase === 'open') {
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+    }
+
     const bannerText = decodeBytes(this.ring.slice(0), this.options.encoding === '' ? 'utf-8' : this.options.encoding)
     this.banner = boundUtf8(bannerText, BANNER_LIMIT_BYTES)
     return this.connectResult()

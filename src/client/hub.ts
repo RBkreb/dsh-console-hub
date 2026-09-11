@@ -138,6 +138,8 @@ export interface EngineDefaults {
   highRiskPatterns: string[]
   promptPattern: string
   pagerPattern: string
+  /** Whether a silent console is woken with one bare Enter on connect. */
+  wakeOnConnect: boolean
   connectTimeoutMs: number
   readTimeoutMs: number
   idleTimeoutMs: number

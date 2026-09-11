@@ -82,6 +82,13 @@ export interface PortManagerOptions {
   pagingQuietMs: number
   /** Prompt pattern source, compiled per console (a view may override it). */
   promptPattern: string
+  /**
+   * Send one bare Enter when a device says nothing on connect.
+   *
+   * Off by default: a device that does not need it must never receive an
+   * unsolicited keystroke. A deployment for silent console servers turns it on.
+   */
+  wakeOnConnect?: boolean
   /** Pager pattern source, compiled per console. */
   pagerPattern: string
 }
@@ -158,6 +165,10 @@ export class PortManager {
       pagerPattern: descriptor.pagerPattern ?? compilePattern(this.options.pagerPattern),
       scrollbackLimitBytes: this.options.scrollbackLimitBytes,
       outputLimitBytes: this.options.outputLimitBytes,
+      // Wake a console that says nothing on connect. Some console servers (both
+      // lab devices among them) stay silent until a key arrives, which would
+      // otherwise leave the caller with no banner and no prompt.
+      wakeOnConnect: this.options.wakeOnConnect,
       ...descriptor.password === undefined ? {} : { password: descriptor.password },
     })
     const entry: ConsoleEntry = {

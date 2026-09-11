@@ -32,6 +32,7 @@
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.client.json",
     "test": "node --import ./scripts/test-preload.mjs ./node_modules/vitest/vitest.mjs run",
     "test:watch": "node --import ./scripts/test-preload.mjs ./node_modules/vitest/vitest.mjs",
+    "test:live": "node scripts/test-live.mjs",
     "lint": "eslint ."
   },
   "dsh": {

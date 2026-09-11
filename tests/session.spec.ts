@@ -33,6 +33,14 @@ async function startFakeConsole(options: {
   greeting?: Uint8Array | string
   /** Answer each received line with this callback's return value. */
   onLine?: (line: string, index: number) => string | Uint8Array | undefined
+  /**
+   * Answer a bare Enter (a lone CR).
+   *
+   * A real console that stays silent until a key is pressed answers exactly
+   * this way, so the fake needs the same hook: `onLine` cannot express it,
+   * because an empty line is skipped as "nothing was typed".
+   */
+  onBareEnter?: () => string | Uint8Array | undefined
 } = {}): Promise<FakeConsole> {
   const received: string[] = []
   const receivedBytes: Buffer[] = []
@@ -46,6 +54,11 @@ async function startFakeConsole(options: {
       receivedBytes.push(chunk)
       const text = chunk.toString('utf8')
       received.push(text)
+      if (text === '\r' && options.onBareEnter !== undefined) {
+        const answer = options.onBareEnter()
+        if (answer !== undefined) socket.write(answer as never)
+        return
+      }
       if (options.onLine === undefined) return
       for (const line of text.split(/\r?\n/)) {
         if (line === '') continue
@@ -178,6 +191,51 @@ describe('ConsoleSession connect', () => {
     await session.open()
     await session.open()
     expect(server.connections).toBe(1)
+  })
+
+  it('wakes a silent console: the lab devices say nothing until Enter', async () => {
+    // Both lab devices (a DPtech firewall and switch) send only the Telnet
+    // negotiation burst and then stay completely silent -- no banner, no
+    // prompt -- until something is typed. A caller that just waits for a
+    // prompt therefore never gets one, and the model has no signal at all.
+    // Pressing Enter once turns the console into an ordinary `--More--`-paging
+    // CLI, so `wakeOnConnect` exists to do exactly that.
+    const server = await startFakeConsole({
+      greeting: Buffer.from([IAC, WILL, 1, IAC, WILL, 3]),
+      onBareEnter: () => '\r\n<DUT1>',
+    })
+    const session = track(sessionFor(server, { wakeOnConnect: true, bannerWindowMs: 800 }), server)
+
+    const connected = await session.open()
+    expect(connected.state).toBe('open')
+    // The bare Enter reached the device...
+    expect(server.receivedBytes.length).toBeGreaterThan(0)
+    expect(Buffer.concat(server.receivedBytes).toString('utf8')).toContain('\r')
+    // ...and the prompt it produced is what the connect reports.
+    expect(connected.prompt).toBe('<DUT1>')
+    expect(connected.banner).toContain('<DUT1>')
+  })
+
+  it('does not wake a device that already spoke', async () => {
+    // A device that greets on connect must not receive an unsolicited Enter:
+    // on some CLIs that is a real keystroke with consequences.
+    const server = await startFakeConsole({ greeting: '<DUT1>' })
+    const session = track(sessionFor(server, { wakeOnConnect: true }), server)
+    const connected = await session.open()
+    expect(connected.prompt).toBe('<DUT1>')
+    expect(server.receivedBytes.join('')).not.toContain('\r')
+  })
+
+  it('leaves a silent console silent when waking is not requested', async () => {
+    const server = await startFakeConsole({ greeting: Buffer.from([IAC, WILL, 1]) })
+    const session = track(sessionFor(server, { bannerWindowMs: 150 }), server)
+    const connected = await session.open()
+    expect(connected.state).toBe('open')
+    // Nothing was typed, so nothing came back -- a legal raw console.
+    expect(connected.prompt).toBeNull()
+    const written = Buffer.concat(server.receivedBytes)
+    // Only the negotiation reply (IAC DONT), never a carriage return.
+    expect(written.toString('utf8')).not.toContain('\r')
   })
 })
 
