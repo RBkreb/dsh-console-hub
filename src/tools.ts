@@ -14,6 +14,16 @@
  *
  * @module dsh-console-hub/tools
  */
+// The DSL compiler is a VALUE import on purpose: `register()` stores
+// `parameters` verbatim and the harness hands it straight to the model API, so
+// what gets registered must already be raw JSON Schema. Letting the harness's
+// own compiler do that conversion is the only way to be sure the two spellings
+// (the authoring DSL vs raw JSON Schema) are not confused -- confusing them is
+// exactly the bug this replaced: `parameters` written in the DSL has no
+// top-level `type`, and the provider rejects the whole tool list with
+// "schema must be a JSON Schema of 'type: \"object\"', got 'type: null'"
+// before the model can say anything at all.
+import { parameterSchemaSpecToJsonSchema } from '@deepseek-ai/dsh-tools'
 import type { ConsoleToolRegistry, ConsoleToolRunContext } from './context-types.ts'
 import type { ConsoleView } from './config-shared.ts'
 import { isConsoleEncoding } from './config-shared.ts'
@@ -215,7 +225,7 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
       'List every device console this session has open. Returns each console\'s handle, label, device address, '
       + 'transport, state, and how long it has been idle. Use it to recover state after a long sequence of calls, '
       + 'or to find a console you forgot to close.',
-    parameters: {},
+    parameters: parameterSchemaSpecToJsonSchema({}),
     output: {
       schema: outputSchema({
         consoles: {
@@ -262,7 +272,7 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
       + 'Returns a console handle plus what the device said on connect (banner and prompt). '
       + 'A connect that fails is still a result: it reports state "error" with a coded lastError so you can retry '
       + 'or pick a different device. The connection stays open until console_close.',
-    parameters: {
+    parameters: parameterSchemaSpecToJsonSchema({
       viewId: { type: 'string', description: 'Stored device view to connect to (preferred when one exists).' },
       host: { type: 'string', description: 'Console-server address, when no stored view is used.' },
       port: { type: 'number', description: 'Mapped console port, when no stored view is used.' },
@@ -277,7 +287,7 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
         description: 'Login password, used once to answer the device prompt and never stored. '
           + 'Prefer a stored credential on the view; only pass this when the user asks for an ad-hoc connection.',
       },
-    },
+    }),
     output: {
       schema: outputSchema({
         consoleId: { type: 'string' },
@@ -353,13 +363,13 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
       + 'include a trailing newline. Set `submit: false` to write without pressing Enter, and `submitKey` to override '
       + 'what Enter means for this device. High-risk commands (entering configuration mode, restarting) are refused '
       + 'unless the user approves them.',
-    parameters: {
+    parameters: parameterSchemaSpecToJsonSchema({
       consoleId: CONSOLE_ID,
       text: { type: 'string', required: true, description: 'The line to send (no trailing newline).' },
       submit: { type: 'boolean', description: 'Whether to append the submit key (default true).' },
       submitKey: { type: 'string', description: 'Submit key override; defaults to a carriage return.' },
       encoding: { type: 'string', description: 'Encoding override for this write.' },
-    },
+    }),
     output: {
       schema: outputSchema({
         consoleId: { type: 'string' },
@@ -413,13 +423,13 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
       + 'is read twice; the first call uses `after: 0`. Returns the decoded text, the next cursor, whether the answer '
       + 'was truncated at the output cap, and the device prompt if one is at the tail. '
       + 'Use `stripEcho` to drop the command line the device echoed back.',
-    parameters: {
+    parameters: parameterSchemaSpecToJsonSchema({
       consoleId: CONSOLE_ID,
       after: { type: 'number', description: 'Cursor to read from; omit or 0 for everything still buffered.' },
       encoding: { type: 'string', description: 'Encoding override for this read.' },
       stripEcho: { type: 'string', description: 'A command line to remove from the output (the echo of what you sent).' },
       maxBytes: { type: 'number', description: 'Cap on returned text bytes for this read.' },
-    },
+    }),
     output: {
       schema: outputSchema({
         text: { type: 'string' },
@@ -488,14 +498,14 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
       + 'or `for: "idle"` to wait until output stops arriving. This is the right way to wait for a command to finish — '
       + 'do not poll console_read in a loop. A timeout is a normal result (matched: false, reason: "timeout"), not an '
       + 'error, so read the output that did arrive.',
-    parameters: {
+    parameters: parameterSchemaSpecToJsonSchema({
       consoleId: CONSOLE_ID,
       for: { type: 'string', enum: ['prompt', 'idle', 'pattern'], description: 'What to wait for (default prompt).' },
       pattern: { type: 'string', description: 'Regular expression, required when `for` is "pattern".' },
       timeoutMs: { type: 'number', description: 'Budget in milliseconds; defaults to the plugin read timeout.' },
       after: { type: 'number', description: 'Cursor the wait starts from (your last read cursor).' },
       idleMs: { type: 'number', description: 'Quiet window that satisfies `for: "idle"`.' },
-    },
+    }),
     output: {
       schema: outputSchema({
         matched: { type: 'boolean' },
@@ -566,10 +576,10 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
       'Close a device console and release its connection to the console-server port. Use `force: true` when the '
       + 'device is not answering a graceful close. Close consoles when you are done with them: an idle console is '
       + 'reaped automatically after the idle window, and it holds a scarce serial port open until then.',
-    parameters: {
+    parameters: parameterSchemaSpecToJsonSchema({
       consoleId: CONSOLE_ID,
       force: { type: 'boolean', description: 'Destroy the socket instead of closing it gracefully.' },
-    },
+    }),
     output: {
       schema: outputSchema({
         consoleId: { type: 'string' },
@@ -595,7 +605,7 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
     description:
       'Show one console in detail: bytes read and written, the prompt last seen, encoding and paging state, and the '
       + 'audit trail of who sent what. Use it to understand what already happened on a console before acting.',
-    parameters: { consoleId: CONSOLE_ID },
+    parameters: parameterSchemaSpecToJsonSchema({ consoleId: CONSOLE_ID }),
     output: {
       schema: outputSchema({
         consoleId: { type: 'string' },

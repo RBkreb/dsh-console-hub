@@ -33,6 +33,7 @@
     "test": "node --import ./scripts/test-preload.mjs ./node_modules/vitest/vitest.mjs run",
     "test:watch": "node --import ./scripts/test-preload.mjs ./node_modules/vitest/vitest.mjs",
     "test:live": "node scripts/test-live.mjs",
+    "check:tools": "node --import ./scripts/test-preload.mjs scripts/check-tool-schema.mjs",
     "lint": "eslint ."
   },
   "dsh": {

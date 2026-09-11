@@ -12,7 +12,7 @@ import { PortManager } from '../src/port-manager.ts'
 import { DEFAULT_PAGER_PATTERN, DEFAULT_PROMPT_PATTERN } from '../src/config-shared.ts'
 import type { ConsoleToolRegistry, ConsoleToolRunContext } from '../src/context-types.ts'
 import type { ConsoleView } from '../src/config-shared.ts'
-import { assertSupportedJsonSchema } from '@deepseek-ai/dsh-tools'
+import { assertObjectJsonSchema, assertSupportedJsonSchema } from '@deepseek-ai/dsh-tools'
 
 /** A minimal tool definition as the fake registry sees it. */
 interface FrozenTool {
@@ -24,13 +24,19 @@ interface FrozenTool {
 }
 
 /**
- * A registry stub that validates every definition the way the real one does.
+ * A registry stub that validates every definition the way the model sees it.
  *
- * The validation is the point. An earlier version of this fake only read
- * `definition.name`, so all seven tools passed here while the REAL registry
- * rejected every one of them (`output.schema` used the `parameters` spelling of
- * `required`) and registered nothing. A fake that accepts anything cannot
- * notice that its subject is unregisterable.
+ * The validation is the point, and it must cover BOTH schemas:
+ *
+ * - `output.schema`, which `register()` checks. An earlier fake read only
+ *   `definition.name`, so all seven tools passed here while the real registry
+ *   rejected every one (the `required` spelling was the DSL's, not raw JSON
+ *   Schema) and registered nothing.
+ * - `parameters`, which `register()` does NOT check but the MODEL API does. A
+ *   DSL-spelled parameters object has no top-level `type`, so the provider
+ *   rejects the entire tool list -- "got 'type: null'" -- and no conversation can
+ *   start at all. Nothing in the harness catches that before the request leaves,
+ *   so this fake is the only place it can be caught.
  */
 function fakeRegistry(): ConsoleToolRegistry & { tools: Map<string, FrozenTool> } {
   const tools = new Map<string, FrozenTool>()
@@ -38,8 +44,11 @@ function fakeRegistry(): ConsoleToolRegistry & { tools: Map<string, FrozenTool> 
     tools,
     register(tool) {
       const frozen = tool as FrozenTool
-      // Same enforced-subset check the runtime applies before accepting a tool.
+      // What the runtime enforces at registration...
       assertSupportedJsonSchema(frozen.output.schema)
+      // ...and what the PROVIDER enforces on the way to the model, which the
+      // runtime does not check at all.
+      assertObjectJsonSchema(frozen.parameters)
       tools.set(frozen.name, frozen)
       return () => tools.delete(frozen.name)
     },

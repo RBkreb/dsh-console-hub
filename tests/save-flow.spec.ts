@@ -280,3 +280,72 @@ describe('save then list, through the registered route', () => {
     expect((listed.body as { value: { views: unknown[] } }).value.views).toHaveLength(0)
   })
 })
+
+describe('the session store is advisory, never a gate', () => {
+  /**
+   * A scene whose session store does NOT know the panel's id.
+   *
+   * This is the shape of a real failure: the same build saved devices happily
+   * under one profile and refused every call with `no session "..."` under
+   * another, because that profile's store did not recognise the panel's id. The
+   * panel's calls all carry the SAME id, so consoles are consistently scoped to
+   * it either way -- refusing gains nothing and loses the whole panel.
+   *
+   * @param store - what the `sessions` service should look like, if anything.
+   * @returns the registered route and the settings document.
+   */
+  async function sceneWithSessions(store: unknown): Promise<{
+    route: ConsoleWebRoute
+    document: () => unknown
+  }> {
+    const settings = settingsService()
+    const server = webServer()
+    const services: Record<string, unknown> = {
+      settings: settings.service,
+      webServer: server.service,
+      credentials: credentials(),
+    }
+    if (store !== undefined) services.sessions = store
+    const { ctx, flush } = fakeContext(services)
+    apply(ctx, {})
+    await flush()
+    return { route: server.routes[0] as ConsoleWebRoute, document: settings.document }
+  }
+
+  it('serves the panel when the session store does not know its id', async () => {
+    const { route, document } = await sceneWithSessions({ get: () => undefined })
+    const saved = await call(route, 'config.upsert', {
+      sessionId: 'session-unknown-to-this-store',
+      name: 'FW1',
+      host: '10.133.6.253',
+      port: 10003,
+      kind: 'telnet',
+    })
+    expect(saved.status).toBe(200)
+    expect(JSON.stringify(document())).toContain('10.133.6.253')
+  })
+
+  it('serves the panel when the session store is absent entirely', async () => {
+    const { route } = await sceneWithSessions(undefined)
+    const listed = await call(route, 'config.list', { sessionId: 'session-a' })
+    expect(listed.status).toBe(200)
+  })
+
+  it('serves the panel even when the session store throws on lookup', async () => {
+    // A store that throws is less of an authority on the caller's identity than
+    // one that merely does not know it, so it must not become a new failure.
+    const { route } = await sceneWithSessions({
+      get: () => {
+        throw new Error('session store unavailable')
+      },
+    })
+    const listed = await call(route, 'config.list', { sessionId: 'session-a' })
+    expect(listed.status).toBe(200)
+  })
+
+  it('still refuses an empty session id, which names nothing at all', async () => {
+    const { route } = await sceneWithSessions({ get: () => undefined })
+    const refused = await call(route, 'config.list', { sessionId: '' })
+    expect(refused.status).toBe(400)
+  })
+})

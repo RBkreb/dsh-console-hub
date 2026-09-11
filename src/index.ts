@@ -285,14 +285,44 @@ function installApi(
   /**
    * Whether a session id names a live session.
    *
-   * Ownership at the manager already isolates consoles, so an absent session
-   * store accepts a non-empty id rather than refusing every caller and making
-   * the panel unusable.
+   * Advisory only, and deliberately never a refusal. The panel sends the id of
+   * the conversation it is attached to, and every call it makes reuses that same
+   * id -- so consoles end up consistently scoped to it whether or not a session
+   * store in THIS process happens to recognise it. Isolation comes from the
+   * manager's per-owner scoping plus the route's browser-trust and
+   * authentication fences, not from this lookup.
+   *
+   * It was a hard gate once, and that broke the whole panel in a composition
+   * whose session store did not know the panel's id: saving a device failed with
+   * `no session "..."` even though the same code worked under another profile.
+   * A gate with a catastrophic failure mode that protects nothing is worth less
+   * than the diagnostic it can still provide, so an unrecognised id is logged
+   * and accepted rather than rejected.
    */
+  const unrecognised = new Set<string>()
   const sessionExists = async (sessionId: string): Promise<boolean> => {
+    if (sessionId === '') return false
     const sessions = ctx.get<{ get?: (id: string) => unknown }>('sessions')
-    if (sessions?.get === undefined) return sessionId !== ''
-    return sessions.get(sessionId) !== undefined
+    if (sessions?.get === undefined) return true
+    let known: boolean
+    try {
+      known = sessions.get(sessionId) !== undefined
+    } catch (error) {
+      // A store that throws is even less of an authority on the caller's
+      // identity than one that merely does not know it.
+      ctx.logger?.warn(`console-hub: the session store rejected a lookup for "${sessionId}": ${String(error)}`)
+      return true
+    }
+    if (!known && !unrecognised.has(sessionId)) {
+      // Once per id: this runs on every panel request, and the useful signal is
+      // the first occurrence, not the hundredth.
+      unrecognised.add(sessionId)
+      ctx.logger?.warn(
+        `console-hub: the session store does not know "${sessionId}"; serving it anyway, because the panel's own id is `
+        + 'consistent across calls and consoles are scoped by it regardless',
+      )
+    }
+    return true
   }
 
   const hub: ConsoleHubApi = {

@@ -9,7 +9,7 @@
  *
  * Usage: node --import ./scripts/test-preload.mjs scripts/check-tool-schema.mjs
  */
-import { assertSupportedJsonSchema } from '@deepseek-ai/dsh-tools'
+import { assertObjectJsonSchema, assertSupportedJsonSchema } from '@deepseek-ai/dsh-tools'
 import { registerConsoleTools } from '../src/tools.ts'
 
 /** Collect every definition the registrar tries to register. */
@@ -47,7 +47,20 @@ let failures = 0
 
 for (const definition of captured) {
   const name = definition.name
-  // 1. The output schema is the enforced-subset contract.
+  // The check `register()` OMITS. `parameters` is stored verbatim and handed to
+  // the model API, so it must already be raw JSON Schema with an object root. A
+  // DSL-spelled parameters object has no top-level `type`, and the provider then
+  // rejects the WHOLE tool list -- "schema must be a JSON Schema of
+  // 'type: \"object\"', got 'type: null'" -- before the model can reply at all.
+  try {
+    assertObjectJsonSchema(definition.parameters)
+    console.log(`[check] ${name}: parameters OK`)
+  } catch (error) {
+    failures += 1
+    console.log(`[check] ${name}: parameters REJECTED -> ${error.message}`)
+  }
+
+  // The output schema is the enforced-subset contract (which register DOES check).
   try {
     assertSupportedJsonSchema(definition.output.schema)
     console.log(`[check] ${name}: output.schema OK`)
@@ -74,11 +87,21 @@ for (const definition of captured) {
   }
   scan(definition.output.schema, 'output.schema')
 
-  // 3. The parameters DSL is separate from output: `required: true` is correct there.
-  for (const [key, spec] of Object.entries(definition.parameters ?? {})) {
-    if (spec !== null && typeof spec === 'object' && spec.type === undefined && spec.oneOf === undefined) {
+  // 3. Every property the model is offered must carry a description, and every
+  //    name listed in `required` must actually be declared. Both are silent
+  //    quality failures otherwise: an undescribed parameter is a parameter the
+  //    model guesses at, and a required name with no property is unsatisfiable.
+  const properties = definition.parameters?.properties ?? {}
+  for (const [key, spec] of Object.entries(properties)) {
+    if (spec.description === undefined || spec.description === '') {
       failures += 1
-      console.log(`[check] ${name}: parameters.${key} declares no type`)
+      console.log(`[check] ${name}: parameters.properties.${key} has no description`)
+    }
+  }
+  for (const key of definition.parameters?.required ?? []) {
+    if (!(key in properties)) {
+      failures += 1
+      console.log(`[check] ${name}: parameters.required names undeclared property "${key}"`)
     }
   }
 }
