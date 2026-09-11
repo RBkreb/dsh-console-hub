@@ -116,11 +116,43 @@ function text(value: string): { type: 'text', text: string }[] {
   return [{ type: 'text', text: value }]
 }
 
-/** Render one console entry as a line. */
-function entryLine(entry: ConsoleEntry): string {
-  const error = entry.lastError === null ? '' : ` [${entry.lastError.code}]`
-  return `${entry.consoleId}  ${entry.label}  ${entry.host}:${String(entry.port)}  ${entry.kind}  `
-    + `${entry.state}${error}  idle ${String(Math.round(entry.idleMs / 1000))}s`
+/**
+ * One console as `console_list` reports it.
+ *
+ * Declared as its own type, and the renderer below typed against IT rather than
+ * against `ConsoleEntry`, because the two are not the same shape. The renderer
+ * used to receive the projection while reading the entry's `lastError` field,
+ * which the projection does not carry -- so `console_list` threw
+ * `Cannot read properties of undefined (reading 'code')` whenever any console
+ * was open. Typing the renderer against what the body actually returns makes
+ * that mismatch a compile error instead of a crash.
+ */
+interface ConsoleListRow {
+  consoleId: string
+  label: string
+  host: string
+  port: number
+  kind: string
+  state: string
+  secure: boolean
+  idleMs: number
+  /** Present only when the console recorded a failure. */
+  lastErrorCode?: string
+}
+
+/** The handle, quoted so its boundary is unambiguous in rendered text. */
+function handle(id: string): string {
+  // A bare handle at the end of a sentence invites copying the punctuation with
+  // it -- against a real device the model did exactly that, and the retry failed
+  // with "not found for this session". Quoting is cheaper than that retry.
+  return `"${id}"`
+}
+
+/** Render one console as a line. */
+function consoleRowLine(row: ConsoleListRow): string {
+  const error = row.lastErrorCode === undefined ? '' : ` [${row.lastErrorCode}]`
+  return `${handle(row.consoleId)}  ${row.label}  ${row.host}:${String(row.port)}  ${row.kind}  `
+    + `${row.state}${error}  idle ${String(Math.round(row.idleMs / 1000))}s`
 }
 
 /** The calling agent's session id, or a throw that names the missing scope. */
@@ -239,18 +271,19 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
             state: { type: 'string' },
             secure: { type: 'boolean' },
             idleMs: { type: 'number' },
+            lastErrorCode: { type: 'string' },
           }, ['consoleId', 'label', 'host', 'port', 'kind', 'state', 'secure', 'idleMs']),
         },
       }, ['consoles']),
       render: (_args: unknown, value: unknown) => {
-        const consoles = (value as { consoles: ConsoleEntry[] }).consoles
+        const consoles = (value as { consoles: ConsoleListRow[] }).consoles
         if (consoles.length === 0) return text('No device consoles are open in this session.')
-        return text(consoles.map(entryLine).join('\n'))
+        return text(consoles.map(consoleRowLine).join('\n'))
       },
     },
     execute: async (args: unknown, exec: ConsoleToolRunContext) => {
       assertLive(exec)
-      const consoles = deps.manager.list(sessionIdOf(exec)).map(entry => ({
+      const consoles: ConsoleListRow[] = deps.manager.list(sessionIdOf(exec)).map(entry => ({
         consoleId: entry.consoleId,
         label: entry.label,
         host: entry.host,
@@ -259,6 +292,10 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
         state: entry.state,
         secure: entry.secure,
         idleMs: entry.idleMs,
+        // The failure code is why a console needs attention, so the list carries
+        // it. Omitted rather than null when there is none: the schema declares an
+        // optional string, and an explicit null would violate it.
+        ...entry.lastError === null ? {} : { lastErrorCode: entry.lastError.code },
       }))
       return { consoles }
     },
@@ -313,17 +350,20 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
           lastErrorCode?: string
         }
         if (result.state === 'open') {
-          const prompt = result.prompt === undefined ? '' : ` prompt ${result.prompt}`
+          const prompt = result.prompt === undefined ? '' : `, prompt ${handle(result.prompt)}`
           const banner = result.banner === '' ? '' : `\n--- connect output ---\n${result.banner}`
+          // The handle is quoted and labelled, and no separator follows it: a
+          // bare trailing handle invites copying the sentence's punctuation into
+          // the id, which is exactly what happened against a real device.
           return text(
-            `Connected to "${result.label}" (${result.host}:${String(result.port)}) as ${result.consoleId};`
-            + `${prompt}.${banner}`,
+            `Connected to "${result.label}" (${result.host}:${String(result.port)}). `
+            + `Handle ${handle(result.consoleId)}${prompt}.${banner}`,
           )
         }
         return text(
           `Console "${result.label}" (${result.host}:${String(result.port)}) is ${result.state}`
           + `${result.lastErrorCode === undefined ? '' : `: ${result.lastErrorCode}`}. `
-          + `Handle ${result.consoleId} stays listed so it can be closed or retried.`,
+          + `Handle ${handle(result.consoleId)} stays listed so it can be closed or retried.`,
         )
       },
     },

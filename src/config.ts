@@ -85,9 +85,10 @@ export const ConsoleHubSettingsSchema: z<ConsoleHubSettings> = z.object({
   highRiskPatterns: z.array(z.string()).default([...DEFAULT_HIGH_RISK_PATTERNS]),
   promptPattern: z.string().default(DEFAULT_CONSOLE_HUB_SETTINGS.promptPattern),
   pagerPattern: z.string().default(DEFAULT_CONSOLE_HUB_SETTINGS.pagerPattern),
-  // Off by default: only a deployment whose console servers are silent until a
-  // key press should turn this on, because it sends a real keystroke.
-  wakeOnConnect: z.boolean().default(false),
+  // ON by default: without it a silent console eats the caller's first command
+  // as the wake keystroke, which reads as a broken console rather than a
+  // missing newline. See the field's docs in config-shared.ts.
+  wakeOnConnect: z.boolean().default(true),
   agentInstructions: z.string().default(''),
   agentConsoleTools: z.boolean().default(true),
   views: z.dict(viewSchema()).default({}),

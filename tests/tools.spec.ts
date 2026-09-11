@@ -163,11 +163,32 @@ async function scene(): Promise<Scene> {
   return { registry, manager, dispose, view }
 }
 
-/** Call one registered tool and return its canonical value. */
+/**
+ * Call one registered tool, then render its canonical value.
+ *
+ * The render is invoked on EVERY call, not just in dedicated presentation
+ * tests, because `render` receives the value `execute` returns and the two can
+ * disagree silently: `console_list` built a projection without `lastError`
+ * while its renderer read `lastError.code`, so the tool threw
+ * `Cannot read properties of undefined (reading 'code')` whenever a console was
+ * open -- and the suite was green, because it only ever listed an EMPTY
+ * inventory. Running both halves together on every path is what makes that
+ * class of mismatch impossible to reintroduce.
+ *
+ * @param scene - the wired tool family.
+ * @param name - the tool to call.
+ * @param args - model arguments.
+ * @param exec - the execution identity.
+ * @returns the canonical value the tool produced.
+ * @throws {Error} when the renderer cannot render that value.
+ */
 async function callTool(scene: Scene, name: string, args: unknown, exec = execFor()): Promise<unknown> {
   const tool = scene.registry.tools.get(name)
   if (tool === undefined) throw new Error(`tool "${name}" is not registered`)
-  return tool.execute(args, exec)
+  const value = await tool.execute(args, exec)
+  // The same order the registry uses: execute, then the pure text projection.
+  tool.output.render(args, value)
+  return value
 }
 
 describe('console tool registration', () => {
@@ -515,5 +536,51 @@ describe('agent context', () => {
       signal: controller.signal,
     }
     await expect(callTool(scene1, 'console_connect', { viewId: 'v-known' }, context)).rejects.toThrow()
+  })
+})
+
+describe('the rendered text is usable as-is', () => {
+  /** Render one tool's result the way the registry does. */
+  function renderOf(scene: Scene, name: string, value: unknown): string {
+    const tool = scene.registry.tools.get(name)
+    if (tool === undefined) throw new Error(`tool "${name}" is not registered`)
+    return tool.output.render({}, value).map(block => block.text).join('\n')
+  }
+
+  it('lists an open console instead of throwing on its own projection', async () => {
+    // The bug this pins: the list body built a projection with no `lastError`,
+    // while the renderer read `lastError.code`. Listing an OPEN console threw
+    // `Cannot read properties of undefined (reading 'code')` -- and the suite
+    // stayed green because nothing had ever listed a NON-empty inventory.
+    const scene1 = await scene()
+    const opened = await callTool(scene1, 'console_connect', { viewId: 'v-known' }) as { consoleId: string }
+    const value = await callTool(scene1, 'console_list', {})
+    const rendered = renderOf(scene1, 'console_list', value)
+    expect(rendered).toContain(opened.consoleId)
+    expect(rendered).toContain('open')
+  })
+
+  it('quotes the handle so its boundary is unambiguous', async () => {
+    // Against a real device the handle was rendered as the last token before a
+    // separator, and the separator was copied back as part of the id, costing a
+    // failed retry. Quoting makes the boundary explicit.
+    const scene1 = await scene()
+    const opened = await callTool(scene1, 'console_connect', { viewId: 'v-known' }) as { consoleId: string }
+    const connectText = renderOf(scene1, 'console_connect', opened)
+    expect(connectText).toContain(`Handle "${opened.consoleId}"`)
+    // And the id must NOT be immediately followed by punctuation.
+    expect(connectText).not.toContain(`${opened.consoleId};`)
+
+    const listed = renderOf(scene1, 'console_list', await callTool(scene1, 'console_list', {}))
+    expect(listed).toContain(`"${opened.consoleId}"`)
+  })
+
+  it('reports a failed console with its error code in the list', async () => {
+    // A console in state `error` is exactly the one a caller needs explained.
+    const scene1 = await scene()
+    await callTool(scene1, 'console_connect', { host: '127.0.0.1', port: 1, kind: 'raw', label: 'dead' })
+    const value = await callTool(scene1, 'console_list', {})
+    const rendered = renderOf(scene1, 'console_list', value)
+    expect(rendered).toMatch(/error|closed/)
   })
 })

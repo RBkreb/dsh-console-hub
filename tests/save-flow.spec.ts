@@ -25,20 +25,40 @@ import type { ConsoleHubSettings } from '../src/config-shared.ts'
 import type { Context, ConsoleWebRoute } from '../src/context-types.ts'
 
 /**
- * A settings store that models the real seam's layering: schema defaults, then
- * the user section. `update` commits asynchronously, so a write that is read
- * back synchronously is a real failure rather than a fake quirk.
+ * A settings store that models the real seam's TWO layers, including the
+ * distinction that caused an empty panel over a populated file.
+ *
+ * The real seam keeps `document[ns]` (the raw stored section) and
+ * `registration.resolved` (the value frozen at registration, refreshed only by a
+ * commit the seam recognises as current) as separate things. `write()` updates
+ * the document unconditionally, then commits conditionally:
+ *
+ *     await this.persist(ns, section)
+ *     this.document[ns] = section                 // always
+ *     if (current registration) this.commit(...)  // maybe
+ *
+ * `scope.get()` reads the frozen value; `describe().user` reads the document.
+ * An earlier fake resolved `get()` fresh on every call, so it could not
+ * represent a stale registration at all -- which is precisely why this bug
+ * reached a real deployment.
  */
-function settingsService(): { service: unknown, document: () => unknown } {
+function settingsService(): {
+  service: unknown
+  document: () => unknown
+  /** A write the seam persists but does not commit to the registration. */
+  writeWithoutCommit(patch: Record<string, unknown>): void
+} {
   let user: Record<string, unknown> = {}
   let revision = 1
+  /** The frozen value `scope.get()` returns. */
+  let frozen: ConsoleHubSettings = parseSettingsDocument(user)
   const watchers: Array<(next: ConsoleHubSettings) => void> = []
 
   /** Resolve exactly as the seam does: schema over the user section. */
   const resolve = (): ConsoleHubSettings => parseSettingsDocument(user)
 
   const scope = {
-    get: resolve,
+    get: () => frozen,
     watch(callback: (next: ConsoleHubSettings) => void) {
       watchers.push(callback)
       return () => {}
@@ -51,22 +71,29 @@ function settingsService(): { service: unknown, document: () => unknown } {
       // Re-resolve so an invalid document is refused at the write, as the real
       // seam's validate hook would refuse it.
       resolve()
-      for (const watcher of watchers) watcher(resolve())
+      frozen = resolve()
+      for (const watcher of watchers) watcher(frozen)
     },
     async replace(section: object) {
       await Promise.resolve()
       user = section as Record<string, unknown>
       revision += 1
       resolve()
-      for (const watcher of watchers) watcher(resolve())
+      frozen = resolve()
+      for (const watcher of watchers) watcher(frozen)
     },
   }
 
   return {
     document: () => user,
+    writeWithoutCommit(patch) {
+      // The document advances; the registration's frozen value does not.
+      user = { ...user, ...patch }
+      revision += 1
+    },
     service: {
       register: () => scope,
-      describe: () => [{ ns: 'dsh-console-hub', value: resolve(), revision }],
+      describe: () => [{ ns: 'dsh-console-hub', value: frozen, revision, user: structuredClone(user) }],
       update: async (_ns: string, patch: object) => {
         await scope.update(patch)
       },
@@ -193,6 +220,7 @@ async function call(
 async function scene(): Promise<{
   route: ConsoleWebRoute
   document: () => unknown
+  writeWithoutCommit(patch: Record<string, unknown>): void
 }> {
   const settings = settingsService()
   const server = webServer()
@@ -204,7 +232,11 @@ async function scene(): Promise<{
   apply(ctx, {})
   await flush()
   expect(server.routes).toHaveLength(1)
-  return { route: server.routes[0] as ConsoleWebRoute, document: settings.document }
+  return {
+    route: server.routes[0] as ConsoleWebRoute,
+    document: settings.document,
+    writeWithoutCommit: settings.writeWithoutCommit,
+  }
 }
 
 describe('save then list, through the registered route', () => {
@@ -347,5 +379,60 @@ describe('the session store is advisory, never a gate', () => {
     const { route } = await sceneWithSessions({ get: () => undefined })
     const refused = await call(route, 'config.list', { sessionId: '' })
     expect(refused.status).toBe(400)
+  })
+})
+
+describe('the stored document wins over a stale registration', () => {
+  /**
+   * The failure this pins, as it actually appeared in a deployment.
+   *
+   * `settings.yaml` held three saved devices. The panel listed none of them, the
+   * model's `console_connect` could not resolve a `viewId`, and nothing logged
+   * an error anywhere -- because the plugin read the value the seam froze at
+   * registration, while the stored document had moved on.
+   *
+   * Reading the stored section is the correct behaviour regardless of how the
+   * two drifted: the stored document is what survives a restart, so it is what
+   * the panel must show and what the engine must use.
+   */
+  const savedViews = {
+    'v-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee': {
+      name: 'FW1',
+      host: '10.133.6.253',
+      port: 10003,
+      kind: 'telnet',
+    },
+  }
+
+  it('lists devices that are stored but missing from the frozen value', async () => {
+    const { route, document, writeWithoutCommit } = await scene()
+    writeWithoutCommit({ views: savedViews })
+    expect(JSON.stringify(document())).toContain('10.133.6.253')
+
+    const listed = await call(route, 'config.list', { sessionId: 'session-a' })
+    expect(listed.status).toBe(200)
+    const views = (listed.body as { value: { views: Array<{ viewId: string, view: { name: string } }> } }).value.views
+    expect(views).toHaveLength(1)
+    expect(views[0]?.view.name).toBe('FW1')
+  })
+
+  it('resolves a stored view by id, so console.connect can reach it', async () => {
+    // The tool path reads the same resolver, so `console_connect { viewId }`
+    // answering "no stored view" was the second face of this one bug.
+    const { route, writeWithoutCommit } = await scene()
+    writeWithoutCommit({ views: savedViews })
+    const connected = await call(route, 'console.connect', {
+      sessionId: 'session-a',
+      viewId: 'v-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+    })
+    // It reached the device layer (and failed there, since nothing listens),
+    // which is the point: the view RESOLVED instead of being reported missing.
+    expect(JSON.stringify(connected.body)).not.toContain('no view')
+  })
+
+  it('still serves a read when the seam cannot describe its namespaces', async () => {
+    const { route } = await scene()
+    const listed = await call(route, 'config.list', { sessionId: 'session-a' })
+    expect(listed.status).toBe(200)
   })
 })

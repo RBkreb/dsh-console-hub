@@ -134,11 +134,20 @@ export interface ConsoleHubSettings {
    * Send one bare Enter when a device says nothing on connect.
    *
    * Some console servers stay completely silent until a key is pressed: no
-   * banner, no prompt. Against such a device every read is empty and the model
-   * has nothing to key off, even though the console is fine. One Enter wakes it.
+   * banner, no prompt. Against such a device every read is empty and there is
+   * nothing to key off, even though the console is fine. One Enter wakes it.
    *
-   * Off by default, because a device that does not need it must never receive an
-   * unsolicited keystroke.
+   * ON by default, which is a deliberate reversal of the first design. Measured
+   * against real hardware: without it the device consumes the caller's FIRST
+   * command as the wake keystroke -- it echoes the line and returns a prompt
+   * with no output, so `show version` appears to do nothing and the console
+   * looks broken. Silently losing a command is a far worse failure than an
+   * unsolicited newline, and the Enter is sent only after the whole banner
+   * window elapsed with no prompt, so a device that greets on connect never
+   * receives one at all.
+   *
+   * A deployment where Enter is meaningfully destructive (a boot menu that acts
+   * on any key, say) turns this off.
    */
   wakeOnConnect: boolean
   /** Prompt snippet appended to the model-facing rules (kept as a separate
@@ -167,7 +176,7 @@ export const DEFAULT_CONSOLE_HUB_SETTINGS: ConsoleHubSettings = {
   highRiskPatterns: [...DEFAULT_HIGH_RISK_PATTERNS],
   promptPattern: DEFAULT_PROMPT_PATTERN,
   pagerPattern: DEFAULT_PAGER_PATTERN,
-  wakeOnConnect: false,
+  wakeOnConnect: true,
   agentInstructions: '',
   agentConsoleTools: true,
   views: {},

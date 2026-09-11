@@ -16,6 +16,7 @@
  * @module dsh-console-hub/client/ConsoleHubView
  */
 import { useCallback, useEffect, useRef, useState, type ReactElement } from 'react'
+import { HubApiError } from './api.ts'
 import type { ClientTabPropsLike, ConsoleHub, ConsoleRow, ViewRow } from './hub.ts'
 import { shouldPoll } from './poll.ts'
 import { uiPrefs } from './prefs.ts'
@@ -39,6 +40,19 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
+/**
+ * Whether a failure means the console is no longer there.
+ *
+ * `not-found` covers both "closed from another surface" and "reaped while
+ * idle", and `session-gone` covers a session that ended. None of them is an
+ * error the user can act on, so they are reconciled rather than reported.
+ *
+ * @param error - the thrown failure.
+ * @returns true when the console should be dropped from the view.
+ */
+function isGone(error: unknown): boolean {
+  return error instanceof HubApiError && (error.code === 'not-found' || error.code === 'session-gone')
+}
 /** One toolbar button. */
 function button(
   label: string,
@@ -186,7 +200,16 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
     }
   }, [hub, sessionId, selected, refresh])
 
-  /** Read whatever the device has said since the cursor. */
+  /**
+   * Read whatever the device has said since the cursor.
+   *
+   * A console can disappear while the panel is watching it: the model may close
+   * it, or the idle reaper may collect it. The host answers `not-found`, and that
+   * is a fact to reconcile rather than an error to display -- showing it as a
+   * banner left a permanent red strip over a console that no longer existed, and
+   * the list kept listing it because polling never refreshed the inventory.
+   * Drop it, refresh, and keep going.
+   */
   const readOnce = useCallback(async () => {
     if (selected === undefined) return
     try {
@@ -198,9 +221,20 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
         setStatus('自动翻页达到页数上限，点击“继续翻页”接着读。')
       }
     } catch (failure) {
+      if (isGone(failure)) {
+        // The console ended elsewhere. Clear the selection so the poll stops, and
+        // re-read the inventory so the list agrees with the host.
+        setSelected(undefined)
+        setOutput('')
+        setPaging(false)
+        setStatus('该控制台已结束（被关闭或已超时回收）。')
+        setError(null)
+        await refresh()
+        return
+      }
       setError(messageOf(failure))
     }
-  }, [hub, sessionId, selected])
+  }, [hub, sessionId, selected, refresh])
 
   // The read loop. `visible` is part of the condition, not just a dependency:
   // a hidden tab stays mounted in this shell and must not keep polling.

@@ -49,6 +49,31 @@ export interface ApiClient {
 }
 
 /**
+ * One API failure, carrying the host's machine-readable code.
+ *
+ * The code matters to callers. A console that vanished (closed from another
+ * surface, or idle-reaped) answers `not-found`, and that is not an error to
+ * shout about -- it is a fact to reconcile against. Flattening every failure
+ * into a bare `Error` forced the view to match on message text, so it showed a
+ * permanent red banner for a console that simply no longer existed.
+ */
+export class HubApiError extends Error {
+  /**
+   * @param code - the host's error code (`not-found`, `forbidden`, ...).
+   * @param message - the host's human-readable message.
+   * @param status - the HTTP status the host answered with.
+   */
+  constructor(
+    readonly code: string,
+    message: string,
+    readonly status: number,
+  ) {
+    super(message)
+    this.name = 'HubApiError'
+  }
+}
+
+/**
  * Build an API client.
  * @param fetchImpl - the fetch implementation (defaults to the global one).
  * @returns the client.
@@ -70,7 +95,7 @@ export function createApiClient(fetchImpl?: FetchLike): ApiClient {
         // would make a broken route look like an empty result.
         throw new Error(`console-hub API "${method}" answered an unreadable body: ${String(error)}`)
       }
-      if (isErrEnvelope(body)) throw new Error(body.error.message)
+      if (isErrEnvelope(body)) throw new HubApiError(body.error.code, body.error.message, response.status)
       if (isOkEnvelope(body)) return body.value as T
       // Neither envelope: a wiring problem (an intercepting proxy, a wrong
       // prefix), which must be loud rather than silently undefined.

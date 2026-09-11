@@ -142,19 +142,75 @@ export function apply(ctx: Context, config?: ConsoleHubConfig): void {
   ctx.inject(['settings'], (scoped) => {
     const binding = bindSettings(scoped.settings as ConsoleSettingsService)
 
-    /** Resolve the live settings value, falling back to the shipped defaults. */
-    const readSettings = (): ConsoleHubSettings => {
+    /**
+     * The RAW stored section, read live.
+     *
+     * `scope.get()` returns a value the seam froze when the namespace was
+     * registered and refreshes only on a commit it recognises as current.
+     * `describe().user`, by contrast, reads the provider's live document -- the
+     * same document a write updates unconditionally. When those two disagree,
+     * the panel must show what is STORED: that is what survives a restart, and
+     * it is what the configuration-surface read path exists for.
+     *
+     * Returns `undefined` whenever the seam cannot answer, so the caller falls
+     * back to the registered scope rather than losing the read entirely.
+     *
+     * @returns the raw user section, or `undefined` when unavailable.
+     */
+    const storedSection = (): unknown => {
+      const service = binding.service as {
+        describe?: () => Array<{ ns: string, user?: unknown }>
+      }
+      if (typeof service.describe !== 'function') return undefined
       try {
-        return parseSettingsDocument(binding.scope.get())
-      } catch {
-        // A stored document that no longer resolves must not break the panel:
-        // the engine keeps running the policy it already has.
+        return service.describe().find(entry => entry.ns === CONSOLE_HUB_SETTINGS_NS)?.user
+      } catch (error) {
+        logger?.warn(`console-hub: the settings service could not describe its namespaces: ${String(error)}`)
+        return undefined
+      }
+    }
+
+    /** Announce a divergence between the stored section and the frozen value, once. */
+    let divergenceReported = false
+    const reportDivergence = (stored: unknown, frozen: ConsoleHubSettings): void => {
+      if (divergenceReported) return
+      const storedViews = Object.keys((stored as { views?: object } | undefined)?.views ?? {}).length
+      const frozenViews = Object.keys(frozen.views).length
+      if (storedViews === frozenViews) return
+      divergenceReported = true
+      // This is the line that explains an empty panel over a populated file.
+      logger?.warn(
+        `console-hub: the settings document holds ${String(storedViews)} saved device(s) but the registered value holds `
+        + `${String(frozenViews)}; reading the stored document`, 
+      )
+    }
+
+    /** Resolve the settings value, preferring the stored document over the frozen one. */
+    const readSettings = (): ConsoleHubSettings => {
+      const stored = storedSection()
+      const frozen = binding.scope.get()
+      if (stored !== undefined) reportDivergence(stored, frozen)
+      try {
+        return parseSettingsDocument(stored ?? frozen)
+      } catch (error) {
+        // Previously silent, which is what made an unusable stored section look
+        // exactly like an empty inventory. Say so, and say why.
+        logger?.warn(
+          `console-hub: the stored settings section is unusable, serving the shipped defaults: `
+          + `${error instanceof Error ? error.message : String(error)}`,
+        )
         return parseSettingsDocument({})
       }
     }
 
-    // Bring the engine onto the stored document before anything can connect.
-    holder.reconfigure(policyFromSettings(readSettings(), resolved.sessionIdleSweepMs))
+    // Announce what the engine starts from, so a load-time mismatch is visible.
+    const initial = readSettings()
+    logger?.info(
+      `console-hub: loaded with ${String(Object.keys(initial.views).length)} saved device(s) `
+      + `(settings revision ${String(binding.scope as unknown as { revision?: number }['revision'] ?? 'n/a')})`,
+    )
+
+    holder.reconfigure(policyFromSettings(initial, resolved.sessionIdleSweepMs))
     active = { holder, settings: readSettings }
 
     // A parked policy lands as soon as the manager drains. The interval matches
