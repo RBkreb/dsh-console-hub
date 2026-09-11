@@ -238,6 +238,30 @@ describe('ConsoleSession send / read', () => {
     expect(read.text).not.toContain('show version')
   })
 
+  it('keeps an answer that merely CONTAINS the echoed command', async () => {
+    const server = await startFakeConsole({ greeting: '<DUT1>' })
+    const session = track(sessionFor(server), server)
+    await session.open()
+    await session.send('show version')
+    // The device echoes the command, then answers with a line that contains the
+    // same text. Line-exact filtering drops the echo and keeps the answer; a
+    // naive substring removal would corrupt the answer into nothing.
+    server.push('\r\nshow version\r\ncommand: show version\r\n<DUT1>')
+    await until(() => session.read({ after: 0, stripEcho: 'show version' }).text.includes('command:'))
+    const read = session.read({ after: 0, stripEcho: 'show version' })
+    expect(read.text).toContain('command: show version')
+    expect(read.text.split('\n').filter(line => line.trim() === 'show version')).toHaveLength(0)
+  })
+
+  it('treats an empty echo filter as a no-op', async () => {
+    const server = await startFakeConsole({ greeting: '<DUT1>' })
+    const session = track(sessionFor(server), server)
+    await session.open()
+    server.push('\r\nshow version\r\n<DUT1>')
+    await until(() => session.read({ after: 0, stripEcho: '' }).text.includes('show version'))
+    expect(session.read({ after: 0, stripEcho: '' }).text).toContain('show version')
+  })
+
   it('reports the prompt found in a read', async () => {
     const server = await startFakeConsole({ greeting: '<DUT1>' })
     const session = track(sessionFor(server), server)

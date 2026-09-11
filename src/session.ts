@@ -14,7 +14,7 @@
  * @module dsh-console-hub/session
  */
 import { Socket } from 'node:net'
-import { compilePattern, type PagingMode, type ConsoleKind } from './config-shared.ts'
+import { compileSearchPattern, type PagingMode, type ConsoleKind } from './config-shared.ts'
 import {
   createRingBuffer,
   decodeBytes,
@@ -147,6 +147,28 @@ export interface ConsoleReadResult {
   pager?: string
   /** Paging progress after this read. */
   paging: ConsolePagingState
+}
+
+/**
+ * Drop one echoed command LINE from decoded console output.
+ *
+ * A device that echoes what was typed repeats the command on its own line, so
+ * the filter removes whole lines whose trimmed text equals the command. A naive
+ * substring removal would corrupt a legitimate answer that merely CONTAINS the
+ * command — a `show version` whose output mentions `show version` is exactly the
+ * output a caller asked for, and must survive.
+ *
+ * @param text - the decoded output.
+ * @param command - the command whose echo should be removed (empty = no-op).
+ * @returns the text without its echoed command lines.
+ */
+export function stripEchoedCommand(text: string, command: string): string {
+  const target = command.trim()
+  if (target === '') return text
+  return text
+    .split(/(?<=\n)/)
+    .filter(line => line.replace(/[\r\n]+$/, '').trim() !== target)
+    .join('')
 }
 
 /** Construction options for one session (already defaulted by the caller). */
@@ -478,8 +500,8 @@ export class ConsoleSession {
     const consumed = Math.min(window.length, limit)
     const slice = window.slice(0, consumed)
     let text = decodeBytes(slice, encoding)
-    if (options.stripEcho !== undefined && options.stripEcho !== '') {
-      text = text.split(options.stripEcho).join('')
+    if (options.stripEcho !== undefined) {
+      text = stripEchoedCommand(text, options.stripEcho)
     }
     const tail = this.tailText()
     const prompt = matchPrompt(tail, this.options.promptPattern)
@@ -497,7 +519,7 @@ export class ConsoleSession {
     }
   }
 
-  /** Clear the automatic pager's abandonment so the next page is handled. */
+  /** Clear the automatic pager's abandonment so the next page is handled again. */
   resumePaging(): void {
     this.pagingAbandoned = false
     this.paging = { active: false, pagesConsumed: 0, reason: null }
@@ -515,7 +537,9 @@ export class ConsoleSession {
     const budgetMs = options.timeoutMs ?? this.options.readTimeoutMs
     const after = options.after ?? 0
     const condition = options.for ?? 'prompt'
-    const matcher = condition === 'pattern' ? compilePattern(options.pattern ?? '') : undefined
+    // A caller's pattern is a SEARCH over the window; the session's own prompt
+    // and pager matchers are the tail-anchored ones.
+    const matcher = condition === 'pattern' ? compileSearchPattern(options.pattern ?? '') : undefined
     const idleMs = options.idleMs ?? 250
 
     let lastGrowthAt = Date.now()

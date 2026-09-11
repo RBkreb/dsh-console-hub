@@ -205,6 +205,18 @@ export function compileCommandFence(source: string): RegExp {
 }
 
 /**
+ * Compile a caller-supplied search pattern: case-insensitive and UNANCHORED,
+ * because "wait until this appears in the output" is a search over the whole
+ * window, not a tail match. Prompt and pager patterns are the anchored ones.
+ * @param source - the pattern body.
+ * @returns the compiled matcher.
+ * @throws {SyntaxError} when `source` is not a valid regular expression.
+ */
+export function compileSearchPattern(source: string): RegExp {
+  return new RegExp(source, 'i')
+}
+
+/**
  * Whether a value names a supported encoding, accepting any letter case.
  * @param value - candidate encoding label.
  * @returns true when the console engine can transcode with it.

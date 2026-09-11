@@ -108,6 +108,8 @@ export interface ConsoleDetail {
 export class PortManager {
   private readonly options: PortManagerOptions
   private readonly consoles = new Map<string, Tracked>()
+  /** Connect banners, keyed by console id (see `connect`). */
+  private readonly banners = new Map<string, string>()
   private reaper: NodeJS.Timeout | undefined
   private disposed = false
 
@@ -174,8 +176,12 @@ export class PortManager {
     }
     this.consoles.set(consoleId, { entry, session, secure: entry.secure })
 
-    const status = await session.open()
-    return this.refresh(consoleId, status)
+    const connected = await session.open()
+    // The connect banner is the one thing only `open()` knows; keep it on the
+    // manager's own record so a later `describe` can report what a device said
+    // when it was first opened.
+    this.banners.set(consoleId, connected.banner)
+    return this.refresh(consoleId, connected)
   }
 
   /**
@@ -197,6 +203,18 @@ export class PortManager {
     const tracked = this.consoles.get(consoleId)
     if (tracked === undefined || tracked.entry.ownerSessionId !== ownerSessionId) return undefined
     return this.refresh(consoleId)
+  }
+
+  /**
+   * The banner one console's device sent when it was opened.
+   * @param ownerSessionId - the requesting session.
+   * @param consoleId - the console handle.
+   * @returns the banner, or an empty string when none was seen.
+   */
+  bannerOf(ownerSessionId: string, consoleId: string): string {
+    const tracked = this.consoles.get(consoleId)
+    if (tracked === undefined || tracked.entry.ownerSessionId !== ownerSessionId) return ''
+    return this.banners.get(consoleId) ?? ''
   }
 
   /**
@@ -273,6 +291,18 @@ export class PortManager {
   }
 
   /**
+   * Clear a console's pending pager state so the next page is handled again.
+   * @param ownerSessionId - the requesting session.
+   * @param consoleId - the console handle.
+   * @throws {Error} when the console is unknown to this owner.
+   */
+  resumePaging(ownerSessionId: string, consoleId: string): void {
+    const tracked = this.require(ownerSessionId, consoleId)
+    tracked.session.resumePaging()
+    this.refresh(consoleId)
+  }
+
+  /**
    * Close one console and drop it from the registry.
    * @param ownerSessionId - the requesting session.
    * @param consoleId - the console handle.
@@ -284,6 +314,7 @@ export class PortManager {
     await tracked.session.close(options)
     tracked.session.dispose()
     this.consoles.delete(consoleId)
+    this.banners.delete(consoleId)
   }
 
   /**
@@ -302,6 +333,7 @@ export class PortManager {
       await tracked.session.close({ force: true })
       tracked.session.dispose()
       this.consoles.delete(consoleId)
+      this.banners.delete(consoleId)
       reaped.push(consoleId)
     }
     return reaped
@@ -318,6 +350,7 @@ export class PortManager {
       await tracked.session.close({ force: true })
       tracked.session.dispose()
       this.consoles.delete(consoleId)
+      this.banners.delete(consoleId)
     }
   }
 
