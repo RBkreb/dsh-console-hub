@@ -21,11 +21,14 @@ import {
   CONSOLE_ENCODINGS,
   CONSOLE_KINDS,
   DEFAULT_CONSOLE_HUB_SETTINGS,
+  DEFAULT_FENCE_RULES,
   DEFAULT_HIGH_RISK_PATTERNS,
+  FENCE_ACTIONS,
   PAGING_MODES,
   compileCommandFence,
   compilePattern,
   compileSearchPattern,
+  type ConsoleFenceRule,
   type ConsoleHubSettings,
 } from './config-shared.ts'
 import { assertNoSecretsInViews } from './views.ts'
@@ -44,6 +47,25 @@ const viewPagingUnion = z.union([
   z.const('auto-interrupt'),
   z.const('manual'),
 ])
+
+/**
+ * One fence rule.
+ *
+ * BOTH matcher fields are declared, defaulting to the empty string, because the
+ * schema language cannot express "exactly one of these". The cross-field check in
+ * {@link findBadPatterns} is what enforces the either/or, and that check is not a
+ * nicety: a rule with no matcher matches NOTHING, so accepting one would let a
+ * typo silently remove a fence the author believed they had configured.
+ */
+function fenceRuleSchema(): z<ConsoleFenceRule> {
+  return z.object({
+    id: z.string(),
+    action: z.union(FENCE_ACTIONS.map(value => z.const(value))),
+    tokens: z.string().default(''),
+    pattern: z.string().default(''),
+    note: z.string().default(''),
+  }) as unknown as z<ConsoleFenceRule>
+}
 
 /** Build the row schema for one device mapping (no secret slot exists). */
 function viewSchema(): z<ConsoleHubSettings['views'][string]> {
@@ -87,7 +109,10 @@ export const ConsoleHubSettingsSchema: z<ConsoleHubSettings> = z.object({
   // keeps a mis-set value from making `for: "idle"` match instantaneously.
   idleQuietMs: z.number().step(1).min(50).max(600_000).default(1500),
   approvalMode: z.union([z.const('always'), z.const('high-risk')]).default('high-risk'),
-  highRiskPatterns: z.array(z.string()).default([...DEFAULT_HIGH_RISK_PATTERNS]),
+  // Defaults to EMPTY: enceRules carries the shipped fence, and this field
+  // only preserves what an older document already declared.
+  highRiskPatterns: z.array(z.string()).default([]),
+  fenceRules: z.array(fenceRuleSchema()).default(DEFAULT_FENCE_RULES.map(rule => ({ ...rule }))),
   promptPattern: z.string().default(DEFAULT_CONSOLE_HUB_SETTINGS.promptPattern),
   pagerPattern: z.string().default(DEFAULT_CONSOLE_HUB_SETTINGS.pagerPattern),
   dormantPattern: z.string().default(DEFAULT_CONSOLE_HUB_SETTINGS.dormantPattern),
@@ -114,6 +139,7 @@ export interface PatternBearingFields {
   pagerPattern: string
   dormantPattern: string
   highRiskPatterns: readonly string[]
+  fenceRules: readonly ConsoleFenceRule[]
   views: Record<string, { promptPattern: string, pagerPattern: string }>
 }
 
@@ -149,6 +175,49 @@ export function findBadPatterns(settings: PatternBearingFields): PatternRejectio
   settings.highRiskPatterns.forEach((source, index) => {
     check(`highRiskPatterns.${index}`, source, compileCommandFence)
   })
+  settings.fenceRules.forEach((rule, index) => {
+    const where = `fenceRules.${index}`
+    const hasTokens = rule.tokens !== undefined && rule.tokens.trim() !== ''
+    const hasPattern = rule.pattern !== undefined && rule.pattern.trim() !== ''
+    // A rule with NO matcher matches nothing, and a rule with BOTH has two
+    // answers to one question. Either way the author's intent is not what the
+    // engine would do, so both are refused at the write. Silently accepting an
+    // empty rule is how a deployment ends up believing it configured a fence it
+    // never had.
+    if (!hasTokens && !hasPattern) {
+      bad.push({
+        field: where,
+        source: '',
+        message: `fence rule "${rule.id}" has neither "tokens" nor "pattern", so it would match no command`,
+      })
+    }
+    if (hasTokens && hasPattern) {
+      bad.push({
+        field: where,
+        source: rule.pattern ?? '',
+        message: `fence rule "${rule.id}" sets both "tokens" and "pattern"; use one matcher`,
+      })
+    }
+    if (rule.id.trim() === '') {
+      bad.push({
+        field: where,
+        source: '',
+        message: 'fence rule "id" must be a non-empty name so a prompt and the audit trail can name it',
+      })
+    }
+    if (hasPattern) check(`${where}.pattern`, rule.pattern as string, compileCommandFence)
+  })
+  // Two rules sharing an id would make an audit trail ambiguous about which one
+  // fired, which is the one thing the id exists for.
+  const seenIds = new Set<string>()
+  for (const rule of settings.fenceRules) {
+    if (seenIds.has(rule.id)) {
+      bad.push({ field: 'fenceRules', source: rule.id, message: `duplicate fence rule id "${rule.id}"` })
+    }
+    seenIds.add(rule.id)
+  }
+  // An empty rule list means nothing is fenced except the fallback, which is a
+  // legitimate choice; a rule whose matcher is blank is not.
   for (const [id, view] of Object.entries(settings.views)) {
     if (view.promptPattern !== '') check(`views.${id}.promptPattern`, view.promptPattern, compilePattern)
     if (view.pagerPattern !== '') check(`views.${id}.pagerPattern`, view.pagerPattern, compilePattern)

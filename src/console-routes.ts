@@ -63,6 +63,15 @@ export interface ConsoleSessionApi {
   fenceForUser?(request: { sessionId: string, consoleId: string, label: string, text: string }):
     | { risk: 'safe' }
     | { risk: 'high', confirmationToken: string, reason: string }
+    /**
+     * Refused outright, by a `deny` rule.
+     *
+     * A separate arm rather than a flavour of `high`, because the two demand
+     * opposite handling: `high` mints a token and INVITES a confirmation, while
+     * this must never mint one. Folding it into `high` would make a `deny` rule
+     * satisfiable by clicking through the very prompt it exists to avoid.
+     */
+    | { risk: 'denied', reason: string }
   /** Validate a confirmation token minted by {@link fenceForUser}. */
   consumeConfirmation?(sessionId: string, consoleId: string, token: string): boolean
   /**
@@ -243,7 +252,8 @@ function consoleHandlers(api: ConsoleSessionApi): Record<string, Handler> {
       }
       // The panel's path fences a high-risk command behind a one-shot
       // confirmation token: the first call refuses and mints the token, the
-      // confirmed replay consumes it. A safe command goes straight through.
+      // confirmed replay consumes it. A safe command goes straight through, and
+      // a `deny` rule is refused BEFORE any token exists.
       const confirmation = optionalString(payload, 'confirmToken')
       if (api.fenceForUser !== undefined || api.consumeConfirmation !== undefined) {
         const fenced = api.fenceForUser?.({
@@ -252,6 +262,12 @@ function consoleHandlers(api: ConsoleSessionApi): Record<string, Handler> {
           label: api.manager.get(sessionId, consoleId)?.label ?? consoleId,
           text,
         })
+        // Checked first and unconditionally: a token must not exist for a denied
+        // command, so the confirmed replay can never satisfy one. Consuming a
+        // token here would let a `deny` be undone by presenting it.
+        if (fenced?.risk === 'denied') {
+          throw new HubError('forbidden', fenced.reason, 403)
+        }
         if (fenced?.risk === 'high') {
           const valid = confirmation !== undefined
             && api.consumeConfirmation?.(sessionId, consoleId, confirmation) === true

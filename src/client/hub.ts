@@ -146,6 +146,8 @@ export interface EngineDefaults {
   pagingMode: string
   approvalMode: string
   highRiskPatterns: string[]
+  /** The ordered fence rules, so the panel can show what is actually enforced. */
+  fenceRules: Array<{ id: string, action: string, tokens: string, pattern: string, note: string }>
   promptPattern: string
   pagerPattern: string
   /** Marker text a device prints when it half-closed an idle console. */
@@ -223,6 +225,11 @@ export interface WaitResult {
 export type FenceResult =
   | { risk: 'safe' }
   | { risk: 'high', confirmationToken: string, reason: string }
+  /**
+   * Refused outright by a `deny` rule. There is deliberately no token: a denial
+   * that carried one would be a denial the user could click past.
+   */
+  | { risk: 'denied', reason: string }
 
 /** The typed calls the views make. */
 export interface ConsoleHub {

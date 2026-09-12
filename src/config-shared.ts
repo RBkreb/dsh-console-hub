@@ -101,11 +101,109 @@ export const DEFAULT_DORMANT_PATTERN
  * human decision: entering configuration mode, and restarting the box. Split
  * into two sources because the fence matches each independently — a `show`
  * whose argument merely mentions `config` must stay allowed.
+ *
+ * LEGACY, and kept only so an existing document keeps its fence. It is honoured
+ * as a set of `ask` rules appended AFTER the ordered rule list, so an explicit
+ * rule always wins. New configuration belongs in {@link ConsoleFenceRule}.
+ *
+ * It is also the field this plugin used to get WRONG, in the unsafe direction:
+ * `config|conf|configure` is anchored with `\b`, and there is no word boundary
+ * between `config` and `configuration`, so `configuration rollback replace
+ * BasicConfig` classified as `safe` and reached the device with no confirmation
+ * at all. That is exactly the class of command {@link DEFAULT_FENCE_RULES} now
+ * fences by token PREFIX instead of by regex boundary.
  */
 export const DEFAULT_HIGH_RISK_PATTERNS = [
   'config|conf|configure',
   'restart|reboot|reload',
 ] as const
+
+// ── The command fence ───────────────────────────────────────────────────────
+
+/**
+ * What a fence rule does when it matches.
+ *
+ * - `deny` refuses the command outright: it never asks, so no approval can
+ *   release it. That is the only action that cannot be talked past.
+ * - `ask` requires an explicit human decision through the approval seam.
+ * - `allow` lets the command through, and exists to carve an exception out of a
+ *   broader rule above it (a `deny configuration` followed by
+ *   `allow show configuration`, say).
+ */
+export const FENCE_ACTIONS = ['deny', 'ask', 'allow'] as const
+/** One fence action. */
+export type FenceAction = typeof FENCE_ACTIONS[number]
+
+/**
+ * One ordered fence rule.
+ *
+ * Exactly one of {@link tokens} / {@link pattern} is the matcher; the unused one
+ * is the empty string. Both are REQUIRED fields rather than optional ones so the
+ * settings schema, the shared defaults, and the runtime all agree on one shape —
+ * an optional field let the defaults and the parsed document disagree, which the
+ * `fills every default` test caught as drift.
+ *
+ * `tokens` is the matcher that handles how a device CLI actually reads input;
+ * `pattern` is the escape hatch for a deployment that needs a real expression.
+ */
+export interface ConsoleFenceRule {
+  /** Stable name, reported in the approval prompt and the audit trail. */
+  id: string
+  /** What happens when this rule matches. */
+  action: FenceAction
+  /**
+   * Abbreviation-aware token matcher: whitespace-separated token groups, each a
+   * `|`-separated set of whole words. A command matches when it has at least as
+   * many tokens, and each of its leading tokens is a PREFIX of one of the
+   * alternatives at that position.
+   *
+   * Prefix comparison is the whole point. A device CLI accepts any unambiguous
+   * abbreviation, so `configuration rollback replace` may be typed `conf roll
+   * rep`, and a rule that only recognised the spelled-out form would be trivially
+   * bypassed by typing less. Measured on the lab switch: `conf` reaches
+   * configuration mode, and `conf roll replace BasicConfig` performs the
+   * rollback — the same command the long form performs.
+   *
+   * Over-matching is deliberate and is the SAFE direction: a one-letter token
+   * fences more than the device would accept, which costs a confirmation prompt,
+   * never a silent write.
+   */
+  tokens: string
+  /** Raw regular expression, anchored at the command start and case-insensitive. */
+  pattern: string
+  /** Human explanation shown when this rule is what fenced the command. */
+  note: string
+}
+
+/**
+ * The fence rules a deployment gets without configuring any.
+ *
+ * Both are `ask` rather than `deny`: they are recoverable, and a console tool
+ * that silently refused a rollback would be worse than one that asks.
+ *
+ * `configuration rollback` is fenced as a COMBINATION, not as the bare
+ * `configuration` prefix. Entering configuration mode is not itself destructive
+ * — `conf` is how anyone edits a device, and every edit still has to be
+ * committed — whereas a rollback replaces the running configuration outright.
+ * Fencing the whole `configuration` prefix would bury the dangerous case in a
+ * prompt the operator learns to click through.
+ */
+export const DEFAULT_FENCE_RULES: readonly ConsoleFenceRule[] = [
+  {
+    id: 'config-rollback',
+    action: 'ask',
+    tokens: 'configuration rollback',
+    pattern: '',
+    note: 'replaces the running configuration with a saved one',
+  },
+  {
+    id: 'restart',
+    action: 'ask',
+    tokens: 'reboot|restart|reload',
+    pattern: '',
+    note: 'restarts the device',
+  },
+]
 
 // ── Settings shape ──────────────────────────────────────────────────────────
 
@@ -177,9 +275,34 @@ export interface ConsoleHubSettings {
    * command finished and idle is documented as a heuristic.
    */
   idleQuietMs: number
-  /** `always` fences every command; `high-risk` only the listed patterns. */
+  /**
+   * The ordered fence rules. First match wins; see {@link ConsoleFenceRule}.
+   *
+   * Ordered rather than a set, because precedence IS the configuration: a broad
+   * `deny` followed by a narrow `allow` expresses an exception, and nothing else
+   * can.
+   */
+  fenceRules: ConsoleFenceRule[]
+  /**
+   * What happens when NO rule matches: `always` asks about every command,
+   * `high-risk` lets unmatched commands through.
+   *
+   * This is the FALLBACK, not an override. It used to be the whole policy, which
+   * made it impossible to express "ask about everything except this one thing".
+   * Rules are evaluated first, so an `allow` rule is now a way to carve an
+   * exception out of `always` mode — deliberate, and the reason `ask` is the
+   * safe default rather than the only option.
+   */
   approvalMode: 'always' | 'high-risk'
-  /** Command-line patterns that require an explicit human decision. */
+  /**
+   * LEGACY pattern sources, honoured as `ask` rules appended AFTER
+   * {@link fenceRules}.
+   *
+   * Kept because a document written before rules existed must not silently lose
+   * its fence — dropping it would be a security regression performed by an
+   * upgrade. Explicit rules win, so a deployment can supersede any of these
+   * without editing them.
+   */
   highRiskPatterns: string[]
   /** Default prompt pattern for views that do not override it. */
   promptPattern: string
@@ -255,7 +378,11 @@ export const DEFAULT_CONSOLE_HUB_SETTINGS: ConsoleHubSettings = {
   // anything at or below that reports "done" mid-answer. See the field's docs.
   idleQuietMs: 1500,
   approvalMode: 'high-risk',
-  highRiskPatterns: [...DEFAULT_HIGH_RISK_PATTERNS],
+  // EMPTY by default: the ordered rules ARE the shipped fence. A non-empty
+  // value here is an inherited document's, preserved so an upgrade cannot
+  // silently drop a fence it was written with.
+  highRiskPatterns: [],
+  fenceRules: DEFAULT_FENCE_RULES.map(rule => ({ ...rule })),
   promptPattern: DEFAULT_PROMPT_PATTERN,
   pagerPattern: DEFAULT_PAGER_PATTERN,
   dormantPattern: DEFAULT_DORMANT_PATTERN,
@@ -302,12 +429,52 @@ export function compilePattern(source: string): RegExp {
 /**
  * Compile one high-risk source into a whole-command matcher: anchored at the
  * start (so `show running-config` is not fenced) and case-insensitive.
+ *
+ * The `\b` terminator is why this cannot be used for the default rule set: there
+ * is no word boundary inside `configuration`, so an alternation of `config`
+ * silently fails to match it. {@link matchesFenceRule} uses token prefixes for
+ * that reason; this remains for the legacy `highRiskPatterns` field and for a
+ * rule that opts into a raw expression.
+ *
  * @param source - the pattern body.
  * @returns the compiled matcher.
  * @throws {SyntaxError} when `source` is not a valid regular expression.
  */
 export function compileCommandFence(source: string): RegExp {
   return new RegExp(`^(?:${source})\\b`, 'i')
+}
+
+/**
+ * Whether one command matches one rule. Pure and total: a malformed rule matches
+ * nothing rather than throwing, because a fence that crashes is a fence that is
+ * not enforcing.
+ *
+ * @param command - one command segment (already split from a compound line).
+ * @param rule - the rule to test.
+ * @returns true when the rule matches this command.
+ */
+export function matchesFenceRule(command: string, rule: ConsoleFenceRule): boolean {
+  if (rule.pattern !== undefined && rule.pattern !== '') {
+    try {
+      return compileCommandFence(rule.pattern).test(command)
+    } catch {
+      return false
+    }
+  }
+  if (rule.tokens === undefined || rule.tokens.trim() === '') return false
+  const groups = rule.tokens.trim().split(/\s+/).map(group => group.split('|'))
+  const words = command.trim().split(/\s+/).filter(word => word !== '')
+  // A rule needs at least as many tokens as it declares: a two-token rule must
+  // NOT match the one-token prefix, which is what keeps bare `conf` (config-mode
+  // entry) out of the rollback rule's blast radius.
+  if (words.length < groups.length) return false
+  for (let index = 0; index < groups.length; index += 1) {
+    const word = (words[index] as string).toLowerCase()
+    const alternatives = groups[index] as string[]
+    // PREFIX, because a device CLI accepts any unambiguous abbreviation.
+    if (!alternatives.some(alternative => alternative.toLowerCase().startsWith(word))) return false
+  }
+  return true
 }
 
 /**

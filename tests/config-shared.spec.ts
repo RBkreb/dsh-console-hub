@@ -19,6 +19,7 @@ import {
   SECRET_REF_PREFIX,
   compileCommandFence,
   compilePattern,
+  matchesFenceRule,
   compileSearchPattern,
   isConsoleEncoding,
   recordIdOf,
@@ -125,14 +126,31 @@ describe('config-shared', () => {
     for (const source of [defaults.promptPattern, defaults.pagerPattern, ...defaults.highRiskPatterns]) {
       expect(() => compilePattern(source)).not.toThrow()
     }
-    // The high-risk fence must cover the plain and abbreviated forms, and the
-    const fence = defaults.highRiskPatterns.map(source => compileCommandFence(source))
-    for (const command of ['config terminal', 'conf t', 'restart', 'reboot', 'reload']) {
-      expect(fence.some(pattern => pattern.test(command))).toBe(true)
+    // The DEFAULT fence is the ordered rule list, not the legacy pattern field.
+    // Keeping the shipped default in `highRiskPatterns` as well would leave two
+    // mechanisms both firing, and it would fence bare `conf` -- which is how
+    // anyone edits a device and is deliberately NOT fenced.
+    expect(defaults.highRiskPatterns).toEqual([])
+    const shipped = defaults.fenceRules.map(rule => rule.tokens)
+    expect(shipped).toContain('configuration rollback')
+    expect(shipped).toContain('reboot|restart|reload')
+    // It must cover the plain AND abbreviated forms a device accepts, without
+    // swallowing ordinary reads that merely mention the words.
+    const fenced = (command: string): boolean =>
+      defaults.fenceRules.some(rule => matchesFenceRule(command, rule))
+    for (const command of [
+      'configuration rollback replace BasicConfig',
+      'conf roll replace BasicConfig',
+      'restart', 'reboot', 'reload',
+    ]) {
+      expect(fenced(command), command).toBe(true)
     }
-    // …without swallowing ordinary reads that merely mention them.
-    for (const command of ['show running-config', 'display current-configuration', 'show version']) {
-      expect(fence.some(pattern => pattern.test(command))).toBe(false)
+    for (const command of [
+      'show running-config', 'display current-configuration', 'show version',
+      // Configuration-mode entry is NOT fenced, by design.
+      'conf', 'conf t', 'configure terminal', 'configuration',
+    ]) {
+      expect(fenced(command), command).toBe(false)
     }
   })
 })

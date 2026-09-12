@@ -29,6 +29,8 @@ function settingsService(): {
   service: unknown
   document: () => Record<string, unknown>
   write(patch: Record<string, unknown>): Promise<void>
+  /** The seam's wholesale-replacement path, which the inventory write uses. */
+  scopeReplace(section: Record<string, unknown>): Promise<void>
   registered: { ns?: string, options?: { validate?: (value: ConsoleHubSettings) => void } }
 } {
   let document: Record<string, unknown> = {}
@@ -85,6 +87,9 @@ function settingsService(): {
     document: () => document,
     write: async (patch) => {
       await scope.update(patch)
+    },
+    scopeReplace: async (section) => {
+      await scope.replace(section)
     },
   }
 }
@@ -416,6 +421,44 @@ describe('capability gating', () => {
     apply(ctx)
     await flush()
     expect(injected).not.toContain('approval')
+  })
+
+  it('gives the model NO way to edit the fence that governs it', async () => {
+    // A security property, not a nicety. The fence is what stands between the
+    // model and a device; a model that could write its own rules could write
+    // `allow` and then run anything. Two assertions:
+    //
+    // 1. No tool the model is offered writes settings or rules.
+    // 2. The ONE tool that does touch the settings document (the inventory)
+    //    leaves the fence byte-identical, which is the part a name check cannot
+    //    prove: the write path replaces the whole section, so a field it forgot
+    //    to carry through would be reset to its default.
+    const settings = settingsService()
+    const tools = toolRegistry()
+    const { ctx, flush } = fakeContext({ settings: settings.service, tools: tools.service })
+    apply(ctx)
+    await flush()
+
+    for (const name of tools.names()) {
+      expect(name).not.toMatch(/fence|rule|policy|settings/i)
+    }
+    expect(tools.names()).toContain('console_upsert_view')
+
+    // A deployed policy that is NOT the default, so a reset would be visible.
+    await settings.write({
+      fenceRules: [{ id: 'no-erase', action: 'deny', tokens: 'erase', pattern: '', note: 'wipes the config' }],
+    })
+    const policy = (): ConsoleHubSettings => parseSettingsDocument(settings.document())
+    const before = policy()
+    expect(before.fenceRules.map(rule => rule.id)).toEqual(['no-erase'])
+
+    // The inventory write goes through `scope.replace`, which rewrites the whole
+    // section from the live value plus the one change.
+    await settings.scopeReplace({ ...before, views: {} })
+    const after = policy()
+    expect(after.fenceRules).toEqual(before.fenceRules)
+    expect(after.fenceRules[0]?.action).toBe('deny')
+    expect(after.approvalMode).toBe(before.approvalMode)
   })
 
   it('finds the credential seam even when it activates after the API is installed', async () => {

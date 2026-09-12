@@ -698,7 +698,9 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
       + 'what Enter means for this device. '
       + 'An EMPTY `text` is allowed and presses Enter alone, which is how a console the device half-closed is woken; '
       + 'whitespace is passed through byte for byte, because a single space is a pager\'s next-page key. '
-      + 'High-risk commands (entering configuration mode, restarting) are refused unless the user approves them.',
+      + 'The host fences commands through ordered rules: an "ask" rule needs user approval, and a "deny" rule refuses '
+      + 'outright -- no approval releases a denied command, so do not retry it or hunt for another spelling. Entering '
+      + 'configuration mode is not itself fenced; a configuration ROLLBACK and restarts are.',
     parameters: parameterSchemaSpecToJsonSchema({
       consoleId: CONSOLE_ID,
       text: {

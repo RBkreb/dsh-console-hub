@@ -324,8 +324,26 @@ describe('config.* methods', () => {
     expect(value.views).toEqual([])
     expect(value.defaults.defaultEncoding).toBe('utf-8')
     expect(value.defaults.approvalMode).toBe('high-risk')
-    // The high-risk fence is surfaced so the panel can show it verbatim.
-    expect(value.defaults.highRiskPatterns).toEqual(['config|conf|configure', 'restart|reboot|reload'])
+    // The active fence is surfaced so the panel can show it verbatim. It is the
+    // ORDERED RULE LIST now, not the legacy pattern field -- which defaults to
+    // empty precisely so two mechanisms do not both fire.
+    expect(value.defaults.fenceRules).toEqual([
+      {
+        id: 'config-rollback',
+        action: 'ask',
+        tokens: 'configuration rollback',
+        pattern: '',
+        note: 'replaces the running configuration with a saved one',
+      },
+      {
+        id: 'restart',
+        action: 'ask',
+        tokens: 'reboot|restart|reload',
+        pattern: '',
+        note: 'restarts the device',
+      },
+    ])
+    expect(value.defaults.highRiskPatterns).toEqual([])
   })
 
   it('creates a view, mints an id, and lists it back without a secret field', async () => {

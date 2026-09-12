@@ -112,10 +112,13 @@ function apiFor(): {
         pagingMode: 'manual' as const,
       }),
       // The panel path's fence: a high-risk command is refused until the panel
-      // replays it with the one-shot token this minted. Safe commands pass.
-      fenceForUser: ({ text }) => text.includes('config') || text.includes('restart')
-        ? { risk: 'high' as const, confirmationToken: `tok-${text}`, reason: `"${text}" is high risk` }
-        : { risk: 'safe' as const },
+      // replays it with the one-shot token this minted. Safe commands pass, and
+      // a command a `deny` rule forbids is refused with NO token at all.
+      fenceForUser: ({ text }) => text.includes('erase')
+        ? { risk: 'denied' as const, reason: `"${text}" is forbidden by the fence rule "never-erase"` }
+        : text.includes('config') || text.includes('restart')
+          ? { risk: 'high' as const, confirmationToken: `tok-${text}`, reason: `"${text}" is high risk` }
+          : { risk: 'safe' as const },
       consumeConfirmation: (_sessionId, _consoleId, token) => token.startsWith('tok-'),
       // Wired the way the host wires it: a pass-through to the live manager, so
       // "what clearing means" has exactly one implementation.
@@ -679,6 +682,44 @@ describe('panel-path high-risk fence', () => {
       confirmToken: 'not-a-real-token',
     })
     expect(refused.status).toBe(403)
+  })
+
+  it('refuses a DENIED command even when a valid-looking token is replayed', async () => {
+    // The hard block through the panel's own path. A `deny` mints no token, so
+    // there is nothing to replay -- and the route must not fall through to the
+    // "confirmed" branch on a token it happens to recognise. This is the
+    // difference between a deny and an ask, and it is the whole reason `denied`
+    // is a separate arm rather than a flavour of `high`.
+    const { api, device } = await scene()
+    const connected = await call(api, 'console.connect', { sessionId: 'session-a', viewId: 'v-known' })
+    const consoleId = (connected.body as { value: { consoleId: string } }).value.consoleId
+
+    const replayed = await call(api, 'console.send', {
+      sessionId: 'session-a',
+      consoleId,
+      text: 'erase startup-config',
+      // A token the fake's `consumeConfirmation` WOULD accept, so this proves the
+      // denial is checked before any token is considered.
+      confirmToken: 'tok-erase startup-config',
+    })
+    expect(replayed.status).toBe(403)
+    expect(replayed.body).toMatchObject({ ok: false, error: { code: 'forbidden' } })
+    expect((replayed.body as { error: { message: string } }).error.message).toMatch(/never-erase/)
+    // Nothing reached the device.
+    expect(device.received.join('')).not.toContain('erase')
+  })
+
+  it('reports a denial from the pre-flight fence, so the panel never offers a confirm button', async () => {
+    const { api } = await scene()
+    const connected = await call(api, 'console.connect', { sessionId: 'session-a', viewId: 'v-known' })
+    const consoleId = (connected.body as { value: { consoleId: string } }).value.consoleId
+    const fenced = await call(api, 'console.fence', { sessionId: 'session-a', consoleId, text: 'erase startup-config' })
+    expect(fenced.status).toBe(200)
+    const value = (fenced.body as { value: { risk: string, confirmationToken?: string } }).value
+    expect(value.risk).toBe('denied')
+    // No token, because a denial that carried one is a denial a user could click
+    // past.
+    expect(value.confirmationToken).toBeUndefined()
   })
 
 

@@ -17,6 +17,7 @@ import {
   DEFAULT_PAGER_PATTERN,
   DEFAULT_PROMPT_PATTERN,
   DEFAULT_HIGH_RISK_PATTERNS,
+  type ConsoleFenceRule,
   type ConsoleHubSettings,
 } from './config-shared.ts'
 import { parseSettingsDocument } from './config.ts'
@@ -98,6 +99,8 @@ function defaultsFor(settings: ConsoleHubSettings): {
   pagingMode: string
   approvalMode: string
   highRiskPatterns: string[]
+  /** The ordered fence rules, so the panel can show what is actually enforced. */
+  fenceRules: ConsoleFenceRule[]
   promptPattern: string
   pagerPattern: string
   /** Marker text a device prints when it half-closed an idle console. */
@@ -126,6 +129,15 @@ function defaultsFor(settings: ConsoleHubSettings): {
     pagingMode: settings.pagingMode,
     approvalMode: settings.approvalMode,
     highRiskPatterns: [...settings.highRiskPatterns],
+    // Copied field by field: this crosses the wire as JSON, and handing out the
+    // live settings objects would let a caller mutate the policy by accident.
+    fenceRules: settings.fenceRules.map(rule => ({
+      id: rule.id,
+      action: rule.action,
+      tokens: rule.tokens ?? '',
+      pattern: rule.pattern ?? '',
+      note: rule.note,
+    })),
     promptPattern: settings.promptPattern,
     pagerPattern: settings.pagerPattern,
     dormantPattern: settings.dormantPattern,

@@ -260,7 +260,11 @@ function bindSettings(settings: ConsoleSettingsService): SettingsBinding {
 
 /** The fence policy a settings value describes. */
 function fencePolicyOf(settings: ConsoleHubSettings): ConsoleFenceSettings {
-  return { approvalMode: settings.approvalMode, highRiskPatterns: settings.highRiskPatterns }
+  return {
+    approvalMode: settings.approvalMode,
+    fenceRules: settings.fenceRules,
+    highRiskPatterns: settings.highRiskPatterns,
+  }
 }
 
 /**
@@ -429,13 +433,23 @@ function installApi(
     // the panel must replay after a second explicit confirmation.
     fenceForUser: ({ text, label }) => {
       const policy = fencePolicyOf(readSettings())
-      if (policy.approvalMode !== 'always' && classifyCommand(text, policy).risk === 'safe') {
-        return { risk: 'safe' as const }
+      const classified = classifyCommand(text, policy)
+      if (classified.action === 'allow') return { risk: 'safe' as const }
+      // A `deny` rule mints NO token, so the refusal cannot be replayed past.
+      // This is the panel's half of the hard block; the model's half is in
+      // `approveConsoleCommand`, which checks the same action before it asks.
+      if (classified.action === 'deny') {
+        return {
+          risk: 'denied' as const,
+          reason: `"${text}" is forbidden on "${label}" by the fence rule `
+            + `"${classified.matchedSource ?? ''}" (${classified.matchedNote ?? 'denied'})`,
+        }
       }
       return {
         risk: 'high' as const,
         confirmationToken: mintConfirmation(confirmations),
-        reason: `"${text}" is a high-risk command on "${label}"`,
+        reason: `"${text}" is a high-risk command on "${label}"`
+          + `${classified.matchedNote === undefined ? '' : `: ${classified.matchedNote}`}`,
       }
     },
     consumeConfirmation: (_sessionId, _consoleId, token) => consumeConfirmation(confirmations, token),
@@ -642,8 +656,10 @@ function installPrompt(ctx: Context, readSettings: () => ConsoleHubSettings): ()
           'with an empty text does the same), and a `dormantBlocked` wait will never match until you do. An empty or',
           'whitespace-only `text` is a valid console_send -- an empty line presses Enter, and a single space is a',
           "pager's next-page key.",
-          'High-risk commands (entering configuration mode, restarting) require user approval; a refusal is a decision to',
-          'report, not an error to retry.',
+          'The host fences some commands through ordered rules in its settings. An "ask" rule requires user approval, and a',
+          '"deny" rule refuses outright -- no approval can release one, so do not retry a denied command or look for',
+          'another way to run it. The shipped rules cover configuration ROLLBACK and restarts; entering configuration mode',
+          'is NOT fenced, so `conf` alone does not need approval. A refusal is a decision to report, not an error to retry.',
           ...extra === '' ? [] : ['', extra],
         ].join('\n')
       },

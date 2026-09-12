@@ -105,6 +105,86 @@ host 半改动需要重启 Host；client 半由 `/plugins` 通道下发，刷新
 | `idleTimeoutMs` | `600000` | 本插件回收"没人用"的控制台；保活**不会**刷新这个时钟 |
 | `idleQuietMs` | `1500` | `wait_for({for:'idle'})` 的静默窗口；**必须大于实测的 ~1014ms 应答块间隔**，否则会在应答中途判定"说完了" |
 
+### 高危指令拦截：有序规则
+
+拦截策略是**有序规则表**（`fenceRules`），自上而下**第一条命中即定**，都没命中才用兜底
+（`approvalMode`）。每条规则一个动作：
+
+| 动作 | 含义 |
+| --- | --- |
+| `deny` | **直接拒绝，永不询问**——任何审批都放行不了 |
+| `ask` | 需要一次明确的人工确认 |
+| `allow` | 放行；用来在宽规则下面开一个窄例外 |
+
+规则有两种匹配器，**二选一**（都不写或都写都会被设置校验拒绝，见下文）：
+
+```yaml
+dsh-console-hub:
+  fenceRules:
+    # ① tokens：按「词前缀」匹配，处理设备 CLI 的省略输入
+    - id: config-rollback
+      action: ask
+      tokens: configuration rollback
+      note: 用保存的配置覆盖运行配置
+    # ② pattern：原始正则，锚定命令开头，给确实需要表达式的场景
+    - id: no-erase
+      action: deny
+      pattern: erase\s+startup-config
+      note: 抹掉已保存的配置
+  approvalMode: high-risk   # 兜底：没命中任何规则时
+```
+
+**为什么默认是 `tokens` 而不是正则——这里曾经有一个真实的漏洞。** 旧默认规则是
+`config|conf|configure`，编译成 `^(?:config|conf|configure)\b`。`\b` 在 `configuration`
+里**不存在词边界**（`g`、`u` 都是词字符），于是：
+
+```
+SAFE     "configuration"                               ← 漏了
+SAFE     "configuration rollback replace BasicConfig"   ← 漏了，而它会覆盖运行配置
+```
+
+也就是这条**真的会改配置**的回滚指令，以前**完全不触发二次确认**。`tokens` 按词前缀比较，
+`conf` / `config` / `configuration` 都能命中：
+
+```
+ASK   configuration rollback replace BasicConfig
+ASK   conf roll replace BasicConfig          ← 省略形式同样命中
+ASK   conf rollback replace BasicConfig
+```
+
+前缀匹配是必须的：设备 CLI 接受任意无歧义的缩写，只认全称的规则**少打几个字母就能绕过**。
+反方向不算命中（命令词比规则词更长不匹配），所以 `rollo` 不会命中 `rollback`——设备本身也不接受
+这个拼法。**过度匹配是刻意的，方向是安全的**：多拦一次只是多一次确认，绝不会静默放行。
+
+**进入配置模式（`conf`）默认不拦**，这是刻意的：改设备本来就要进配置模式，而且任何改动都还得
+提交；把整个 `configuration` 前缀都拦掉，只会让真正危险的那条淹没在一个操作员已经习惯点掉的弹窗
+里。所以回滚规则声明了**两个** token——只写一个词的命令不命中它。
+
+**复合命令逐段判定。** `show version; reboot` 先拆成两段、各自判定，整行取**最严**的结果。若按整行
+匹配，一条 `allow show` 会把后面的 `reboot` 一起吞掉——那是一个绕过。
+
+`deny` 与 `ask` 在**三条路径**上都分开：
+
+- 模型路径：`deny` 在询问审批**之前**就拒绝，所以「允许一次」永远释放不了它；没有审批服务时报的是
+  规则名，而不是"缺少审批服务"（后者会指向错误的修复方向）；
+- 面板路径：`deny` **不签发令牌**，因此没有可重放的确认，也不会走 `confirmHighRisk` 关闭时的直发分支；
+- 工具描述：写明被拒就是最终决定，不要换一种拼法重试。
+
+**模型无法编辑自己的规则。** 模型没有任何写设置的工具（唯一写路径是设备清单
+`console_upsert_view`，走 `replace` 时会把当前规则原样带过去）。`tests/host.spec.ts` 钉住这一点：
+工具名不得出现 `fence|rule|policy|settings`，且清单写入后规则必须逐字节不变——只看名字是不够的，
+真正的保证是第二条。
+
+`highRiskPatterns` 是**遗留字段**：它作为 `ask` 规则追加在有序规则**之后**，所以旧文档不会在升级中
+静默丢掉自己的拦截，而显式规则可以覆盖它。它现在**默认为空**——出厂的拦截就是 `fenceRules`，
+两个机制同时生效只会让"到底谁在拦"说不清。
+
+| 字段 | 默认 | 说明 |
+| --- | --- | --- |
+| `fenceRules` | 回滚 + 重启两条 `ask` 规则 | 有序规则表，第一条命中即定 |
+| `approvalMode` | `high-risk` | **兜底**：`always` 每条都问；`high-risk` 未命中即放行 |
+| `highRiskPatterns` | `[]` | 遗留字段，仅用于保留旧文档已声明的拦截 |
+
 ## 开发
 
 ```sh

@@ -39,6 +39,13 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
+/** Badge colours for one fence action, so a deny is never mistaken for an ask. */
+const RULE_COLOR: Record<string, string> = {
+  deny: '#e06c75',
+  ask: '#e6b800',
+  allow: '#7ec699',
+}
+
 /**
  * Whether a failure means the console is no longer there.
  *
@@ -396,6 +403,15 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
     setError(null)
     try {
       const fenced = await hub.fence(sessionId, selected, text)
+      if (fenced.risk === 'denied') {
+        // A `deny` rule, and the one place the panel must not offer a way
+        // forward. There is no token to replay, so showing the usual
+        // confirmation card would present a button the host would refuse --
+        // and the `confirmHighRisk` pref below must NOT be able to skip it.
+        setPending(undefined)
+        setError(`已被规则禁止发送：${fenced.reason}`)
+        return
+      }
       if (fenced.risk === 'high') {
         // The host refuses the write until it sees the token, so the choice here
         // is only whether to ASK first — never whether to carry the token.
@@ -638,6 +654,35 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
               style={{ width: 70, font: 'inherit', padding: '1px 3px' }}
             />
           </label>
+        )}
+        {defaults !== undefined && (defaults.fenceRules ?? []).length > 0 && (
+          <details style={{ marginLeft: 12, fontFamily: 'var(--dsw-font-family, inherit)' }}>
+            <summary
+              style={{ cursor: 'pointer', opacity: 0.8 }}
+              title="高危指令规则：自上而下第一条命中的生效，都没命中才用兜底策略。规则在插件设置里编辑。"
+            >
+              拦截规则 ({(defaults.fenceRules ?? []).length})
+            </summary>
+            <ol style={{ margin: '4px 0 0', paddingLeft: 20 }}>
+              {/* `?? []`: the panel must not crash on a host that does not send
+                  this field. An older host, or a partial answer, would otherwise
+                  take the whole tab down over a read-only summary. */}
+              {(defaults.fenceRules ?? []).map(rule => (
+                <li key={rule.id} style={{ marginBottom: 2 }}>
+                  <code>{rule.tokens !== '' ? rule.tokens : rule.pattern}</code>
+                  {' '}
+                  <strong style={{ color: RULE_COLOR[rule.action] ?? 'inherit' }}>
+                    {rule.action === 'deny' ? '禁止' : rule.action === 'ask' ? '需确认' : '放行'}
+                  </strong>
+                  {rule.note !== '' && <span style={{ opacity: 0.7 }}> · {rule.note}</span>}
+                </li>
+              ))}
+            </ol>
+            <div style={{ opacity: 0.7, marginTop: 2 }}>
+              未命中任何规则时：
+              {defaults.approvalMode === 'always' ? '每条命令都要确认' : '直接放行'}
+            </div>
+          </details>
         )}
       </div>
 

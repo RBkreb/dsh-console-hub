@@ -555,6 +555,70 @@ describe('the input keeps focus across a send', () => {
     return { hub, sends }
   }
 
+  it('refuses a DENIED command and never offers a confirmation', async () => {
+    // The panel's half of the hard block. A `deny` rule must not be reachable by
+    // clicking through a prompt: there is no token, so the usual confirmation
+    // card would present a button the host would refuse -- and with the
+    // `confirmHighRisk` pref OFF the panel used to send straight through, which
+    // for a deny would have been a silent bypass.
+    const scene = sendingHub()
+    scene.hub.fence = async () => ({ risk: 'denied' as const, reason: '被规则 "never-erase" 禁止' })
+
+    const view = renderView(scene.hub)
+    await waitFor(() => {
+      expect(view.getByText('FW1-focus')).toBeTruthy()
+    })
+    fireEvent.click(view.getByText('FW1-focus'))
+    const input = await waitFor(() => {
+      const node = view.container.querySelector('[data-console-hub-input="command"]')
+      if (node === null) throw new Error('input not rendered')
+      return node as HTMLInputElement
+    })
+    fireEvent.change(input, { target: { value: 'erase startup-config' } })
+    fireEvent.click(view.getByText('发送'))
+
+    await waitFor(() => {
+      expect(view.getByText(/已被规则禁止发送/)).toBeTruthy()
+    })
+    // THE assertions: nothing was written, and no confirmation was offered.
+    expect(scene.sends).toEqual([])
+    expect(view.queryByText('确认发送')).toBeNull()
+  })
+
+  it('still asks before a high-risk command, and sends it only once confirmed', async () => {
+    // The ask path must keep working: the deny handling above must not have
+    // turned every fence into a refusal.
+    const scene = sendingHub()
+    scene.hub.fence = async () => ({
+      risk: 'high' as const,
+      confirmationToken: 'ct-1',
+      reason: 'replaces the running configuration',
+    })
+
+    const view = renderView(scene.hub)
+    await waitFor(() => {
+      expect(view.getByText('FW1-focus')).toBeTruthy()
+    })
+    fireEvent.click(view.getByText('FW1-focus'))
+    const input = await waitFor(() => {
+      const node = view.container.querySelector('[data-console-hub-input="command"]')
+      if (node === null) throw new Error('input not rendered')
+      return node as HTMLInputElement
+    })
+    fireEvent.change(input, { target: { value: 'configuration rollback replace BasicConfig' } })
+    fireEvent.click(view.getByText('发送'))
+
+    await waitFor(() => {
+      expect(view.getByText('确认发送')).toBeTruthy()
+    })
+    // Not written yet: the token has not been replayed.
+    expect(scene.sends).toEqual([])
+    fireEvent.click(view.getByText('确认发送'))
+    await waitFor(() => {
+      expect(scene.sends).toEqual(['configuration rollback replace BasicConfig'])
+    })
+  })
+
   it('stays enabled and focused while a send is in flight', async () => {
     // The assertion has to happen DURING the busy window, not after it. Busy is
     // true only while the send is pending, and that is exactly when the old
@@ -627,6 +691,10 @@ describe('the engine settings controls', () => {
       pagingMode: 'auto-more',
       approvalMode: 'high-risk',
       highRiskPatterns: [],
+      fenceRules: [
+        { id: 'config-rollback', action: 'ask', tokens: 'configuration rollback', pattern: '', note: 'replaces the running configuration' },
+        { id: 'restart', action: 'ask', tokens: 'reboot|restart|reload', pattern: '', note: 'restarts the device' },
+      ],
       promptPattern: '.',
       pagerPattern: '--more--',
       dormantPattern: 'please press enter',
@@ -748,6 +816,45 @@ describe('the engine settings controls', () => {
     await waitFor(() => {
       expect(scene.updates).toEqual([{ dormantProbeMs: 0 }])
     })
+  })
+
+  it('shows the active fence rules, labelled by action', async () => {
+    // A security setting nobody can see is a security setting nobody can check.
+    // The panel lists what is enforced, in order, so "why did that need
+    // confirming" is answerable without opening the settings document.
+    const scene = settingsHub()
+    const view = renderView(scene.hub)
+    await waitFor(() => {
+      expect(view.getByText(/拦截规则/)).toBeTruthy()
+    })
+    // Each rule's matcher and its action are both visible.
+    expect(view.getByText('configuration rollback')).toBeTruthy()
+    expect(view.getByText('reboot|restart|reload')).toBeTruthy()
+    expect(view.getAllByText('需确认')).toHaveLength(2)
+    // And the fallback, so the list is not mistaken for the whole policy.
+    expect(view.getByText(/直接放行/)).toBeTruthy()
+  })
+
+  it('does not crash when a host sends no fenceRules at all', async () => {
+    // A read-only summary must never take the tab down. An older host, or a
+    // partial answer, previously threw on `defaults.fenceRules.length`.
+    const scene = settingsHub()
+    const stripped = {
+      ...scene.hub,
+      listViews: async () => {
+        const answer = await scene.hub.listViews('session-a')
+        const { fenceRules: _dropped, ...rest } = answer.defaults as unknown as Record<string, unknown>
+        return { views: answer.views, defaults: rest as never }
+      },
+    } as ConsoleHub
+    const view = renderView(stripped)
+    // `queryByText`, because absence is the assertion here: `getByText` throws
+    // when it finds nothing, which would fail the test for the very outcome it
+    // is checking for.
+    await waitFor(() => {
+      expect(view.getByLabelText('连接后自动唤醒')).toBeTruthy()
+    })
+    expect(view.queryByText(/拦截规则/)).toBeNull()
   })
 })
 

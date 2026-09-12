@@ -176,4 +176,69 @@ describe('resolveConsoleHubConfig', () => {
   it('exposes the schemastery schema as the loader-facing Config', () => {
     expect(typeof (Config as unknown as (value: unknown) => unknown)).toBe('function')
   })
+
+  it('ships the rollback and restart rules, and NOT a bare config-mode fence', () => {
+    const resolved = parseSettingsDocument({})
+    expect(resolved.fenceRules.map(rule => rule.id)).toEqual(['config-rollback', 'restart'])
+    expect(resolved.fenceRules.every(rule => rule.action === 'ask')).toBe(true)
+    // Entering configuration mode must stay unfenced: that is the whole point of
+    // declaring the rollback rule with TWO tokens.
+    expect(resolved.fenceRules.some(rule => rule.tokens === 'configuration')).toBe(false)
+  })
+
+  it('refuses a fence rule that would silently match nothing', () => {
+    // The dangerous typo: a rule with no matcher looks configured and enforces
+    // nothing. Accepting it would let a deployment believe it had a fence it
+    // never had, so the WRITE is refused and the operator finds out immediately.
+    expect(() => parseSettingsDocument({
+      fenceRules: [{ id: 'oops', action: 'ask' }],
+    })).toThrow(/fenceRules\.0/)
+    expect(() => parseSettingsDocument({
+      fenceRules: [{ id: 'oops', action: 'ask', tokens: '   ' }],
+    })).toThrow(/match no command/)
+  })
+
+  it('refuses a fence rule with two matchers, or an unnamed one', () => {
+    // Two matchers is ambiguous about which was meant, so it is refused rather
+    // than resolved by an undocumented precedence.
+    expect(() => parseSettingsDocument({
+      fenceRules: [{ id: 'both', action: 'ask', tokens: 'reboot', pattern: 'reboot' }],
+    })).toThrow(/both/)
+    expect(() => parseSettingsDocument({
+      fenceRules: [{ id: '  ', action: 'ask', tokens: 'reboot' }],
+    })).toThrow(/non-empty name/)
+  })
+
+  it('refuses duplicate rule ids, which would make an audit trail ambiguous', () => {
+    expect(() => parseSettingsDocument({
+      fenceRules: [
+        { id: 'same', action: 'ask', tokens: 'reboot' },
+        { id: 'same', action: 'deny', tokens: 'erase' },
+      ],
+    })).toThrow(/duplicate/)
+  })
+
+  it('refuses an unknown action and a malformed rule pattern', () => {
+    expect(() => parseSettingsDocument({
+      fenceRules: [{ id: 'x', action: 'maybe', tokens: 'reboot' }],
+    })).toThrow(/action/)
+    expect(() => parseSettingsDocument({
+      fenceRules: [{ id: 'x', action: 'ask', pattern: '(' }],
+    })).toThrow(/fenceRules\.0\.pattern/)
+  })
+
+  it('accepts a hand-written rule set, including a deny', () => {
+    const resolved = parseSettingsDocument({
+      fenceRules: [
+        { id: 'no-erase', action: 'deny', pattern: 'erase\\s+startup-config', note: 'wipes the saved config' },
+        { id: 'write', action: 'ask', tokens: 'write|copy run', note: 'persists config' },
+      ],
+    })
+    expect(resolved.fenceRules).toHaveLength(2)
+    expect(resolved.fenceRules[0]?.action).toBe('deny')
+    // Defaults fill the fields a rule left out, so the runtime never sees
+    // `undefined` where it expects a string.
+    expect(resolved.fenceRules[0]?.tokens).toBe('')
+    expect(resolved.fenceRules[1]?.pattern).toBe('')
+  })
 })

@@ -43,7 +43,8 @@ import {
   DEFAULT_PROMPT_PATTERN,
   compileCommandFence,
 } from '../../src/config-shared.ts'
-import { classifyCommand, compileFence, type ConsoleFenceSettings } from '../../src/guard.ts'
+import { approveConsoleCommand, classifyCommand, compileFence, type ConsoleFenceSettings } from '../../src/guard.ts'
+import type { ConsoleToolRunContext } from '../../src/context-types.ts'
 import { ManagerHolder, policyFromSettings } from '../../src/manager-holder.ts'
 
 /** The lab devices, from PHASE0.md. */
@@ -83,6 +84,15 @@ function manager(): PortManager {
 /** Sleep, so a read can wait for a device that answers slowly. */
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+/** A tool-execution context stub, so the approval choreography can be driven. */
+function toolExec(): ConsoleToolRunContext {
+  return {
+    agent: { session: { id: 'live' } },
+    callId: 'live-call-1',
+    signal: new AbortController().signal,
+  }
 }
 
 /** Read repeatedly from a GIVEN cursor until `check` holds, accumulating what it sees. */
@@ -347,22 +357,144 @@ describe.runIf(LIVE)('live console lab', () => {
   }, 40_000)
 
   it('classifies the high-risk commands these devices really accept', () => {
-    // The engine's own connect path is exercised above; this asserts the
-    // GUARD's behaviour on the real strings a device CLI accepts.
+    // The engine's own connect path is exercised above; this asserts the GUARD's
+    // behaviour on the real strings a device CLI accepts, against the SHIPPED
+    // policy (ordered rules + the legacy field, which defaults to empty).
     const policy: ConsoleFenceSettings = {
       approvalMode: DEFAULT_CONSOLE_HUB_SETTINGS.approvalMode,
+      fenceRules: DEFAULT_CONSOLE_HUB_SETTINGS.fenceRules,
       highRiskPatterns: [...DEFAULT_CONSOLE_HUB_SETTINGS.highRiskPatterns],
     }
-    // Words the lab devices really accept.
-    for (const command of ['config', 'configure', 'conf terminal', 'restart', 'reboot', 'show version', 'display version']) {
-      const { risk } = classifyCommand(command, policy)
-      const expected = /^(config|conf|configure|restart|reboot)/i.test(command) ? 'high' : 'safe'
-      expect(`${command}:${risk}`).toBe(`${command}:${expected}`)
+
+    // FENCED: a configuration rollback in every spelling the switch accepts, and
+    // the restarts. `conf roll replace BasicConfig` is the abbreviation an
+    // operator actually types, and it runs the same rollback as the long form.
+    for (const command of [
+      'configuration rollback replace BasicConfig',
+      'conf roll replace BasicConfig',
+      'conf rollback replace BasicConfig',
+      'reboot', 'restart', 'reload',
+    ]) {
+      expect(`${command}:${classifyCommand(command, policy).action}`, command).toBe(`${command}:ask`)
     }
+
+    // ALLOWED: ordinary reads, and configuration-mode entry, which is how anyone
+    // edits a device and is deliberately not fenced.
+    for (const command of [
+      'show version', 'display version', 'show running-config',
+      'conf', 'conf t', 'configure terminal', 'configuration',
+    ]) {
+      expect(`${command}:${classifyCommand(command, policy).action}`, command).toBe(`${command}:allow`)
+    }
+
     // And the compiled fence really anchors at the command start.
     expect(compileFence('config|restart')[0]?.test('config terminal')).toBe(true)
     expect(compileCommandFence('config|restart').test('show configuration')).toBe(false)
   })
+
+  it('fences the rollback on the REAL switch, and recovers with one confirmed write', async () => {
+    // The increment, driven against the switch the operator named.
+    //
+    // SCOPE, deliberately narrow: SW1 only, and exactly ONE command —
+    // `configuration rollback replace BasicConfig`, which restores the known-good
+    // test configuration. Nothing else is sent, and FW1 is not touched, because a
+    // fence test that ran an unfenced variant to "prove" the contrast would be
+    // running the very command the fence exists to gate.
+    const ports = manager()
+    try {
+      const entry = await ports.connect({
+        ownerSessionId: 'live',
+        label: SW1.label,
+        host: SW1.host,
+        port: SW1.port,
+        kind: 'telnet',
+        encoding: 'utf-8',
+        pagingMode: 'manual',
+      })
+      await ports.waitFor('live', entry.consoleId, { for: 'prompt', timeoutMs: 8000 })
+      // The prompt is asserted only as PRESENT, not as a particular view. The
+      // device keeps its CLI view across console sessions, so it may legitimately
+      // be in either `<SWITCH>` (user) or `[SWITCH]` (config) -- and the operator
+      // runs this rollback from the USER view (`<SWITCH>`). Pinning a bracket
+      // here would make the suite fail on the device's remembered state rather
+      // than on anything the plugin did.
+      const prompt = ports.describe('live', entry.consoleId)?.state.prompt
+      expect(prompt).toMatch(/^[<[].*[>\]]$/)
+      console.log(`[live] switch view at connect: ${String(prompt)}`)
+
+      const policy: ConsoleFenceSettings = {
+        approvalMode: DEFAULT_CONSOLE_HUB_SETTINGS.approvalMode,
+        fenceRules: DEFAULT_CONSOLE_HUB_SETTINGS.fenceRules,
+        highRiskPatterns: [...DEFAULT_CONSOLE_HUB_SETTINGS.highRiskPatterns],
+      }
+      const command = 'configuration rollback replace BasicConfig'
+
+      // 1. The fence asks BEFORE anything reaches the device.
+      let asked: string | undefined
+      const blocked = await approveConsoleCommand(
+        { exec: toolExec(), consoleLabel: SW1.label, command },
+        {
+          policy,
+          approver: {
+            async request(req) {
+              asked = req.reason
+              return 'rejected'
+            },
+          },
+        },
+      )
+      expect(blocked.approved).toBe(false)
+      // The prompt names the device, the exact command, and WHY it is fenced.
+      expect(asked).toContain('SW1')
+      expect(asked).toContain(command)
+      expect(asked).toMatch(/replaces the running configuration/i)
+
+      // 2. The device has not seen it: a rejected ask writes nothing.
+      const before = ports.read('live', entry.consoleId, { after: 0 }).cursor
+      expect(ports.read('live', entry.consoleId, { after: before }).text).toBe('')
+
+      // 3. Approved once, it runs -- and the device answers, which is the only
+      //    proof that the command is real and the view is right.
+      const approved = await approveConsoleCommand(
+        { exec: toolExec(), consoleLabel: SW1.label, command },
+        { policy, approver: { async request() { return 'allowed-once' } } },
+      )
+      expect(approved.approved).toBe(true)
+
+      await ports.send('live', entry.consoleId, command)
+      // Wait for the PROMPT, not for a keyword -- and pass the cursor, which is
+      // load-bearing. `for: "prompt"` matches a prompt at the tail, and the
+      // connect's wake already left one there, so without `after` this returned
+      // IMMEDIATELY, before the device had even echoed the command. The cursor
+      // makes it wait for a prompt that arrives AFTER the write.
+      //
+      // A keyword match would be wrong here for a second reason, measured with
+      // `scripts/probe-rollback.mjs`: this firmware answers the rollback with the
+      // ECHO and then a bare prompt about 3.2s later, and prints no success or
+      // failure text at all. "The prompt came back" IS the completion signal.
+      const waited = await ports.waitFor('live', entry.consoleId, {
+        for: 'prompt',
+        after: before,
+        timeoutMs: 25_000,
+      })
+      const answer = ports.read('live', entry.consoleId, { after: before }).text
+
+      // The command reached the device and it responded: the echo proves the
+      // write landed, and the console is still usable afterwards.
+      expect(waited.matched).toBe(true)
+      expect(answer).toContain(command)
+      expect(answer.length).toBeGreaterThan(command.length)
+      expect(ports.describe('live', entry.consoleId)?.state.state).toBe('open')
+      // Reported rather than asserted: the exact wording is firmware-specific, and
+      // this suite must not fail on a device that phrased it differently.
+      console.log(
+        `[live] switch rollback: matched=${String(waited.matched)} in ${String(waited.elapsedMs)}ms; `
+        + `answer=${JSON.stringify(answer.slice(0, 300))}`,
+      )
+    } finally {
+      await ports.dispose()
+    }
+  }, 90_000)
 
   it('pages automatically when the device offers --More--', async () => {
     const ports = manager()

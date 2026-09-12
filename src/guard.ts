@@ -19,7 +19,7 @@
  *
  * @module dsh-console-hub/guard
  */
-import { compileCommandFence, DEFAULT_HIGH_RISK_PATTERNS } from './config-shared.ts'
+import { compileCommandFence, DEFAULT_FENCE_RULES, DEFAULT_HIGH_RISK_PATTERNS, matchesFenceRule, type ConsoleFenceRule, type FenceAction } from './config-shared.ts'
 import type { ConsoleApprovalService, ConsoleToolRunContext } from './context-types.ts'
 
 /** The default fence sources, re-exported for callers that seed a policy. */
@@ -27,22 +27,65 @@ export const DEFAULT_FENCE_SOURCES: readonly string[] = [...DEFAULT_HIGH_RISK_PA
 
 /** The fence policy a classification runs against. */
 export interface ConsoleFenceSettings {
-  /** `always` fences every command; `high-risk` only the listed patterns. */
+  /**
+   * What happens when no rule matches. Rules are the policy; this is the floor
+   * beneath them.
+   */
   approvalMode: 'always' | 'high-risk'
-  /** Pattern sources, each anchored at the command start. */
-  highRiskPatterns: readonly string[]
+  /**
+   * The ordered rules. First match wins.
+   *
+   * Absent means "the shipped defaults", so a policy composed by hand still
+   * fences the dangerous commands rather than silently fencing nothing.
+   */
+  fenceRules?: readonly ConsoleFenceRule[]
+  /**
+   * LEGACY patterns, evaluated as `ask` rules after the ordered ones. Absent
+   * means "none", NOT "the shipped defaults": this field exists so a document
+   * that predates rules keeps the fence it was written with.
+   */
+  highRiskPatterns?: readonly string[]
 }
 
 /** Why one command was classified the way it was. */
 export interface ConsoleCommandClassification {
   /** `high` requires an explicit human decision; `safe` may run. */
   risk: 'high' | 'safe'
-  /** The pattern source that matched, or `approvalMode:always`. */
+  /**
+   * What the matched rule decided. `deny` is the hard block: it never asks, so
+   * no approval can release it.
+   *
+   * Deliberately separate from `risk`: a `deny` and an `ask` are both "not
+   * safe", but a caller that treated them the same would offer an approval
+   * prompt for a command that must never run.
+   */
+  action: FenceAction
+  /** The rule id that matched, or `approvalMode:always` for the fallback. */
   matchedSource?: string
+  /** The human explanation from the matched rule. */
+  matchedNote?: string
   /** The command segment that matched (compound lines are split first). */
   matchedSegment?: string
   /** Every segment the line was split into, for diagnostics. */
   segments: readonly string[]
+}
+
+/** The rules a policy evaluates, in order, with the legacy field appended. */
+export function fenceRulesOf(settings: ConsoleFenceSettings): ConsoleFenceRule[] {
+  const explicit = settings.fenceRules === undefined
+    ? [...DEFAULT_FENCE_RULES]
+    : [...settings.fenceRules]
+  // Legacy patterns come LAST so an explicit rule can supersede one -- including
+  // by `allow`, which is the only way to release a command an inherited document
+  // fences.
+  const legacy = (settings.highRiskPatterns ?? []).map((source, index) => ({
+    id: `legacy:${String(index)}`,
+    action: 'ask' as const,
+    tokens: '',
+    pattern: source,
+    note: `matches the legacy high-risk pattern "${source}"`,
+  }))
+  return [...explicit, ...legacy]
 }
 
 /**
@@ -105,38 +148,59 @@ export function commandSegments(line: string): string[] {
   return segments.map(segment => segment.trim()).filter(segment => segment !== '')
 }
 
+/** How restrictive each action is, so a compound line can be combined safely. */
+const SEVERITY: Record<FenceAction, number> = { allow: 0, ask: 1, deny: 2 }
+
 /**
  * Classify one command line against a fence policy.
+ *
+ * The line is split into the commands a device would actually run, and EACH
+ * segment is classified on its own: rules in order, first match wins, and the
+ * fallback (`approvalMode`) when none matches. The line's outcome is then the
+ * MOST RESTRICTIVE segment.
+ *
+ * Per-segment classification with a most-restrictive combination is the whole
+ * safety argument for compound lines. Evaluating the line as a whole lets a
+ * single `allow` rule swallow everything after it — with a `show` allowed and
+ * rules checked in order, `show version; reboot` would match `allow show`, return
+ * safe, and the `reboot` would never be looked at. Splitting first means the
+ * `reboot` segment is classified whatever the first segment decided.
+ *
  * @param command - the raw line the model or the panel wants to send.
  * @param settings - the active fence policy.
- * @returns the classification, including which segment and source matched.
- * @throws {SyntaxError} when a configured pattern source is malformed.
+ * @returns the classification, including which segment and rule decided it.
  */
 export function classifyCommand(command: string, settings: ConsoleFenceSettings): ConsoleCommandClassification {
   const segments = commandSegments(command)
   if (segments.length === 0) {
     // Nothing to run: an empty write must not present an approval prompt.
-    return { risk: 'safe', segments }
+    return { risk: 'safe', action: 'allow', segments }
   }
 
-  if (settings.approvalMode === 'always') {
-    return {
-      risk: 'high',
-      matchedSource: 'approvalMode:always',
-      matchedSegment: segments[0],
-      segments,
-    }
-  }
+  const rules = fenceRulesOf(settings)
+  const fallback: FenceAction = settings.approvalMode === 'always' ? 'ask' : 'allow'
 
-  const matchers = settings.highRiskPatterns.map(source => ({ source, pattern: compileCommandFence(source) }))
+  let decision: { action: FenceAction, segment: string, rule?: ConsoleFenceRule } | undefined
   for (const segment of segments) {
-    for (const { source, pattern } of matchers) {
-      if (pattern.test(segment)) {
-        return { risk: 'high', matchedSource: source, matchedSegment: segment, segments }
-      }
+    const matched = rules.find(rule => matchesFenceRule(segment, rule))
+    const action = matched === undefined ? fallback : matched.action
+    if (decision === undefined || SEVERITY[action] > SEVERITY[decision.action]) {
+      decision = { action, segment, ...matched === undefined ? {} : { rule: matched } }
+      // nothing can outrank a deny, so stop as soon as one is found
+      if (action === 'deny') break
     }
   }
-  return { risk: 'safe', segments }
+
+  const settled = decision as { action: FenceAction, segment: string, rule?: ConsoleFenceRule }
+  return {
+    risk: settled.action === 'allow' ? 'safe' : 'high',
+    action: settled.action,
+    ...settled.rule === undefined
+      ? { matchedSource: `approvalMode:${settings.approvalMode}` }
+      : { matchedSource: settled.rule.id, matchedNote: settled.rule.note },
+    matchedSegment: settled.segment,
+    segments,
+  }
 }
 
 /**
@@ -180,11 +244,16 @@ export interface ConsoleApprovalResult {
 /**
  * Decide whether one command may be written.
  *
- * A safe command is approved without asking. A fenced command is approved ONLY
- * on `allowed-once`; every other outcome — a rejection, a cancellation, an
- * absent answerer, an absent service, a missing agent, or a thrown approver —
- * refuses. That is the whole fail-closed rule, and it lives here rather than at
- * each call site.
+ * Three outcomes, in this order:
+ *
+ * 1. `allow` — approved without asking.
+ * 2. `deny` — refused, and the approval seam is NOT consulted. A `deny` rule
+ *    that still raised a prompt would be a rule that asks the human to override
+ *    a policy that exists to be un-overridable.
+ * 3. `ask` — approved ONLY on `allowed-once`; every other outcome (a rejection,
+ *    a cancellation, an absent answerer, an absent service, a missing agent, or
+ *    a thrown approver) refuses. That is the whole fail-closed rule, and it
+ *    lives here rather than at each call site.
  *
  * @param request - the command and the execution asking.
  * @param deps - the policy and the approval seam.
@@ -195,12 +264,24 @@ export async function approveConsoleCommand(
   deps: ConsoleApprovalDeps,
 ): Promise<ConsoleApprovalResult> {
   const classification = classifyCommand(request.command, deps.policy)
-  if (classification.risk === 'safe') return { approved: true, classification }
+  if (classification.action === 'allow') return { approved: true, classification }
 
   const segment = classification.matchedSegment ?? request.command
-  const why = classification.matchedSource === 'approvalMode:always'
+  const why = classification.matchedNote === undefined
     ? 'every command requires approval (approvalMode "always")'
-    : `"${segment}" matches the high-risk pattern "${classification.matchedSource ?? ''}"`
+    : `"${segment}" ${classification.matchedNote}`
+
+  // The hard block. Checked BEFORE the approver so no approval channel, however
+  // configured, can release it -- and so a deployment with no approver gets the
+  // real reason (the rule) rather than "no approval service is composed".
+  if (classification.action === 'deny') {
+    return {
+      approved: false,
+      reason: `refusing to run ${why} on "${request.consoleLabel}": a "deny" rule forbids it `
+        + `(rule "${classification.matchedSource ?? ''}"); this cannot be approved`,
+      classification,
+    }
+  }
 
   if (deps.approver === undefined) {
     return {
