@@ -65,6 +65,14 @@ export interface ConsoleSessionApi {
     | { risk: 'high', confirmationToken: string, reason: string }
   /** Validate a confirmation token minted by {@link fenceForUser}. */
   consumeConfirmation?(sessionId: string, consoleId: string, token: string): boolean
+  /**
+   * Discard one console's local scrollback, leaving the connection open.
+   *
+   * Optional so the route still serves a deployment that composes a manager
+   * without it; absent means the method reports `not-supported` rather than
+   * pretending the clear happened.
+   */
+  clear?(sessionId: string, consoleId: string): { cursor: number, droppedBytes: number }
 }
 
 /** One dispatchable console method. */
@@ -187,6 +195,24 @@ function consoleHandlers(api: ConsoleSessionApi): Record<string, Handler> {
         prompt: detail?.state.prompt ?? null,
         paging: detail?.state.paging ?? { active: false, pagesConsumed: 0, reason: null },
       }
+    },
+
+    async 'console.clear'(payload) {
+      const sessionId = await requireSession(api, payload)
+      const consoleId = requireConsoleId(payload)
+      // Distinguish "this build cannot clear" from "that console is gone":
+      // an absent capability is a deployment fact, and reporting it as
+      // not-found would send the caller hunting for a console that is present.
+      if (api.clear === undefined) {
+        throw new HubError('not-supported', 'this deployment cannot clear a console scrollback', 501)
+      }
+      let result: { cursor: number, droppedBytes: number }
+      try {
+        result = api.clear(sessionId, consoleId)
+      } catch (error) {
+        asHubError(error)
+      }
+      return { consoleId, cursor: result.cursor, droppedBytes: result.droppedBytes }
     },
 
     async 'console.describe'(payload) {

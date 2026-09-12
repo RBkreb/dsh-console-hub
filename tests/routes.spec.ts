@@ -21,11 +21,43 @@ import type {
 
 // ── Fakes ───────────────────────────────────────────────────────────────────
 
+/** Whether a value is a plain object (arrays and class instances are not). */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    && Object.getPrototypeOf(value) === Object.prototype
+}
+
+/**
+ * Layer `over` onto `under`, exactly as the real settings seam does.
+ *
+ * Copied deliberately from `mergeLayers` in `@deepseek-ai/dsh-settings`, because
+ * a fake that merges differently from the real thing cannot fail the way the
+ * real thing fails. Plain objects merge key by key; anything else -- arrays
+ * included -- replaces wholesale.
+ *
+ * The consequence that matters: NO MERGE CAN REMOVE A KEY. The keys it would
+ * have to remove are precisely the ones it does not carry, so a view map that
+ * omits a deleted entry emerges still holding it.
+ *
+ * @param under - the current section.
+ * @param over - the incoming patch.
+ * @returns the merged section.
+ */
+function mergeLayers(under: unknown, over: unknown): unknown {
+  if (over === undefined) return under
+  if (!isPlainObject(under) || !isPlainObject(over)) return over
+  const merged: Record<string, unknown> = { ...under }
+  for (const [key, value] of Object.entries(over)) {
+    merged[key] = key in merged ? mergeLayers(merged[key], value) : value
+  }
+  return merged
+}
 /** A settings service stub backed by an in-memory document. */
 function fakeSettings(initial: Partial<ConsoleHubSettings> = {}): {
   service: ConsoleSettingsService
   current: () => ConsoleHubSettings
   revision: () => number
+  replace: (patch: object) => Promise<void>
 } {
   let document: unknown = { ...initial }
   let revision = 1
@@ -34,10 +66,18 @@ function fakeSettings(initial: Partial<ConsoleHubSettings> = {}): {
   const scope: ConsoleSettingsScope<ConsoleHubSettings> = {
     get: () => parseSettingsDocument(document),
     watch: () => () => {},
+    // A RECURSIVE merge, deliberately: this mirrors the real seam's `update`
+    // (`mergeLayers` in dsh-settings), where plain objects merge key by key and
+    // only non-object values replace. It used to be a top-level spread,
+    // `{ ...document, ...patch }`, which DELETES an absent nested key -- so the
+    // fake could represent a working view deletion while the real seam quietly
+    // reinstated it. That mismatch is why a deletion reported success and
+    // changed nothing on disk, with every test green.
     update: async (patch) => {
-      document = { ...(document as object), ...(patch as object) }
+      document = mergeLayers(document, patch)
       revision += 1
     },
+    // The one path that can express a removal, matching the real seam.
     replace: async (section) => {
       document = section
       revision += 1
@@ -53,9 +93,26 @@ function fakeSettings(initial: Partial<ConsoleHubSettings> = {}): {
         }
         await scope.update(patch)
       },
+      // The service-level wholesale replace, as the real seam exposes it. Its
+      // ABSENCE here is what made the deletion test unfalsifiable: without it
+      // the route's fallback chain reached `update` (a merge) and no test could
+      // see that a removal had silently failed.
+      replace: async (_ns, section, expectedRevision) => {
+        if (expectedRevision !== undefined && expectedRevision !== revision) {
+          throw Object.assign(new Error('revision mismatch'), { code: 'CONFLICT' })
+        }
+        await scope.replace(section)
+      },
     },
     current: () => parseSettingsDocument(document),
     revision: () => revision,
+    // The owner-facing `replace` that production's `installApi` always supplies.
+    // Its absence here sent the route down its LAST fallback -- the seam's
+    // `update`, a recursive merge -- so the deletion test exercised a path
+    // production never takes, and passed while deletion was broken.
+    replace: async (patch: object) => {
+      await scope.replace({ ...parseSettingsDocument(document), ...patch })
+    },
   }
 }
 
@@ -344,6 +401,15 @@ describe('config.* methods', () => {
     expect((removed.body as { value: { removed: boolean, secretRemoved: boolean } }).value)
       .toEqual({ removed: true, secretRemoved: true })
     expect(await credentials.readRecord('dsh-console-hub/c1')).toBeUndefined()
+    // The VIEW must be gone too, not just its credential. The assertion above
+    // passed for a long time while the deletion itself silently failed: the
+    // settings seam's `update` is a recursive merge, so a view map missing the
+    // deleted entry came back still holding it. Checking the credential alone
+    // could not see that, because clearing the record is a separate call that
+    // really did run.
+    const after = await call(api, 'config.list', { sessionId: 'session-a' })
+    expect((after.body as { value: { views: unknown[] } }).value.views).toHaveLength(0)
+    expect(JSON.stringify(after.body)).not.toContain('v-1')
     const again = await call(api, 'config.remove', { sessionId: 'session-a', viewId: 'v-1' })
     expect(again.status).toBe(404)
   })

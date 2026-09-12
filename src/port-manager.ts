@@ -326,6 +326,26 @@ export class PortManager {
   }
 
   /**
+   * Discard one console's local scrollback, leaving the connection untouched.
+   *
+   * `cursor` is the offset the caller should read from next; passing it on is
+   * what keeps a reader from being handed output it already displayed. The
+   * socket, the encoding, the login and the device's own scrollback are all
+   * unaffected -- only this process's copy is dropped.
+   *
+   * @param ownerSessionId - the requesting session.
+   * @param consoleId - the console handle.
+   * @returns the next read cursor and how many bytes were discarded.
+   * @throws {Error} when the console is unknown to this owner.
+   */
+  clear(ownerSessionId: string, consoleId: string): { cursor: number, droppedBytes: number } {
+    const tracked = this.require(ownerSessionId, consoleId)
+    const result = tracked.session.clear()
+    this.refresh(consoleId)
+    return result
+  }
+
+  /**
    * Close one console and drop it from the registry.
    * @param ownerSessionId - the requesting session.
    * @param consoleId - the console handle.

@@ -24,6 +24,7 @@ export type HubErrorCode =
   | 'credential-rejected'
   | 'settings-rejected'
   | 'settings-conflict'
+  | 'not-supported'
   | 'internal'
 
 /** One API failure with its wire code and HTTP status. */

@@ -38,6 +38,7 @@ export const CONSOLE_TOOL_NAMES = [
   'console_wait_for',
   'console_close',
   'console_describe',
+  'console_clear',
 ] as const
 
 /** One model-facing tool name. */
@@ -725,6 +726,46 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
           detail: item.detail,
         })),
       }
+    },
+  })
+
+  register({
+    name: 'console_clear',
+    description:
+      'Discard everything already shown on one console, so the next read starts from a clean pane. '
+      + 'The connection is NOT touched: nothing is sent to the device, nothing is closed or reset, and the '
+      + 'device\'s own scrollback is unaffected -- only this process\'s copy of the output is dropped. '
+      + 'Use it when earlier output is no longer relevant and would otherwise fill the next read.',
+    parameters: parameterSchemaSpecToJsonSchema({ consoleId: CONSOLE_ID }),
+    output: {
+      schema: outputSchema({
+        consoleId: { type: 'string' },
+        cursor: { type: 'number' },
+        droppedBytes: { type: 'number' },
+      }, ['consoleId', 'cursor', 'droppedBytes']),
+      render: (_args: unknown, value: unknown) => {
+        const result = value as { consoleId: string, cursor: number, droppedBytes: number }
+        // A reader that kept its old cursor must be told to move: the bytes it
+        // was waiting for are gone, and re-reading from there yields nothing.
+        return text(
+          `Cleared ${String(result.droppedBytes)} byte(s) from console "${result.consoleId}" (local copy only; the `
+          + `connection is still open). Read it next with after=${String(result.cursor)}.`,
+        )
+      },
+    },
+    execute: async (args: unknown, exec: ConsoleToolRunContext) => {
+      assertLive(exec)
+      const sessionId = sessionIdOf(exec)
+      const parsed = (args ?? {}) as Record<string, unknown>
+      const consoleId = parsed.consoleId
+      if (typeof consoleId !== 'string' || consoleId === '') throw new Error('"consoleId" is required')
+      let result: { cursor: number, droppedBytes: number }
+      try {
+        result = deps.manager.clear(sessionId, consoleId)
+      } catch (error) {
+        throw new Error(error instanceof Error ? error.message : String(error))
+      }
+      return { consoleId, cursor: result.cursor, droppedBytes: result.droppedBytes }
     },
   })
 

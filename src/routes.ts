@@ -297,10 +297,22 @@ async function clearSecretOrReject(api: ConsoleHubApi, viewId: string): Promise<
 }
 
 /**
- * Apply a settings patch through the write path every writer uses, so the
- * schema, the pattern check, and the secret guard all run.
+ * Replace this plugin's whole settings section after validating it.
+ *
+ * This goes through `replace`, NOT `update`, and that distinction is the whole
+ * point of the function. The settings seam's `update` is a RECURSIVE MERGE:
+ * plain objects merge key by key and no merge can remove a key, because the
+ * keys it would have to remove are exactly the ones it does not carry. Merging
+ * a view map that is missing a deleted entry therefore reinstates that entry,
+ * the write reports success, and the device stays on disk.
+ *
+ * The section is replaced WHOLESALE rather than patched per key, so a removal
+ * is expressible at all. Absent keys fall back to the schema defaults, which is
+ * what this section's author expects: the patch is built from the live document
+ * plus one change, so nothing is being reset by accident.
+ *
  * @param api - the API dependencies.
- * @param patch - the partial settings document to merge.
+ * @param patch - fields to change; anything absent reverts to its default.
  * @returns the resolved settings after the write.
  * @throws {HubError} `settings-rejected` when the resulting document is invalid.
  */
@@ -313,9 +325,14 @@ async function applySettingsPatch(api: ConsoleHubApi, patch: object): Promise<Co
     throw new HubError('settings-rejected', error instanceof Error ? error.message : String(error))
   }
   const scope = api.settings as HubSettingsFace & { scope?: ConsoleSettingsScope<ConsoleHubSettings> }
-  if (scope.scope !== undefined) await scope.scope.update(merged)
+  // Prefer the owner scope's `replace`. Fall back to the service-level
+  // `replace` when the face carries one, and only then to `update` -- which
+  // cannot remove anything and is therefore the one path a deletion must NOT
+  // take. The fallback exists so the plugin still loads against a settings
+  // face that offers nothing else.
+  if (scope.scope !== undefined) await scope.scope.replace(merged)
   else if (scope.replace !== undefined) await scope.replace(merged)
-  else await api.settings.service.update('dsh-console-hub', patch)
+  else await api.settings.service.update('dsh-console-hub', merged)
   return api.settings.current()
 }
 

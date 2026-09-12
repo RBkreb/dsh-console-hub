@@ -332,8 +332,12 @@ function installApi(
     service: binding.service,
     current: readSettings,
     revision: () => revision,
+    // `replace`, not `update`: the seam's update is a recursive merge, and no
+    // merge can remove a key. Anything routed through it (a view deletion, a
+    // cleared map) would report success while the removed entry survived on
+    // disk. Named `replace` on this face because that is what it must do.
     replace: async (patch: object) => {
-      await binding.scope.update(patch)
+      await binding.scope.replace({ ...readSettings(), ...patch })
       revision += 1
     },
   }
@@ -441,6 +445,10 @@ function installApi(
       }
     },
     consumeConfirmation: (_sessionId, _consoleId, token) => consumeConfirmation(confirmations, token),
+    // Deliberately a pass-through to the live manager rather than an inline
+    // body, so there is one implementation of "what clearing means" -- the
+    // session's -- reachable from both the panel and the model.
+    clear: (sessionId, consoleId) => holder.get().clear(sessionId, consoleId),
   }
 
   ctx.inject(['webServer'], (webScoped) => {

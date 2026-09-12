@@ -94,6 +94,9 @@ function apiFor(): {
         ? { risk: 'high' as const, confirmationToken: `tok-${text}`, reason: `"${text}" is high risk` }
         : { risk: 'safe' as const },
       consumeConfirmation: (_sessionId, _consoleId, token) => token.startsWith('tok-'),
+      // Wired the way the host wires it: a pass-through to the live manager, so
+      // "what clearing means" has exactly one implementation.
+      clear: (sessionId, consoleId) => manager.clear(sessionId, consoleId),
     },
     manager,
   }
@@ -455,6 +458,62 @@ describe('console.control / console.close', () => {
     expect(closed.status).toBe(200)
     expect((closed.body as { value: { closed: boolean, consoleId: string } }).value.closed).toBe(true)
     expect(manager.list('session-a')).toHaveLength(0)
+  })
+
+  it('clears a console scrollback without closing the connection', async () => {
+    const { api, device } = await scene()
+    const connected = await call(api, 'console.connect', { sessionId: 'session-a', viewId: 'v-known' })
+    const consoleId = (connected.body as { value: { consoleId: string } }).value.consoleId
+
+    // Produce something worth clearing, then wait until the ANSWER is readable.
+    // The device replies asynchronously, so a read issued right after the send
+    // would race it and see only the greeting -- and a clear with nothing to
+    // drop would pass the assertions below for the wrong reason.
+    await call(api, 'console.send', { sessionId: 'session-a', consoleId, text: 'before-clear' })
+    const readOnce = async (): Promise<{ text: string, cursor: number }> => {
+      const response = await call(api, 'console.read', { sessionId: 'session-a', consoleId, after: 0 })
+      return (response.body as { value: { text: string, cursor: number } }).value
+    }
+    let before = await readOnce()
+    const deadline = Date.now() + 2000
+    while (!before.text.includes('before-clear') && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 20))
+      before = await readOnce()
+    }
+    expect(before.text).toContain('before-clear')
+
+    const cleared = await call(api, 'console.clear', { sessionId: 'session-a', consoleId })
+    expect(cleared.status).toBe(200)
+    const value = (cleared.body as { value: { cursor: number, droppedBytes: number } }).value
+    // Bytes really were dropped, and the caller is told where to resume.
+    expect(value.droppedBytes).toBeGreaterThan(0)
+    expect(value.cursor).toBeGreaterThanOrEqual(before.cursor)
+
+    // The discarded text is no longer readable from the old cursor...
+    const after = await call(api, 'console.read', { sessionId: 'session-a', consoleId, after: 0 })
+    expect((after.body as { value: { text: string } }).value.text).not.toContain('before-clear')
+
+    // ...and the console is STILL OPEN: the device socket was never touched.
+    const list = await call(api, 'console.list', { sessionId: 'session-a' })
+    const rows = (list.body as { value: { consoles: { consoleId: string, state: string }[] } }).value.consoles
+    expect(rows.find(row => row.consoleId === consoleId)?.state).toBe('open')
+
+    // The device is still usable: a command sent now still reaches it.
+    await call(api, 'console.send', { sessionId: 'session-a', consoleId, text: 'after-clear' })
+    await until(() => device.received.some(line => line.includes('after-clear')))
+  })
+
+  it('reports not-supported when the deployment composes no clear capability', async () => {
+    // Distinct from `not-found`: the console EXISTS, this build simply cannot
+    // clear it. Answering not-found would send a caller hunting for a console
+    // that is sitting right there.
+    const { api } = await scene()
+    const connected = await call(api, 'console.connect', { sessionId: 'session-a', viewId: 'v-known' })
+    const consoleId = (connected.body as { value: { consoleId: string } }).value.consoleId
+    delete api.clear
+    const refused = await call(api, 'console.clear', { sessionId: 'session-a', consoleId })
+    expect(refused.status).toBe(501)
+    expect(refused.body).toMatchObject({ ok: false, error: { code: 'not-supported' } })
   })
 
   it('closes every console for a session in one call', async () => {

@@ -264,6 +264,11 @@ export interface ConsoleHub {
     idleMs?: number
   }): Promise<WaitResult>
   control(sessionId: string, consoleId: string, action: 'drain'): Promise<{ paging: { active: boolean } }>
+  /**
+   * Discard one console's local scrollback. The connection is untouched.
+   * @returns the cursor to read from next, and the bytes that were dropped.
+   */
+  clear(sessionId: string, consoleId: string): Promise<{ consoleId: string, cursor: number, droppedBytes: number }>
   close(sessionId: string, consoleId: string, force?: boolean): Promise<{ closed: boolean }>
   closeAll(sessionId: string, force?: boolean): Promise<{ closed: number }>
   describe(sessionId: string, consoleId: string): Promise<{
@@ -278,6 +283,23 @@ export interface ConsoleHub {
     banner: string
   }>
   settings(sessionId: string): Promise<{ revision: number, defaults: EngineDefaults }>
+  /**
+   * Patch the HOST engine settings document.
+   *
+   * Distinct from the side-card prefs: this reaches the document the host
+   * enforces engine policy from, which is the only place a `wakeOnConnect`
+   * change has any effect.
+   *
+   * @param sessionId - the owning session.
+   * @param patch - the settings fields to change.
+   * @param expectedRevision - the revision the caller read, for a conflict check.
+   * @returns the new revision and the engine defaults after the write.
+   */
+  updateSettings(
+    sessionId: string,
+    patch: Record<string, unknown>,
+    expectedRevision?: number,
+  ): Promise<{ revision: number, defaults: EngineDefaults }>
 }
 
 /**
@@ -303,12 +325,19 @@ export function createConsoleHub(client: ApiClient): ConsoleHub {
       client.call('console.read', { sessionId, consoleId, after, ...options }),
     waitFor: (sessionId, consoleId, options) => client.call('console.waitFor', { sessionId, consoleId, ...options }),
     control: (sessionId, consoleId, action) => client.call('console.control', { sessionId, consoleId, action }),
+    clear: (sessionId, consoleId) => client.call('console.clear', { sessionId, consoleId }),
     close: (sessionId, consoleId, force) =>
       client.call('console.close', { sessionId, consoleId, ...force === undefined ? {} : { force } }),
     closeAll: (sessionId, force) =>
       client.call('console.closeAll', { sessionId, ...force === undefined ? {} : { force } }),
     describe: (sessionId, consoleId) => client.call('console.describe', { sessionId, consoleId }),
     settings: sessionId => client.call('settings.get', { sessionId }),
+    updateSettings: (sessionId, patch, expectedRevision) =>
+      client.call('settings.update', {
+        sessionId,
+        patch,
+        ...expectedRevision === undefined ? {} : { expectedRevision },
+      }),
   }
 }
 

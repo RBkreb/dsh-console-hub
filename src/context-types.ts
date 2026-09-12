@@ -119,11 +119,26 @@ export interface ConsoleSettingsDescriptor {
   user?: unknown
 }
 
-/** The settings seam face this plugin uses. */
+/**
+ * The settings seam face this plugin uses.
+ *
+ * `update` and `replace` are NOT interchangeable, and the difference decides
+ * whether a deletion works:
+ *
+ * - `update` MERGES recursively. Plain objects merge key by key, so no merge can
+ *   remove a key -- the ones it would have to remove are exactly the ones it
+ *   does not carry. A view map missing a deleted entry comes back still holding
+ *   it, the write reports success, and the device stays on disk.
+ * - `replace` installs the section WHOLESALE, so an absent key is genuinely
+ *   absent. This is the only path that can express a removal.
+ */
 export interface ConsoleSettingsService {
   register<T>(ns: string, schema: unknown, options?: { base?: Partial<T> }): ConsoleSettingsScope<T>
   describe(options?: { redactSecrets?: boolean }): ConsoleSettingsDescriptor[]
+  /** Merge `patch` into the namespace's stored section. Cannot remove a key. */
   update(ns: string, patch: object, expectedRevision?: number): Promise<void>
+  /** Install `section` as the namespace's whole stored section. Can remove keys. */
+  replace(ns: string, section: object, expectedRevision?: number): Promise<void>
 }
 
 // ── Host: credentials ───────────────────────────────────────────────────────

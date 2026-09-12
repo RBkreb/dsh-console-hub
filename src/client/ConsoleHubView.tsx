@@ -18,7 +18,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactElement } from 'react'
 import { HubApiError } from './api.ts'
 import { ConsoleBuffers } from './buffer.ts'
-import type { ClientTabPropsLike, ConsoleHub, ConsoleRow, ViewRow } from './hub.ts'
+import type { ClientTabPropsLike, ConsoleHub, ConsoleRow, EngineDefaults, ViewRow } from './hub.ts'
 import { shouldPoll } from './poll.ts'
 import { uiPrefs } from './prefs.ts'
 import { ViewForm } from './ViewForm.tsx'
@@ -89,6 +89,12 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
 
   const [views, setViews] = useState<ViewRow[]>([])
   const [consoles, setConsoles] = useState<ConsoleRow[]>([])
+  // The HOST engine defaults, carried so the controls below can show and change
+  // real engine policy. These are not side-card prefs: `wakeOnConnect` is read
+  // by the host from its settings document, so showing it here and writing it
+  // through `settings.update` is the only arrangement where the switch and the
+  // engine agree.
+  const [defaults, setDefaults] = useState<EngineDefaults | undefined>(undefined)
   const [selected, setSelected] = useState<string | undefined>(undefined)
   const [output, setOutput] = useState('')
   const [draft, setDraft] = useState('')
@@ -128,7 +134,12 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
       hub.listViews(sessionId),
       hub.listConsoles(sessionId),
     ])
-    if (inventory.status === 'fulfilled') setViews(inventory.value.views)
+    if (inventory.status === 'fulfilled') {
+      setViews(inventory.value.views)
+      // `config.list` already carries the engine defaults, so the controls cost
+      // no extra request and stay in step with whatever the host currently has.
+      setDefaults(inventory.value.defaults)
+    }
     if (live.status === 'fulfilled') {
       setConsoles(live.value.consoles)
       // Forget consoles that ended elsewhere (closed from another surface, or
@@ -390,6 +401,76 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
     }
   }, [hub, sessionId, refresh])
 
+  /**
+   * Empty this console's pane, and the host's copy with it.
+   *
+   * The host call is what makes it STICK: the local buffer could be emptied
+   * without asking anyone, but the next poll would then read the host's
+   * still-retained scrollback and paint it straight back. The host returns the
+   * cursor that follows the dropped bytes, which is exactly where the next read
+   * must resume.
+   *
+   * The connection is NOT touched: this discards a local record, it does not
+   * close, reset or interrupt the device. Clearing a console you are watching
+   * is a display decision, so nothing is sent to the hardware.
+   */
+  const clearOutput = useCallback(async () => {
+    if (selected === undefined) return
+    setBusy(true)
+    setError(null)
+    try {
+      const result = await hub.clear(sessionId, selected)
+      buffersRef.current.clear(selected)
+      buffersRef.current.get(selected).cursor = result.cursor
+      cursorRef.current = result.cursor
+      setOutput('')
+      setPaging(false)
+      setStatus(`已清空本地显示（${String(result.droppedBytes)} 字节）；连接保持。`)
+    } catch (failure) {
+      // A console that ended elsewhere is reconciled here too, so the button
+      // cannot leave a stale selection behind a permanent red banner.
+      if (isGone(failure)) {
+        buffersRef.current.clear(selected)
+        setSelected(undefined)
+        setOutput('')
+        await refresh()
+      } else {
+        setError(messageOf(failure))
+      }
+    } finally {
+      setBusy(false)
+    }
+  }, [hub, sessionId, selected, refresh])
+
+  /**
+   * Flip one HOST engine setting.
+   *
+   * Written through the settings API rather than kept locally: the host is what
+   * enforces `wakeOnConnect`, and a purely local switch would show the new
+   * value while every future connect still behaved the old way. On failure the
+   * displayed defaults are re-read from the host, so the control never keeps a
+   * value the engine did not accept.
+   *
+   * @param key - the settings field to change.
+   * @param value - its new value.
+   */
+  const updateEngineSetting = useCallback(async (key: string, value: unknown) => {
+    setBusy(true)
+    setError(null)
+    try {
+      const result = await hub.updateSettings(sessionId, { [key]: value })
+      setDefaults(result.defaults)
+      setStatus(`已更新引擎设置：${key} = ${String(value)}`)
+    } catch (failure) {
+      setError(messageOf(failure))
+      // Re-read rather than guess: the write may have been rejected, or may
+      // have landed and then failed on the way back.
+      await refresh()
+    } finally {
+      setBusy(false)
+    }
+  }, [hub, sessionId, refresh])
+
   const current = consoles.find(row => row.consoleId === selected)
 
   return (
@@ -399,6 +480,21 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
         {' '}
         {button('新建', () => setEditing({ kind: 'new' }))}
         {button('刷新', () => void refresh())}
+        {defaults !== undefined && (
+          <label
+            title="连接后先发一次回车再等待提示符。某些 console 服务器在收到按键前完全静默，开启后连接即可看到提示符。"
+            style={{ marginLeft: 12, opacity: busy ? 0.6 : 1, cursor: 'pointer' }}
+          >
+            <input
+              type="checkbox"
+              checked={defaults.wakeOnConnect}
+              disabled={busy}
+              onChange={event => { void updateEngineSetting('wakeOnConnect', event.target.checked) }}
+            />
+            {' '}
+            连接后自动唤醒
+          </label>
+        )}
       </div>
 
       <div style={{ display: 'flex', minHeight: 0, flex: 1 }}>
@@ -522,6 +618,15 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
                   )}
 
                   <div style={{ display: 'flex', padding: 8, gap: 6 }}>
+                    {/*
+                      `readOnly`, never `disabled`. Disabling a focused input makes
+                      the browser BLUR it, and re-enabling never restores focus --
+                      so every send left the user clicking back into the box. The
+                      buttons still gate on `busy`, so a second submit cannot be
+                      issued; the field merely stays focused. A JSX comment must
+                      live in children position, which is why this sits here and
+                      not in the attribute list above.
+                    */}
                     <input
                       value={draft}
                       onChange={event => { setDraft(event.target.value) }}
@@ -529,11 +634,12 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
                         if (event.key === 'Enter') void submit()
                       }}
                       placeholder="输入命令后回车（不发换行前请留空）"
-                      disabled={busy}
+                      readOnly={busy}
                       style={{ flex: 1, font: 'inherit', padding: '4px 6px' }}
                     />
                     {button('发送', () => void submit(), { disabled: busy })}
                     {button('读取', () => void readOnce())}
+                    {button('清空', () => void clearOutput(), { title: '只清空本地显示，不断开连接' })}
                   </div>
                   <div style={{ padding: '0 8px 8px', opacity: 0.6 }}>
                     当前：{current?.label ?? selected} · cursor {cursorRef.current}

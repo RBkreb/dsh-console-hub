@@ -182,6 +182,17 @@ export interface RingBuffer {
    * @returns the retained bytes at or after `cursor`.
    */
   slice(cursor: number): Uint8Array
+  /**
+   * Drop every retained byte, as if the window had been evicted at once.
+   *
+   * `written` deliberately does NOT move: the cursor is an absolute offset into
+   * the stream, so advancing `dropped` to meet it retires the retained bytes
+   * while every existing cursor keeps its meaning. A reader asking from an old
+   * cursor is clamped into the now-empty window and gets nothing, rather than
+   * being handed a shifted window of unrelated bytes -- the same guarantee
+   * {@link slice} already makes for bytes that aged out under the size limit.
+   */
+  clear(): void
 }
 
 /**
@@ -225,6 +236,14 @@ export function createRingBuffer(limitBytes: number): RingBuffer {
     slice(cursor) {
       const start = Math.max(0, Math.min(cursor - dropped, buffer.length))
       return buffer.slice(start)
+    },
+    clear() {
+      // Retire the retained bytes by moving the DROP counter to the write head.
+      // `written` is `dropped + buffer.length`, so this leaves the absolute
+      // cursor untouched while making the window empty -- every existing reader
+      // cursor still refers to the same point in the stream.
+      dropped += buffer.length
+      buffer = new Uint8Array(0)
     },
   }
 }

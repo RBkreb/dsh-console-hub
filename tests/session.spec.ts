@@ -267,6 +267,50 @@ describe('ConsoleSession send / read', () => {
     expect(second.text).not.toContain('first')
   })
 
+  it('clears the local scrollback without touching the connection', async () => {
+    const server = await startFakeConsole({ greeting: '<DUT1>' })
+    const session = track(sessionFor(server), server)
+    await session.open()
+    server.push('\r\nnoise before\r\n')
+    await until(() => session.read({ after: 0 }).text.includes('noise before'))
+
+    const cleared = session.clear()
+    expect(cleared.droppedBytes).toBeGreaterThan(0)
+    // Already-read output is gone...
+    expect(session.read({ after: 0 }).text).not.toContain('noise before')
+    // ...and the returned cursor is where the next read should start.
+    expect(session.read({ after: cleared.cursor }).text).toBe('')
+
+    // The SOCKET is untouched: the session is still open and still answers.
+    expect(session.status().state).toBe('open')
+    server.push('after clear\r\n')
+    await until(() => session.read({ after: cleared.cursor }).text.includes('after clear'))
+  })
+
+  it('forgets a prompt that described cleared output', async () => {
+    // `waitFor` matches on the retained tail. A prompt left over from output
+    // that no longer exists would keep answering `matched` for a prompt the
+    // reader cannot see -- so clearing drops it.
+    const server = await startFakeConsole({ greeting: '<DUT1>' })
+    const session = track(sessionFor(server), server)
+    await session.open()
+    await until(() => session.status().prompt === '<DUT1>')
+    session.clear()
+    expect(session.status().prompt).toBeNull()
+  })
+
+  it('resets paging state so a cleared page prompt cannot strand the reader', async () => {
+    const server = await startFakeConsole({ greeting: '<DUT1>' })
+    const session = track(sessionFor(server, { pagingMode: 'manual' }), server)
+    await session.open()
+    server.push('\r\nline\r\n--More--')
+    await until(() => session.read({ after: 0 }).paging.active)
+    session.clear()
+    // The pager described discarded output; a page that cannot be answered must
+    // not stay "active".
+    expect(session.read({ after: 0 }).paging.active).toBe(false)
+  })
+
   it('decodes with a per-call encoding override', async () => {
     const server = await startFakeConsole({ greeting: '<SW1>' })
     const session = track(sessionFor(server, { encoding: 'utf-8' }), server)

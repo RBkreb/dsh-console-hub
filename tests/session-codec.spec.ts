@@ -166,6 +166,34 @@ describe('createRingBuffer', () => {
     expect(() => createRingBuffer(0)).toThrow(/limit/)
     expect(() => createRingBuffer(-1)).toThrow(/limit/)
   })
+
+  it('empties on clear while keeping the cursor absolute', () => {
+    // The property that makes clearing safe: `written` is an offset into the
+    // STREAM, not into the retained window. Advancing the drop counter to meet
+    // it retires the bytes without renumbering anything, so a reader holding a
+    // pre-clear cursor lands outside the (now empty) window and gets nothing --
+    // rather than being handed a shifted window of unrelated bytes.
+    const ring = createRingBuffer(1024)
+    ring.append(bytes(1, 2, 3))
+    const before = ring.written
+    ring.clear()
+    expect(ring.length).toBe(0)
+    expect(ring.written).toBe(before)
+    expect([...ring.slice(0)]).toEqual([])
+    expect([...ring.slice(before)]).toEqual([])
+  })
+
+  it('keeps counting after a clear, so post-clear output is readable', () => {
+    const ring = createRingBuffer(1024)
+    ring.append(bytes(1, 2, 3))
+    ring.clear()
+    ring.append(bytes(4, 5))
+    // The cursor did not restart, so output that arrives after the clear is not
+    // confused with the bytes that were dropped.
+    expect(ring.written).toBe(5)
+    expect([...ring.slice(3)]).toEqual([4, 5])
+    expect([...ring.slice(0)]).toEqual([4, 5])
+  })
 })
 
 describe('matchPrompt / matchPager', () => {

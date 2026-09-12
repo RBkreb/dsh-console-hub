@@ -73,6 +73,9 @@ function fakeSettings(initial: Partial<ConsoleHubSettings> = {}): { service: Con
       update: async (_ns, patch) => {
         await scope.update(patch)
       },
+      replace: async (_ns, section) => {
+        await scope.replace(section)
+      },
     },
   }
 }

@@ -554,6 +554,37 @@ export class ConsoleSession {
   }
 
   /**
+   * Discard everything read so far, so the next read starts from a clean pane.
+   *
+   * The wire is untouched: this is a READER-side reset, not a device command.
+   * The bytes are dropped from the local ring buffer, which is also what
+   * `waitFor` searches and where the prompt/pager matchers look -- so the
+   * remembered prompt goes too, because it described output that no longer
+   * exists. Anything the device sends AFTER this is received and readable as
+   * usual; nothing is sent to the device and nothing is unplugged.
+   *
+   * Existing cursors are NOT renumbered. `written` keeps counting from where it
+   * was, so a caller holding a pre-clear cursor reads from a window that no
+   * longer contains it and gets nothing -- the honest answer, and the same one
+   * a cursor that aged out under the size limit already gets.
+   *
+   * @returns the cursor a reader should use next, and how many bytes were dropped.
+   */
+  clear(): { cursor: number, droppedBytes: number } {
+    const droppedBytes = this.ring.length
+    this.ring.clear()
+    // The pager state described the discarded output: a page prompt printed in
+    // it can never be answered now, so keeping it would strand the reader on a
+    // page that no longer exists.
+    this.resumePaging()
+    // A prompt remembered from discarded output would keep `waitFor` reporting
+    // `matched` for a prompt the reader cannot see.
+    this.currentPrompt = null
+    this.record('system', 'clear', `cleared ${String(droppedBytes)} byte(s) of local scrollback`)
+    return { cursor: this.ring.written, droppedBytes }
+  }
+
+  /**
    * Wait until output satisfies a condition, the budget runs out, or the
    * session closes. This is the one blocking read every caller uses, so no
    * caller needs a polling loop of its own.

@@ -76,6 +76,31 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
+/** Read repeatedly from a GIVEN cursor until `check` holds, accumulating what it sees. */
+async function readFrom(
+  ports: PortManager,
+  sessionId: string,
+  consoleId: string,
+  cursor: number,
+  check: (text: string) => boolean,
+  budgetMs = 8000,
+): Promise<string> {
+  // Distinct from `readUntil`, which always starts at 0: after a clear, cursor 0
+  // addresses bytes that no longer exist, so a resumed reader must say where it
+  // is. Sharing one helper would hide that difference.
+  let at = cursor
+  let accumulated = ''
+  const deadline = Date.now() + budgetMs
+  while (Date.now() < deadline) {
+    const result = ports.read(sessionId, consoleId, { after: at })
+    at = result.cursor
+    accumulated += result.text
+    if (check(accumulated)) return accumulated
+    await sleep(150)
+  }
+  return accumulated
+}
+
 /** Read repeatedly until `check` holds, accumulating everything seen. */
 async function readUntil(
   ports: PortManager,
@@ -247,6 +272,46 @@ describe.runIf(LIVE)('live console lab', () => {
       const detail = ports.describe('live', entry.consoleId)
       expect(detail?.state.state).toBe('open')
       expect(text.length).toBeGreaterThan(0)
+    } finally {
+      await ports.dispose()
+    }
+  }, 45_000)
+
+  it('clears the local scrollback and keeps talking to the real device', async () => {
+    // The property that separates clearing from closing, measured on hardware:
+    // after a clear the device must still answer. A clear that quietly broke the
+    // connection would look identical in the pane -- empty output -- so only a
+    // real follow-up command can tell the two apart.
+    const ports = manager()
+    try {
+      const entry = await ports.connect({
+        ownerSessionId: 'live',
+        label: SW1.label,
+        host: SW1.host,
+        port: SW1.port,
+        kind: 'telnet',
+        encoding: 'utf-8',
+        pagingMode: 'manual',
+      })
+      await ports.waitFor('live', entry.consoleId, { for: 'prompt', timeoutMs: 8000 })
+      await ports.send('live', entry.consoleId, 'show version')
+      const before = await readUntil(ports, 'live', entry.consoleId, seen => seen.length > 0, 15_000)
+      expect(before.length).toBeGreaterThan(0)
+
+      const cleared = ports.clear('live', entry.consoleId)
+      expect(cleared.droppedBytes).toBeGreaterThan(0)
+      // The buffer really is empty, and the cursor it hands back is where the
+      // next read must resume.
+      expect(ports.read('live', entry.consoleId, { after: 0 }).text).toBe('')
+      expect(ports.read('live', entry.consoleId, { after: cleared.cursor }).text).toBe('')
+
+      // Still open, and still usable: the device answers a fresh command. The
+      // read starts from the cursor the clear handed back, since everything
+      // before it was discarded.
+      expect(ports.describe('live', entry.consoleId)?.state.state).toBe('open')
+      await ports.send('live', entry.consoleId, 'show version')
+      const after = await readFrom(ports, 'live', entry.consoleId, cleared.cursor, seen => seen.includes('Software'), 15_000)
+      expect(after).toContain('Software')
     } finally {
       await ports.dispose()
     }
