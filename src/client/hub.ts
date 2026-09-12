@@ -14,6 +14,7 @@
 import { createElement } from 'react'
 import type { ApiClient } from './api.ts'
 import { ConsoleHubView } from './ConsoleHubView.tsx'
+import { FenceRulesEditor } from './FenceRulesEditor.tsx'
 
 /** The tab type this plugin registers. */
 export const CONSOLE_TAB_ID = 'dsh-console-hub:consoles'
@@ -88,8 +89,22 @@ export interface ClientTabDescriptor {
   dedupeKey: (tab: ClientTabLike) => string
   settings: {
     pluginToggles: readonly ClientSettingRow[]
+    /**
+     * Custom settings panel, rendered by the shell AFTER the row list.
+     *
+     * Declared as the shell's own contract does: it receives the store and other
+     * sidebar plumbing, and returns a node. Narrowed to the fields this plugin
+     * reads rather than mirroring the whole `SidebarSettingsRenderProps`, since
+     * the bundle may not import the sidebar's types.
+     */
+    render?: (props: SidebarSettingsRenderPropsLike) => unknown
   }
   component: (props: ClientTabPropsLike) => unknown
+}
+
+/** The slice of the shell's settings-panel props this plugin uses. */
+export interface SidebarSettingsRenderPropsLike {
+  store?: { getSnapshot?: () => { sessionId?: string } }
 }
 
 /** The `ctx.betterSidebar` slice this plugin uses. */
@@ -443,14 +458,31 @@ export function consoleTabDescriptor(hub: ConsoleHub): ClientTabDescriptor {
     // than starting a second poll loop.
     single: true,
     dedupeKey: () => CONSOLE_TAB_ID,
-    // Declarative rows ONLY. This descriptor once declared `pluginToggles`
-    // AND rendered the same four controls through `settings.render`, and the
-    // shell renders the rows and then the custom panel -- so every option
-    // appeared twice, stacked. The rows are the shell-native path (it persists
-    // them to `pluginSettings[<id>]` itself), so the custom panel is what goes;
-    // the tab now reads those same values back out of the sidebar snapshot.
+    // Declarative rows for the four client-side preferences, PLUS a custom panel
+    // for the fence rules. The shell renders `settings.render` AFTER the row list
+    // (`SideCardSection`: "an extension of the row list, not a replacement"), so
+    // the editor lands directly under 高危指令二次确认 — which is where an operator
+    // looks for it.
+    //
+    // The editor renders ONLY itself. An earlier version of this descriptor
+    // declared rows AND re-rendered the same four controls in the panel, so every
+    // option appeared twice, stacked; keeping the two mechanisms on disjoint
+    // content is what avoids repeating that.
+    //
+    // The rules cannot be an ordinary row: a row persists into the sidebar's own
+    // `pluginSettings[id]` blob, and the fence is enforced by the HOST, so a rule
+    // stored there would be a rule that does nothing. Hence a custom panel that
+    // writes through the plugin's API.
     settings: {
       pluginToggles: settingsRows(),
+      render: (props: { store?: { getSnapshot?: () => { sessionId?: string } } }) =>
+        createElement(FenceRulesEditor, {
+          hub,
+          // The plugin's API is session-scoped, so the editor needs the active
+          // session. Read live from the store rather than captured, so switching
+          // sessions while the popup is open cannot write to the previous one.
+          sessionId: props.store?.getSnapshot?.().sessionId,
+        }),
     },
     component: props => createElement(ConsoleHubView, { ...props, hub }),
   }

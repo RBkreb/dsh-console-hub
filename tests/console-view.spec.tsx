@@ -818,43 +818,18 @@ describe('the engine settings controls', () => {
     })
   })
 
-  it('shows the active fence rules, labelled by action', async () => {
-    // A security setting nobody can see is a security setting nobody can check.
-    // The panel lists what is enforced, in order, so "why did that need
-    // confirming" is answerable without opening the settings document.
+  it('keeps the fence rules OUT of the console column', async () => {
+    // The rules used to be listed here as a read-only disclosure. They now live
+    // in the side card's settings popup, next to the other preferences, where
+    // they can actually be EDITED -- one place, not two. This asserts the tab did
+    // not keep a second copy, which is the duplication the descriptor's row list
+    // and custom panel already caused once.
     const scene = settingsHub()
     const view = renderView(scene.hub)
     await waitFor(() => {
-      expect(view.getByText(/拦截规则/)).toBeTruthy()
-    })
-    // Each rule's matcher and its action are both visible.
-    expect(view.getByText('configuration rollback')).toBeTruthy()
-    expect(view.getByText('reboot|restart|reload')).toBeTruthy()
-    expect(view.getAllByText('需确认')).toHaveLength(2)
-    // And the fallback, so the list is not mistaken for the whole policy.
-    expect(view.getByText(/直接放行/)).toBeTruthy()
-  })
-
-  it('does not crash when a host sends no fenceRules at all', async () => {
-    // A read-only summary must never take the tab down. An older host, or a
-    // partial answer, previously threw on `defaults.fenceRules.length`.
-    const scene = settingsHub()
-    const stripped = {
-      ...scene.hub,
-      listViews: async () => {
-        const answer = await scene.hub.listViews('session-a')
-        const { fenceRules: _dropped, ...rest } = answer.defaults as unknown as Record<string, unknown>
-        return { views: answer.views, defaults: rest as never }
-      },
-    } as ConsoleHub
-    const view = renderView(stripped)
-    // `queryByText`, because absence is the assertion here: `getByText` throws
-    // when it finds nothing, which would fail the test for the very outcome it
-    // is checking for.
-    await waitFor(() => {
       expect(view.getByLabelText('连接后自动唤醒')).toBeTruthy()
     })
-    expect(view.queryByText(/拦截规则/)).toBeNull()
+    expect(view.container.textContent).not.toContain('拦截规则')
   })
 })
 

@@ -8,7 +8,8 @@
  */
 // @vitest-environment jsdom
 import { describe, expect, it, vi } from 'vitest'
-import { createElement } from 'react'
+import { createElement, type ReactElement } from 'react'
+import { renderToStaticMarkup } from 'react-dom/server'
 import { apply, inject } from '../src/client/index.tsx'
 import {
   CONSOLE_TAB_ID,
@@ -109,21 +110,49 @@ describe('consoleTabDescriptor', () => {
     expect(descriptor.hidden).not.toBe(true)
   })
 
-  it('declares its settings as rows ONLY, never also as a custom panel', () => {
-    // The rendered defect: the descriptor declared `pluginToggles` and ALSO a
-    // `settings.render` that drew the same four controls, and the shell renders
-    // the rows and then the custom panel -- so every option appeared twice,
-    // stacked, in the side card.
+  it('declares its settings as rows PLUS a panel, with DISJOINT content', () => {
+    // The rendered defect this guards against: the descriptor declared
+    // `pluginToggles` and ALSO a `settings.render` that drew the same four
+    // controls, so every option appeared twice, stacked in the side card.
     //
-    // The rows are the shell-native path (it persists them itself), so the
-    // custom panel must be absent. The declared type no longer even has a
-    // `render` member, which is the compile-time half of this guarantee; the
-    // runtime cast below keeps the assertion honest for a future edit that
-    // widens that type back.
+    // The shell's `settings.render` is ADDITIVE (rows first, panel after), which
+    // is exactly what puts the fence editor directly under 高危指令二次确认. So the
+    // property that matters is not "no panel" but "the panel does not redraw the
+    // rows" -- asserted by rendering it and looking at what came out.
     const descriptor = consoleTabDescriptor({} as never)
     expect(descriptor.settings?.pluginToggles?.length).toBeGreaterThan(0)
-    const settings = descriptor.settings as { render?: unknown } | undefined
-    expect(settings?.render).toBeUndefined()
+    const settings = descriptor.settings as { render?: (props: unknown) => unknown } | undefined
+    expect(typeof settings?.render).toBe('function')
+
+    const element = settings?.render?.({
+      store: { getSnapshot: () => ({ sessionId: 'session-a' }) },
+    }) as { type?: unknown, props?: Record<string, unknown> } | undefined
+    // It renders the fence editor, and it passes the hub through so the editor
+    // can reach the HOST settings (the rows beside it persist to the browser's
+    // own blob, which the fence does not read).
+    expect((element?.type as { name?: string })?.name).toBe('FenceRulesEditor')
+    expect(element?.props?.hub).toBeDefined()
+    // The active session comes from the store, read live: the plugin API is
+    // session-scoped, and a captured id could write to the previous session.
+    expect(element?.props?.sessionId).toBe('session-a')
+  })
+
+  it('renders the fence editor with NO duplicate of the declarative rows', () => {
+    // Rendered for real, because the props check above cannot see what the editor
+    // draws. The four client preferences are the shell's rows; if any of their
+    // labels appear in the panel too, the duplication bug is back.
+    const descriptor = consoleTabDescriptor({ settings: async () => ({ revision: 1, defaults: {} }) } as never)
+    const settings = descriptor.settings as { render: (props: unknown) => unknown }
+    const html = renderToStaticMarkup(
+      settings.render({ store: { getSnapshot: () => ({ sessionId: 'session-a' }) } }) as ReactElement,
+    )
+    // The control the panel IS for.
+    expect(html).toContain('data-console-hub-fence="rules"')
+    expect(html).toContain('data-console-hub-fence-save')
+    // None of the declarative rows' labels may appear.
+    for (const label of ['连接后自动聚焦控制台', '输出自动换行', '刷新间隔', '高危指令二次确认']) {
+      expect(html, label).not.toContain(label)
+    }
   })
 
   it('declares each settings row exactly once', () => {
