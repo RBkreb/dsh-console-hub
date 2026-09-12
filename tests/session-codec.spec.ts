@@ -76,20 +76,42 @@ describe('stripIac', () => {
 })
 
 describe('negotiationReply', () => {
-  it('refuses every option the peer requests', () => {
+  it('refuses every option the peer REQUESTS', () => {
     const reply = negotiationReply(bytes(IAC, DO, 24))
     expect([...reply]).toEqual([IAC, WONT, 24])
   })
 
-  it('replies DONT to WILL and to WONT, DO and DONT both answer WONT', () => {
+  it('answers WILL with DONT', () => {
     expect([...negotiationReply(bytes(IAC, WILL, 1))]).toEqual([IAC, DONT, 1])
-    expect([...negotiationReply(bytes(IAC, WONT, 1))]).toEqual([IAC, DONT, 1])
-    expect([...negotiationReply(bytes(IAC, DONT, 1))]).toEqual([IAC, WONT, 1])
+  })
+
+  it('answers DONT and WONT with NOTHING: they are statements, not requests', () => {
+    // RFC 854 / RFC 1143. This is the difference between a console that settles
+    // and one that saturates its link forever.
+    //
+    // MEASURED against the lab firewall: it replies to our DONT with another
+    // WONT, so answering each WONT with a DONT is an infinite ping-pong. The
+    // device and this session exchanged negotiation frames forever -- 1.4KB/s
+    // each way and rising, with no application data at all, so an "idle" console
+    // was never idle. Verified fixed in `scripts/probe-rfc.mjs`: with the reply
+    // suppressed, rx/tx freeze at 20/6 bytes after connect instead of climbing.
+    expect([...negotiationReply(bytes(IAC, WONT, 1))]).toEqual([])
+    expect([...negotiationReply(bytes(IAC, DONT, 1))]).toEqual([])
   })
 
   it('collects every request in one chunk into one reply', () => {
     const reply = negotiationReply(bytes(IAC, DO, 24, IAC, WILL, 1, IAC, DO, 31))
     expect([...reply]).toEqual([IAC, WONT, 24, IAC, DONT, 1, IAC, WONT, 31])
+  })
+
+  it('does not echo a refusal back as if it were a request', () => {
+    // The exact real-world storm, byte for byte from the lab: the device's
+    // opening WILL/WILL, then its response to our refusals. Only the initial two
+    // may produce a reply; everything after must be silent, or the loop resumes.
+    const opening = bytes(IAC, WILL, 1, IAC, WILL, 3)
+    expect([...negotiationReply(opening)]).toEqual([IAC, DONT, 1, IAC, DONT, 3])
+    const afterOurRefusal = bytes(IAC, WONT, 1, IAC, WONT, 3)
+    expect([...negotiationReply(afterOurRefusal)]).toEqual([])
   })
 
   it('returns nothing when the chunk carries no request', () => {

@@ -83,9 +83,25 @@ export function stripIac(data: Uint8Array): Uint8Array {
 }
 
 /**
- * Build the refusal reply for every option negotiation in one chunk: `DO`/`DONT`
- * are answered `WONT`, `WILL`/`WONT` are answered `DONT`. Refusing everything is
- * what stops the console server's negotiation storm.
+ * Build the refusal reply for every option REQUEST in one chunk.
+ *
+ * Per RFC 854 and RFC 1143, only `DO` and `WILL` are requests; `DONT` and `WONT`
+ * are statements about the sender's own state and must NOT be answered. The
+ * reply is therefore:
+ *
+ * - `DO <opt>`   -> `WONT <opt>` (we will not perform it)
+ * - `WILL <opt>` -> `DONT <opt>` (we do not want it)
+ * - `DONT`/`WONT` -> nothing at all
+ *
+ * This distinction is not pedantry; answering a `WONT` with a `DONT` is an
+ * infinite loop against real hardware. MEASURED on the lab firewall
+ * (`scripts/probe-rfc.mjs`): it opens with `WILL 1`/`WILL 3`, an echo-obsessed
+ * reply turns that into `WONT 1`/`WONT 3`, and answering each `WONT` with `DONT`
+ * makes the device answer each `DONT` with another `WONT`. The two ends then
+ * exchange negotiation frames forever -- 1.4KB/s in each direction, rising,
+ * with no application data at all. That is what the previous implementation did:
+ * it fired a reply for EVERY negotiation byte, so an idle console saturated its
+ * link and never went quiet.
  *
  * @param data - the raw bytes from one socket read.
  * @returns the bytes to write back; empty when the chunk asked nothing.
@@ -100,8 +116,9 @@ export function negotiationReply(data: Uint8Array): Uint8Array {
     }
     const command = data[i + 1] as number
     const option = data[i + 2] as number
-    if (command === DO || command === DONT) reply.push(IAC, WONT, option)
-    else if (command === WILL || command === WONT) reply.push(IAC, DONT, option)
+    // ONLY the two request verbs are answered; see the note above.
+    if (command === DO) reply.push(IAC, WONT, option)
+    else if (command === WILL) reply.push(IAC, DONT, option)
     i += 3
   }
   return Uint8Array.from(reply)
