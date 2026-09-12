@@ -15,7 +15,7 @@
  *
  * @module dsh-console-hub/client/ConsoleHubView
  */
-import { useCallback, useEffect, useRef, useState, type ReactElement } from 'react'
+import { useCallback, useEffect, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactElement } from 'react'
 import { HubApiError } from './api.ts'
 import { ConsoleBuffers } from './buffer.ts'
 import { ConfigModal } from './ConfigModal.tsx'
@@ -62,7 +62,7 @@ function isGone(error: unknown): boolean {
 /** One toolbar button. */
 function button(
   label: string,
-  onClick: () => void,
+  onClick: (event: ReactMouseEvent<HTMLButtonElement>) => void,
   options: { disabled?: boolean, title?: string, danger?: boolean } = {},
 ): ReactElement {
   return (
@@ -217,14 +217,21 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
     setError(null)
     try {
       const entry = await hub.connect(sessionId, input)
-      setStatus(`${entry.label} (${entry.host}:${String(entry.port)}) ${entry.state}`)
+      // A connect may have ATTACHED to a console another session already had
+      // open, rather than opening a second device link. Said out loud, because
+      // it changes what the user may safely do next: closing a console someone
+      // else is using pulls the device out from under them.
+      setStatus(
+        `${entry.label} (${entry.host}:${String(entry.port)}) ${entry.state}`
+        + `${entry.reused === true ? ' · 已附加到既有连接（共享池）' : ''}`,
+      )
       // The banner is the device's own words on connect — for a console that
       // lands straight at a prompt it is the only thing that proves the link.
       setConsoles(current => [
         ...current.filter(row => row.consoleId !== entry.consoleId),
         {
           consoleId: entry.consoleId,
-          ownerSessionId: sessionId,
+          openedBy: entry.openedBy ?? sessionId,
           label: entry.label,
           host: entry.host,
           port: entry.port,
@@ -684,6 +691,24 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
           {consoles.map(row => (
             <div
               key={row.consoleId}
+              // The WHOLE card selects. The handler used to sit on the label line
+              // alone while the card still showed `cursor: pointer`, so the label,
+              // the error line, the button row and every gap between them looked
+              // clickable and were not -- the reported bug. A card is one control,
+              // so it takes one handler.
+              onClick={() => { select(row.consoleId) }}
+              // Keyboard-reachable for the same reason: it is now a large target,
+              // and a div with an onClick is invisible to the keyboard.
+              role="button"
+              tabIndex={0}
+              aria-pressed={row.consoleId === selected}
+              onKeyDown={event => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                  // Space would otherwise scroll the panel.
+                  event.preventDefault()
+                  select(row.consoleId)
+                }
+              }}
               style={{
                 padding: '6px 8px',
                 cursor: 'pointer',
@@ -691,10 +716,17 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
                 borderBottom: '1px solid rgba(127,127,127,0.2)',
               }}
             >
-              <div onClick={() => { select(row.consoleId) }}>
+              <div>
                 <strong>{row.label}</strong>
                 {' '}
                 <span style={{ opacity: 0.7 }}>{row.state}</span>
+                {row.openedBy !== sessionId && (
+                  // Consoles are shared, so a row may not be this session's. Shown
+                  // because closing it affects whoever opened it.
+                  <span style={{ marginLeft: 6, opacity: 0.55 }} title={`由会话 ${row.openedBy} 打开（共享池）`}>
+                    共享
+                  </span>
+                )}
                 {row.dormant === true && (
                   // Marked in the LIST, not just in the pane: a dormant console
                   // answers nothing, so a user scanning several consoles must be
@@ -708,8 +740,13 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
                 <div style={{ color: '#c0392b' }}>{row.lastError.code}: {row.lastError.message}</div>
               )}
               <div style={{ marginTop: 4 }}>
-                {button('关闭', () => void closeConsole(row.consoleId, false), { disabled: busy })}
-                {button('强制关闭', () => void closeConsole(row.consoleId, true), { disabled: busy, danger: true })}
+                {/*
+                  Stopped from bubbling: the card selects, and these buttons must
+                  not ALSO select the row they are acting on -- closing a console
+                  would otherwise select it on the way out.
+                */}
+                {button('关闭', event => { event.stopPropagation(); void closeConsole(row.consoleId, false) }, { disabled: busy })}
+                {button('强制关闭', event => { event.stopPropagation(); void closeConsole(row.consoleId, true) }, { disabled: busy, danger: true })}
               </div>
             </div>
           ))}

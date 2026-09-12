@@ -122,7 +122,7 @@ function apiFor(): {
       consumeConfirmation: (_sessionId, _consoleId, token) => token.startsWith('tok-'),
       // Wired the way the host wires it: a pass-through to the live manager, so
       // "what clearing means" has exactly one implementation.
-      clear: (sessionId, consoleId) => manager.clear(sessionId, consoleId),
+      clear: (_sessionId, consoleId) => manager.clear(consoleId),
     },
     manager,
   }
@@ -201,6 +201,38 @@ async function scene(
     ? { viewId, name: 'FW1', host: '127.0.0.1', port: device.port, kind: 'raw', encoding: 'utf-8', user: '', promptPattern: '', pagerPattern: '', pagingMode: '', tags: [], notes: '' }
     : undefined)
   return { api, manager, device }
+}
+
+/**
+ * A scene with TWO devices, reachable as `v-known` and `v-second`.
+ *
+ * Needed because a second connect to the SAME target now ATTACHES instead of
+ * opening (a second TCP connection to one console-server port would evict the
+ * first). So any test about "several consoles" has to mean several devices.
+ *
+ * @returns the API, the manager, and both devices.
+ */
+async function twoDeviceScene(): Promise<{
+  api: ConsoleSessionApi
+  manager: PortManager
+  first: Device
+  second: Device
+}> {
+  const first = await startDevice()
+  const second = await startDevice()
+  const { api, manager } = apiFor()
+  devices.push(first, second)
+  managers.push(manager)
+  const view = (viewId: string, name: string, port: number): Record<string, unknown> => ({
+    viewId, name, host: '127.0.0.1', port, kind: 'raw', encoding: 'utf-8',
+    user: '', promptPattern: '', pagerPattern: '', pagingMode: '', tags: [], notes: '',
+  })
+  api.viewOf = async (_sessionId, viewId) => {
+    if (viewId === 'v-known') return view(viewId, 'FW1', first.port) as never
+    if (viewId === 'v-second') return view(viewId, 'SW1', second.port) as never
+    return undefined
+  }
+  return { api, manager, first, second }
 }
 
 describe('console route envelope', () => {
@@ -299,13 +331,19 @@ describe('console.connect', () => {
 })
 
 describe('console.list / console.describe', () => {
-  it('lists the caller session consoles only', async () => {
+  it('lists the SHARED pool to any session, marking who opened each console', async () => {
+    // The list is not session-filtered. Filtering is what made a console opened
+    // by a since-dead session unreachable: the session check rejected every call
+    // that named it, so nothing could list it in order to close it.
     const { api } = await scene()
     await call(api, 'console.connect', { sessionId: 'session-a', viewId: 'v-known' })
     const mine = await call(api, 'console.list', { sessionId: 'session-a' })
     expect((mine.body as { value: { consoles: unknown[] } }).value.consoles).toHaveLength(1)
+
     const theirs = await call(api, 'console.list', { sessionId: 'session-b' })
-    expect((theirs.body as { value: { consoles: unknown[] } }).value.consoles).toHaveLength(0)
+    const rows = (theirs.body as { value: { consoles: { openedBy: string }[] } }).value.consoles
+    expect(rows).toHaveLength(1)
+    expect(rows[0]?.openedBy).toBe('session-a')
   })
 
   it('describes one console with its audit trail', async () => {
@@ -321,12 +359,26 @@ describe('console.list / console.describe', () => {
     expect(value.state.audit.some(entry => entry.action === 'send')).toBe(true)
   })
 
-  it('hides another session console behind not-found', async () => {
+  it('describes and drives a console another session opened', async () => {
+    // Shared means shared: another session may describe, read and write it. What
+    // is asserted is that the access works AND that the trail records the attach,
+    // so a shared link still has a history.
     const { api } = await scene()
     const connected = await call(api, 'console.connect', { sessionId: 'session-a', viewId: 'v-known' })
     const consoleId = (connected.body as { value: { consoleId: string } }).value.consoleId
-    const refused = await call(api, 'console.describe', { sessionId: 'session-b', consoleId })
-    expect(refused.status).toBe(404)
+
+    const described = await call(api, 'console.describe', { sessionId: 'session-b', consoleId })
+    expect(described.status).toBe(200)
+    expect((described.body as { value: { entry: { openedBy: string } } }).value.entry.openedBy).toBe('session-a')
+
+    const sent = await call(api, 'console.send', { sessionId: 'session-b', consoleId, text: 'show clock' })
+    expect(sent.status).toBe(200)
+  })
+
+  it('still reports a console id that does not exist as not-found', async () => {
+    const { api } = await scene()
+    const missing = await call(api, 'console.describe', { sessionId: 'session-a', consoleId: 'c-nope' })
+    expect(missing.status).toBe(404)
   })
 })
 
@@ -567,7 +619,7 @@ describe('console.control / console.close', () => {
     const closed = await call(api, 'console.close', { sessionId: 'session-a', consoleId })
     expect(closed.status).toBe(200)
     expect((closed.body as { value: { closed: boolean, consoleId: string } }).value.closed).toBe(true)
-    expect(manager.list('session-a')).toHaveLength(0)
+    expect(manager.list()).toHaveLength(0)
   })
 
   it('clears a console scrollback without closing the connection', async () => {
@@ -626,15 +678,35 @@ describe('console.control / console.close', () => {
     expect(refused.body).toMatchObject({ ok: false, error: { code: 'not-supported' } })
   })
 
-  it('closes every console for a session in one call', async () => {
-    const { api, manager } = await scene()
+  it('closes the WHOLE pool in one call, whichever session opened what', async () => {
+    // Two devices, opened by two different sessions: `closeAll` is not scoped to
+    // a caller, because with one shared pool there is no "my consoles" left. The
+    // count is what tells the operator how much device access was released.
+    const { api, manager } = await twoDeviceScene()
     await call(api, 'console.connect', { sessionId: 'session-a', viewId: 'v-known' })
-    await call(api, 'console.connect', { sessionId: 'session-a', viewId: 'v-known' })
-    expect(manager.list('session-a')).toHaveLength(2)
-    const closed = await call(api, 'console.closeAll', { sessionId: 'session-a', force: true })
+    await call(api, 'console.connect', { sessionId: 'session-b', viewId: 'v-second' })
+    expect(manager.list()).toHaveLength(2)
+    const closed = await call(api, 'console.closeAll', { sessionId: 'session-a' })
     expect(closed.status).toBe(200)
     expect((closed.body as { value: { closed: number } }).value.closed).toBe(2)
-    expect(manager.list('session-a')).toHaveLength(0)
+    expect(manager.list()).toHaveLength(0)
+  })
+
+  it('reports a reused connect so the caller knows it attached', async () => {
+    // The panel focuses the existing console instead of implying a second device
+    // link was made, and the model is told the console may already be under
+    // another session's control.
+    const { api } = await scene()
+    const first = await call(api, 'console.connect', { sessionId: 'session-a', viewId: 'v-known' })
+    const opened = (first.body as { value: { consoleId: string, reused: boolean, openedBy: string } }).value
+    expect(opened.reused).toBe(false)
+    expect(opened.openedBy).toBe('session-a')
+
+    const second = await call(api, 'console.connect', { sessionId: 'session-b', viewId: 'v-known' })
+    const attached = (second.body as { value: { consoleId: string, reused: boolean, openedBy: string } }).value
+    expect(attached.reused).toBe(true)
+    expect(attached.consoleId).toBe(opened.consoleId)
+    expect(attached.openedBy).toBe('session-a')
   })
 })
 

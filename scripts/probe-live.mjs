@@ -33,7 +33,7 @@ const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms))
 
 try {
   const entry = await ports.connect({
-    ownerSessionId: 'probe',
+    sessionId: 'probe',
     label: 'probe',
     host,
     port: Number(portText),

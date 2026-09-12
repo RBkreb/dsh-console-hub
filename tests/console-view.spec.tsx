@@ -15,7 +15,7 @@
  * the worst of both worlds -- the user cannot tell whether the save worked.
  */
 import { afterEach, describe, expect, it } from 'vitest'
-import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, waitFor, within } from '@testing-library/react'
 import { createElement } from 'react'
 import { ConsoleHubView } from '../src/client/ConsoleHubView.tsx'
 import type { ConsoleHub, ViewRow } from '../src/client/hub.ts'
@@ -216,7 +216,7 @@ describe('a console that disappears while the panel watches it', () => {
     const calls: string[] = []
     const row = {
       consoleId: 'c0123456789abcdef0123456789abcdef',
-      ownerSessionId: 'session-a',
+      sessionId: 'session-a',
       label: 'FW1-live',
       host: '10.133.6.253',
       port: 10003,
@@ -310,18 +310,23 @@ describe('switching between two consoles', () => {
    *
    * @returns the hub plus what was read, per console.
    */
-  function twoConsoleHub(): { hub: ConsoleHub, reads: Array<{ consoleId: string, after: number }> } {
+  function twoConsoleHub(): {
+    hub: ConsoleHub
+    reads: Array<{ consoleId: string, after: number }>
+    closes: string[]
+  } {
     const rows = [
       ['c0111111111111111111111111111111', 'FW1-live', 'one'],
       ['c0222222222222222222222222222222', 'SW-live', 'two'],
     ] as const
     const reads: Array<{ consoleId: string, after: number }> = []
+    const closes: string[] = []
     const hub = {
       listViews: async () => ({ views: [], defaults: {} }),
       listConsoles: async () => ({
         consoles: rows.map(([consoleId, label]) => ({
           consoleId,
-          ownerSessionId: 'session-a',
+          openedBy: 'session-a',
           label,
           host: '10.133.6.253',
           port: 10003,
@@ -353,7 +358,10 @@ describe('switching between two consoles', () => {
       send: async () => { throw new Error('unexpected send') },
       waitFor: async () => { throw new Error('unexpected waitFor') },
       control: async () => { throw new Error('unexpected control') },
-      close: async () => { throw new Error('unexpected close') },
+      close: async (_sessionId: string, consoleId: string) => {
+        closes.push(consoleId)
+        return { closed: true }
+      },
       closeAll: async () => { throw new Error('unexpected closeAll') },
       describe: async () => { throw new Error('unexpected describe') },
       settings: async () => { throw new Error('unexpected settings') },
@@ -363,8 +371,74 @@ describe('switching between two consoles', () => {
       clearSecret: async () => { throw new Error('unexpected clearSecret') },
       secretStatus: async () => { throw new Error('unexpected secretStatus') },
     } as unknown as ConsoleHub
-    return { hub, reads }
+    return { hub, reads, closes }
   }
+
+  it('selects a console from ANYWHERE on its card, not just the label line', async () => {
+    // The reported bug: the click handler sat on the label line while the CARD
+    // showed `cursor: pointer`, so the padding, the error line and the gaps
+    // between them all looked clickable and did nothing. A card is one control,
+    // so the assertion is that the card ELEMENT itself carries the handler.
+    const scene = twoConsoleHub()
+    const view = renderView(scene.hub)
+    await waitFor(() => {
+      expect(view.getByText('SW-live')).toBeTruthy()
+    })
+
+    // Click the card element, not the text inside it.
+    const card = view.getByText('SW-live').closest('[role="button"]')
+    expect(card).not.toBeNull()
+    fireEvent.click(card as HTMLElement)
+
+    await waitFor(() => {
+      expect(view.getByText(/output-from-2/)).toBeTruthy()
+    })
+  })
+
+  it('selects a console with the keyboard, since the card is a control', async () => {
+    // A large click target that only responds to a mouse is a regression for
+    // anyone using the keyboard, so the card is focusable and takes Enter/Space.
+    const scene = twoConsoleHub()
+    const view = renderView(scene.hub)
+    await waitFor(() => {
+      expect(view.getByText('SW-live')).toBeTruthy()
+    })
+    const card = view.getByText('SW-live').closest('[role="button"]') as HTMLElement
+    expect(card.tabIndex).toBe(0)
+
+    fireEvent.keyDown(card, { key: 'Enter' })
+    await waitFor(() => {
+      expect(view.getByText(/output-from-2/)).toBeTruthy()
+    })
+
+    // Space selects too, and must not scroll the panel.
+    fireEvent.keyDown(card, { key: ' ' })
+    await waitFor(() => {
+      expect(card.getAttribute('aria-pressed')).toBe('true')
+    })
+  })
+
+  it('does NOT select a console when its own 关闭 button is clicked', async () => {
+    // The card now selects, so the buttons inside it have to stop there: closing
+    // a console would otherwise select it on the way out, leaving the pane
+    // pointing at something that no longer exists.
+    const scene = twoConsoleHub()
+    const view = renderView(scene.hub)
+    await waitFor(() => {
+      expect(view.getByText('SW-live')).toBeTruthy()
+    })
+
+    const card = view.getByText('SW-live').closest('[role="button"]') as HTMLElement
+    expect(card.getAttribute('aria-pressed')).toBe('false')
+    fireEvent.click(within(card).getByText('关闭'))
+
+    await waitFor(() => {
+      expect(scene.closes).toEqual(['c0222222222222222222222222222222'])
+    })
+    // Still not selected, and never read.
+    expect(card.getAttribute('aria-pressed')).toBe('false')
+    expect(scene.reads.some(entry => entry.consoleId === 'c0222222222222222222222222222222')).toBe(false)
+  })
 
   it('shows the other console output synchronously on switch, with no empty flash', async () => {
     const scene = twoConsoleHub()
@@ -442,7 +516,7 @@ describe('switching between two consoles', () => {
       listConsoles: async () => ({
         consoles: [{
           consoleId: 'c0aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
-          ownerSessionId: 'session-a',
+          sessionId: 'session-a',
           label: 'FW1-new',
           host: '10.133.6.253',
           port: 10003,
@@ -523,7 +597,7 @@ describe('the input keeps focus across a send', () => {
       listConsoles: async () => ({
         consoles: [{
           consoleId: 'c0bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
-          ownerSessionId: 'session-a',
+          sessionId: 'session-a',
           label: 'FW1-focus',
           host: '10.133.6.253',
           port: 10003,
@@ -844,7 +918,7 @@ describe('the dormancy banner', () => {
     const counter = { wakes: 0 }
     const row = (): Record<string, unknown> => ({
       consoleId: 'c0ddddddddddddddddddddddddddddddd',
-      ownerSessionId: 'session-a',
+      sessionId: 'session-a',
       label: 'FW1-dormant',
       host: '10.133.6.253',
       port: 10003,
@@ -1016,7 +1090,7 @@ describe('the clear button', () => {
       listConsoles: async () => ({
         consoles: [{
           consoleId: 'c0ccccccccccccccccccccccccccccccc',
-          ownerSessionId: 'session-a',
+          sessionId: 'session-a',
           label: 'FW1-clear',
           host: '10.133.6.253',
           port: 10003,

@@ -43,7 +43,7 @@ const ports = new PortManager({
 })
 
 const entry = await ports.connect({
-  ownerSessionId: 'probe',
+  sessionId: 'probe',
   label: 'SPREAD',
   host,
   port: Number(portText),

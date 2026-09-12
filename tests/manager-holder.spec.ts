@@ -76,8 +76,8 @@ function holderFor(policy: PortManagerOptions = basePolicy()): ManagerHolder {
 
 /** Connect one console through a holder's current manager. */
 async function connect(holder: ManagerHolder, device: Device, label = 'FW1'): Promise<string> {
-  const entry = await holder.get().connect({
-    ownerSessionId: 'session-a',
+  const { entry: entry } = await holder.get().connect({
+    sessionId: 'session-a',
     label,
     host: '127.0.0.1',
     port: device.port,
@@ -165,16 +165,21 @@ describe('ManagerHolder', () => {
     // The new policy is LIVE, not parked.
     expect(holder.currentPolicy().idleTimeoutMs).toBe(999)
     // And the open console is untouched: same manager, still open, still usable.
-    expect(holder.get().get('session-a', consoleId)?.state).toBe('open')
-    await holder.get().send('session-a', consoleId, 'show version')
-    await until(() => holder.get().read('session-a', consoleId, {}).text.includes('answer:show version'))
+    expect(holder.get().get(consoleId)?.state).toBe('open')
+    await holder.get().send(consoleId, 'show version')
+    await until(() => holder.get().read(consoleId, {}).text.includes('answer:show version'))
   })
 
   it('gives the change to the NEXT console, so a toggle takes effect at once', async () => {
     // The behaviour the user actually wants from a settings toggle: flip it, open
     // a console, get the new behaviour -- without closing the old ones first.
+    //
+    // The second console is a SECOND DEVICE: with one shared pool, reconnecting
+    // to the same target attaches to the console already open rather than making
+    // a new one, so it would not exercise the new policy at all.
     const device = await startDevice()
-    openDevices.push(device)
+    const second = await startDevice()
+    openDevices.push(device, second)
     const holder = holderFor()
     await connect(holder, device, 'BEFORE')
 
@@ -183,7 +188,7 @@ describe('ManagerHolder', () => {
     // The manager reads the new value on its next connect, which is the whole
     // point of applying in place.
     expect(holder.get().openCount()).toBe(1)
-    await connect(holder, device, 'AFTER')
+    await connect(holder, second, 'AFTER')
     expect(holder.get().openCount()).toBe(2)
   })
 
@@ -207,9 +212,9 @@ describe('ManagerHolder', () => {
     // answering under the policy it was opened with, so editing settings never
     // breaks a session in progress.
     holder.reconfigure({ ...basePolicy(), readTimeoutMs: 50 })
-    await holder.get().send('session-a', consoleId, 'show version')
-    await until(() => holder.get().read('session-a', consoleId, {}).text.includes('answer:show version'))
-    expect(holder.get().read('session-a', consoleId, {}).text).toContain('answer:show version')
+    await holder.get().send(consoleId, 'show version')
+    await until(() => holder.get().read(consoleId, {}).text.includes('answer:show version'))
+    expect(holder.get().read(consoleId, {}).text).toContain('answer:show version')
   })
 
   it('re-arms the idle reaper when the sweep interval changes', async () => {

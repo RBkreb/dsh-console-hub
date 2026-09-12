@@ -124,8 +124,12 @@ function asHubError(error: unknown): never {
 function consoleHandlers(api: ConsoleSessionApi): Record<string, Handler> {
   const handlers: Record<string, Handler> = {
     async 'console.list'(payload) {
-      const sessionId = await requireSession(api, payload)
-      return { consoles: api.manager.list(sessionId) }
+      // The session is still required and still proven to exist, because it is
+      // what the audit trail attributes an action to. It no longer FILTERS: the
+      // pool is shared, so a session sees every console -- which is also what
+      // makes a console opened by a session that has since ended reachable.
+      await requireSession(api, payload)
+      return { consoles: api.manager.list() }
     },
 
     async 'console.connect'(payload) {
@@ -184,10 +188,10 @@ function consoleHandlers(api: ConsoleSessionApi): Record<string, Handler> {
         ? target.pagingMode ?? defaults.pagingMode
         : asPagingMode(requestedPaging)
 
-      let entry
+      let outcome
       try {
-        entry = await api.manager.connect({
-          ownerSessionId: sessionId,
+        outcome = await api.manager.connect({
+          sessionId,
           ...target,
           pagingMode,
           ...password === undefined || password === '' ? {} : { password },
@@ -195,12 +199,18 @@ function consoleHandlers(api: ConsoleSessionApi): Record<string, Handler> {
       } catch (error) {
         asHubError(error)
       }
-      const detail = api.manager.describe(sessionId, entry.consoleId)
+      const entry = outcome.entry
+      const detail = api.manager.describe(entry.consoleId)
       return {
         ...entry,
+        // True when this call attached to a console someone else already opened.
+        // The panel uses it to focus that console instead of implying a second
+        // device link was made -- and the model needs it to know the console may
+        // already be under another session's control.
+        reused: outcome.reused,
         // The banner only exists on the manager's record; a panel that attached
         // after the connect finished still needs to see what the device said.
-        banner: api.manager.bannerOf(sessionId, entry.consoleId),
+        banner: api.manager.bannerOf(entry.consoleId),
         prompt: detail?.state.prompt ?? null,
         paging: detail?.state.paging ?? { active: false, pagesConsumed: 0, reason: null },
       }
@@ -225,11 +235,11 @@ function consoleHandlers(api: ConsoleSessionApi): Record<string, Handler> {
     },
 
     async 'console.describe'(payload) {
-      const sessionId = await requireSession(api, payload)
+      await requireSession(api, payload)
       const consoleId = requireConsoleId(payload)
-      const detail = api.manager.describe(sessionId, consoleId)
-      if (detail === undefined) throw new HubError('not-found', `console "${consoleId}" not found for this session`, 404)
-      return { ...detail, banner: api.manager.bannerOf(sessionId, consoleId) }
+      const detail = api.manager.describe(consoleId)
+      if (detail === undefined) throw new HubError('not-found', `console "${consoleId}" not found`, 404)
+      return { ...detail, banner: api.manager.bannerOf(consoleId) }
     },
 
     async 'console.send'(payload) {
@@ -259,7 +269,7 @@ function consoleHandlers(api: ConsoleSessionApi): Record<string, Handler> {
         const fenced = api.fenceForUser?.({
           sessionId,
           consoleId,
-          label: api.manager.get(sessionId, consoleId)?.label ?? consoleId,
+          label: api.manager.get(consoleId)?.label ?? consoleId,
           text,
         })
         // Checked first and unconditionally: a token must not exist for a denied
@@ -277,13 +287,13 @@ function consoleHandlers(api: ConsoleSessionApi): Record<string, Handler> {
         }
       }
       try {
-        const entry = await api.manager.send(sessionId, consoleId, text, {
+        const entry = await api.manager.send(consoleId, text, {
           ...encoding === undefined ? {} : { encoding },
           ...submit === undefined ? {} : { submit },
           ...submitKey === undefined ? {} : { submitKey },
           ...actor === undefined ? {} : { actor: actor as 'user' | 'model' | 'system' },
         })
-        const detail = api.manager.describe(sessionId, consoleId)
+        const detail = api.manager.describe(consoleId)
         return {
           consoleId,
           state: entry.state,
@@ -309,7 +319,7 @@ function consoleHandlers(api: ConsoleSessionApi): Record<string, Handler> {
       // Enter runs no command. Refusing it here would have made the wake
       // keystroke unsendable through the panel's own path while the tool path
       // allowed it.
-      const entry = api.manager.get(sessionId, consoleId)
+      const entry = api.manager.get(consoleId)
       if (entry === undefined) {
         throw new HubError('not-found', `console "${consoleId}" not found for this session`, 404)
       }
@@ -329,7 +339,7 @@ function consoleHandlers(api: ConsoleSessionApi): Record<string, Handler> {
       const maxBytes = optionalNumber(payload, 'maxBytes')
       const stripEcho = optionalString(payload, 'stripEcho')
       try {
-        return api.manager.read(sessionId, consoleId, {
+        return api.manager.read(consoleId, {
           ...after === undefined ? {} : { after },
           ...encoding === undefined ? {} : { encoding },
           ...maxBytes === undefined ? {} : { maxBytes },
@@ -358,7 +368,7 @@ function consoleHandlers(api: ConsoleSessionApi): Record<string, Handler> {
       const after = optionalNumber(payload, 'after')
       const idleMs = optionalNumber(payload, 'idleMs')
       try {
-        return await api.manager.waitFor(sessionId, consoleId, {
+        return await api.manager.waitFor(consoleId, {
           for: condition as 'prompt' | 'idle' | 'pattern',
           ...pattern === undefined ? {} : { pattern },
           ...timeoutMs === undefined ? {} : { timeoutMs },
@@ -376,8 +386,8 @@ function consoleHandlers(api: ConsoleSessionApi): Record<string, Handler> {
       const sessionId = await requireSession(api, payload)
       const consoleId = requireConsoleId(payload)
       try {
-        const answered = await api.manager.wake(sessionId, consoleId)
-        const detail = api.manager.describe(sessionId, consoleId)
+        const answered = await api.manager.wake(consoleId)
+        const detail = api.manager.describe(consoleId)
         return {
           consoleId,
           answered,
@@ -402,8 +412,8 @@ function consoleHandlers(api: ConsoleSessionApi): Record<string, Handler> {
       // "unstall this console". `drain` resumes automatic paging; `wake` presses
       // Enter. Both leave the connection untouched.
       if (action === 'wake') {
-        const answered = await api.manager.wake(sessionId, consoleId)
-        const after = api.manager.describe(sessionId, consoleId)
+        const answered = await api.manager.wake(consoleId)
+        const after = api.manager.describe(consoleId)
         return {
           consoleId,
           state: after?.entry.state ?? 'closed',
@@ -415,12 +425,12 @@ function consoleHandlers(api: ConsoleSessionApi): Record<string, Handler> {
       if (action !== 'drain') {
         throw new HubError('bad-request', `unknown control action "${action}"`)
       }
-      const detail = api.manager.describe(sessionId, consoleId)
+      const detail = api.manager.describe(consoleId)
       if (detail === undefined) throw new HubError('not-found', `console "${consoleId}" not found for this session`, 404)
       // Discharging a pending pager is what "drain" means: the panel's next-page
       // button and the model both need it.
-      api.manager.resumePaging(sessionId, consoleId)
-      const after = api.manager.describe(sessionId, consoleId)
+      api.manager.resumePaging(consoleId)
+      const after = api.manager.describe(consoleId)
       return { consoleId, state: after?.entry.state ?? detail.entry.state, paging: after?.state.paging ?? detail.state.paging }
     },
 
@@ -429,7 +439,7 @@ function consoleHandlers(api: ConsoleSessionApi): Record<string, Handler> {
       const consoleId = requireConsoleId(payload)
       const force = optionalBoolean(payload, 'force')
       try {
-        await api.manager.close(sessionId, consoleId, force === undefined ? {} : { force })
+        await api.manager.close(consoleId, force === undefined ? {} : { force })
       } catch (error) {
         asHubError(error)
       }
@@ -437,13 +447,12 @@ function consoleHandlers(api: ConsoleSessionApi): Record<string, Handler> {
     },
 
     async 'console.closeAll'(payload) {
-      const sessionId = await requireSession(api, payload)
-      const force = optionalBoolean(payload, 'force')
-      const owned = api.manager.list(sessionId)
-      for (const entry of owned) {
-        await api.manager.close(sessionId, entry.consoleId, force === undefined ? { force: true } : { force })
-      }
-      return { closed: owned.length }
+      await requireSession(api, payload)
+      // The WHOLE pool, and the answer says so. With one shared pool there is no
+      // "my consoles" left to scope this to, and a caller that wants a subset
+      // has the handles to close them one at a time.
+      const closed = await api.manager.closeAll()
+      return { closed }
     },
   }
   return handlers

@@ -1,14 +1,31 @@
 /**
- * Console ownership: which consoles exist, who owns them, and when they go
- * away.
+ * Console ownership: which consoles exist and when they go away.
  *
- * A console is a scarce device resource, so every operation is keyed by the
- * owning session and one session can neither see nor touch another's console.
- * The manager also owns the two lifetimes the session itself cannot: the
- * per-owner cap (a connect that would exceed it is refused rather than
- * silently replacing a live console) and the idle reaper (a console nobody has
- * touched inside its window is closed, so a forgotten tab cannot hold a
- * device's serial port open forever).
+ * ONE SHARED POOL, not one pool per agent session. That is the whole design, and
+ * it is driven by the hardware: a console-server port maps a single TCP
+ * connection to the device's serial line, so two connections to the same device
+ * are either refused or (as measured on the lab firewall) cause the device to
+ * tear down the first one. Consoles are therefore a scarce, host-wide resource,
+ * and modelling them per session got both halves wrong:
+ *
+ * - `maxConsoles` did not bound device usage at all. MEASURED with the old
+ *   per-owner cap: three sequential sessions against one device, each capped at
+ *   3, left 9 live TCP connections to the SAME port.
+ * - A session that died left its consoles behind, and because a dead session
+ *   failed the session check on every route, nothing could list or close them --
+ *   they were reachable only by the idle reaper, and they did not count against
+ *   anyone's cap.
+ *
+ * Sharing collapses both: the cap is global, so nothing can exceed what the
+ * device will accept, and `connect` to an already-open target ATTACHES to that
+ * console instead of opening a second connection that would evict it.
+ *
+ * Lifetimes are consequently one mechanism rather than several: a console is
+ * closed explicitly, or reaped when nobody touches it for `idleTimeoutMs`. There
+ * is no per-session cleanup to get right, and therefore none to leak.
+ *
+ * `openedBy` is recorded for display and the audit trail. It is PROVENANCE, not
+ * permission: any session may read, write, wake or close any console in the pool.
  *
  * @module dsh-console-hub/port-manager
  */
@@ -17,8 +34,8 @@ import { ConsoleSession, type ConsoleSessionState } from './session.ts'
 
 /** Everything needed to open one console. */
 export interface ConsoleDescriptor {
-  /** The session that owns this console. */
-  ownerSessionId: string
+  /** The session asking for it; recorded as the opener, not used as a permission. */
+  sessionId: string
   /** Human label shown in lists and cards. */
   label: string
   /** Device address. */
@@ -45,8 +62,14 @@ export interface ConsoleDescriptor {
 export interface ConsoleEntry {
   /** Opaque handle the caller passes back. */
   consoleId: string
-  /** Owning session. */
-  ownerSessionId: string
+  /**
+   * The session that OPENED this console, for display and the audit trail.
+   *
+   * Deliberately not called `owner` and deliberately not checked by anything:
+   * every session may use every console, because the underlying device link is
+   * shared whether or not this process admits it.
+   */
+  openedBy: string
   /** Human label. */
   label: string
   host: string
@@ -73,6 +96,20 @@ export interface ConsoleEntry {
   idleMs: number
   /** Session start (ISO). */
   createdAt: string
+}
+
+/** What one connect produced. */
+export interface ConsoleConnectOutcome {
+  /** The console, whether it was opened or attached to. */
+  entry: ConsoleEntry
+  /**
+   * True when an existing console for the same target was reused.
+   *
+   * Reported because it changes what the caller should do: a reused console may
+   * already be under another session's control, and closing it to "clean up"
+   * would pull the device link out from under whoever else is using it.
+   */
+  reused: boolean
 }
 
 /** Fully-defaulted manager settings. */
@@ -194,17 +231,40 @@ export class PortManager {
   }
 
   /**
-   * Open one console.
+   * Open one console, or ATTACH to the one already open for this target.
+   *
+   * Attaching rather than opening a second connection is the point of the shared
+   * pool, and it is not a convenience: a second TCP connection to the same
+   * console-server port makes the device tear down the first (measured on the lab
+   * firewall, which is what the half-close test relies on). So "open another one"
+   * would not give the caller an independent console -- it would silently break
+   * whoever was already connected.
+   *
+   * A console that is already dead is discarded here rather than attached to, so
+   * a caller never receives a handle that cannot work.
+   *
    * @param descriptor - device, transport, and credential facts.
-   * @returns the new console entry (its state is `error`/`closed` when the connect failed).
-   * @throws {Error} when the owner is at its console cap.
+   * @returns the console plus whether it was reused.
+   * @throws {Error} when the pool is at its cap.
    */
-  async connect(descriptor: ConsoleDescriptor): Promise<ConsoleEntry> {
+  async connect(descriptor: ConsoleDescriptor): Promise<ConsoleConnectOutcome> {
     if (this.disposed) throw new Error('console-hub: the port manager is disposed')
-    const owned = this.ownedBy(descriptor.ownerSessionId)
-    if (owned.length >= this.options.maxConsoles) {
+
+    const existing = this.liveForTarget(descriptor.host, descriptor.port)
+    if (existing !== undefined) {
+      // The audit trail is per console, so an attach is recorded on it: without
+      // this, two sessions driving one device would leave a trail that only ever
+      // names the first.
+      existing.session.recordAttach(descriptor.sessionId)
+      return { entry: this.refresh(existing.entry.consoleId), reused: true }
+    }
+
+    // GLOBAL cap. A per-owner cap did not bound device usage at all: three
+    // sequential sessions against one device, each capped at 3, held 9 live TCP
+    // connections to the same port.
+    if (this.consoles.size >= this.options.maxConsoles) {
       throw new Error(
-        `console-hub: session already holds ${owned.length} console(s); the limit is ${this.options.maxConsoles}`,
+        `console-hub: the pool already holds ${this.consoles.size} console(s); the limit is ${this.options.maxConsoles}`,
       )
     }
 
@@ -237,7 +297,7 @@ export class PortManager {
     })
     const entry: ConsoleEntry = {
       consoleId,
-      ownerSessionId: descriptor.ownerSessionId,
+      openedBy: descriptor.sessionId,
       label: descriptor.label,
       host: descriptor.host,
       port: descriptor.port,
@@ -258,15 +318,11 @@ export class PortManager {
     // manager's own record so a later `describe` can report what a device said
     // when it was first opened.
     this.banners.set(consoleId, connected.banner)
-    return this.refresh(consoleId, connected)
+    return { entry: this.refresh(consoleId, connected), reused: false }
   }
 
   /**
-   * How many consoles are open across every session.
-   *
-   * The manager's own reconfiguration reads this: a policy change must not
-   * discard a live console, so the host defers it until this reaches zero.
-   *
+   * How many consoles the pool holds.
    * @returns the number of tracked consoles.
    */
   openCount(): number {
@@ -274,86 +330,82 @@ export class PortManager {
   }
 
   /**
-   * Every console owned by one session, with a live status.
-   * @param ownerSessionId - the owning session.
-   * @returns the owner's consoles, oldest first.
+   * Every console in the pool, with a live status.
+   *
+   * No session argument: the pool is shared, so "whose console is this" is a
+   * display fact carried on the entry rather than a filter. Filtering by session
+   * is what made a dead session's consoles unreachable -- nothing could list them
+   * to close them.
+   *
+   * @returns every console, oldest first.
    */
-  list(ownerSessionId: string): ConsoleEntry[] {
-    return this.ownedBy(ownerSessionId).map(tracked => this.refresh(tracked.entry.consoleId))
+  list(): ConsoleEntry[] {
+    return [...this.consoles.values()].map(tracked => this.refresh(tracked.entry.consoleId))
   }
 
   /**
-   * Look up one console, owner-scoped.
-   * @param ownerSessionId - the requesting session.
+   * Look up one console.
    * @param consoleId - the console handle.
-   * @returns the entry, or `undefined` when it does not exist or is not this owner's.
+   * @returns the entry, or `undefined` when it does not exist.
    */
-  get(ownerSessionId: string, consoleId: string): ConsoleEntry | undefined {
+  get(consoleId: string): ConsoleEntry | undefined {
     const tracked = this.consoles.get(consoleId)
-    if (tracked === undefined || tracked.entry.ownerSessionId !== ownerSessionId) return undefined
+    if (tracked === undefined) return undefined
     return this.refresh(consoleId)
   }
 
   /**
    * The banner one console's device sent when it was opened.
-   * @param ownerSessionId - the requesting session.
    * @param consoleId - the console handle.
    * @returns the banner, or an empty string when none was seen.
    */
-  bannerOf(ownerSessionId: string, consoleId: string): string {
-    const tracked = this.consoles.get(consoleId)
-    if (tracked === undefined || tracked.entry.ownerSessionId !== ownerSessionId) return ''
+  bannerOf(consoleId: string): string {
     return this.banners.get(consoleId) ?? ''
   }
 
   /**
-   * Describe one console, owner-scoped.
-   * @param ownerSessionId - the requesting session.
+   * Describe one console.
    * @param consoleId - the console handle.
    * @returns the entry plus its full status, or `undefined`.
    */
-  describe(ownerSessionId: string, consoleId: string): ConsoleDetail | undefined {
+  describe(consoleId: string): ConsoleDetail | undefined {
     const tracked = this.consoles.get(consoleId)
-    if (tracked === undefined || tracked.entry.ownerSessionId !== ownerSessionId) return undefined
+    if (tracked === undefined) return undefined
     return { entry: this.refresh(consoleId), state: tracked.session.status() }
   }
 
   /**
    * Send one command to a console.
-   * @param ownerSessionId - the requesting session.
    * @param consoleId - the console handle.
    * @param text - the command text.
    * @param options - submit key/encoding/actor overrides.
    * @returns the entry after writing.
-   * @throws {Error} when the console is unknown to this owner or already closed.
+   * @throws {Error} when the console is unknown or already closed.
    */
   async send(
-    ownerSessionId: string,
     consoleId: string,
     text: string,
     options: { submitKey?: string, encoding?: string, actor?: 'user' | 'model' | 'system', submit?: boolean } = {},
   ): Promise<ConsoleEntry> {
-    const tracked = this.require(ownerSessionId, consoleId)
+    const tracked = this.require(consoleId)
     const status = await tracked.session.send(text, options)
     return this.refresh(consoleId, status)
   }
 
   /**
    * Read one console's output window.
-   * @param ownerSessionId - the requesting session.
    * @param consoleId - the console handle.
    * @param options - cursor, encoding, and echo-filter overrides.
    * @returns the decoded window.
-   * @throws {Error} when the console is unknown to this owner.
+   * @throws {Error} when the console is unknown.
    */
   read(
-    ownerSessionId: string,
     consoleId: string,
     options: { after?: number, encoding?: string, stripEcho?: string, maxBytes?: number } = {},
     // The read result shape is the session's; re-exported by callers through
     // the session module rather than restated here.
   ): ReturnType<ConsoleSession['read']> {
-    const tracked = this.require(ownerSessionId, consoleId)
+    const tracked = this.require(consoleId)
     const result = tracked.session.read(options)
     this.refresh(consoleId)
     return result
@@ -361,18 +413,16 @@ export class PortManager {
 
   /**
    * Wait on one console.
-   * @param ownerSessionId - the requesting session.
    * @param consoleId - the console handle.
    * @param options - condition and budget.
    * @returns the wait outcome.
-   * @throws {Error} when the console is unknown to this owner.
+   * @throws {Error} when the console is unknown.
    */
   waitFor(
-    ownerSessionId: string,
     consoleId: string,
     options: Parameters<ConsoleSession['waitFor']>[0] = {},
   ): ReturnType<ConsoleSession['waitFor']> {
-    const tracked = this.require(ownerSessionId, consoleId)
+    const tracked = this.require(consoleId)
     return tracked.session.waitFor(options).then((result) => {
       this.refresh(consoleId)
       return result
@@ -381,12 +431,11 @@ export class PortManager {
 
   /**
    * Clear a console's pending pager state so the next page is handled again.
-   * @param ownerSessionId - the requesting session.
    * @param consoleId - the console handle.
-   * @throws {Error} when the console is unknown to this owner.
+   * @throws {Error} when the console is unknown.
    */
-  resumePaging(ownerSessionId: string, consoleId: string): void {
-    const tracked = this.require(ownerSessionId, consoleId)
+  resumePaging(consoleId: string): void {
+    const tracked = this.require(consoleId)
     tracked.session.resumePaging()
     this.refresh(consoleId)
   }
@@ -399,13 +448,12 @@ export class PortManager {
    * socket, the encoding, the login and the device's own scrollback are all
    * unaffected -- only this process's copy is dropped.
    *
-   * @param ownerSessionId - the requesting session.
    * @param consoleId - the console handle.
    * @returns the next read cursor and how many bytes were discarded.
-   * @throws {Error} when the console is unknown to this owner.
+   * @throws {Error} when the console is unknown.
    */
-  clear(ownerSessionId: string, consoleId: string): { cursor: number, droppedBytes: number } {
-    const tracked = this.require(ownerSessionId, consoleId)
+  clear(consoleId: string): { cursor: number, droppedBytes: number } {
+    const tracked = this.require(consoleId)
     const result = tracked.session.clear()
     this.refresh(consoleId)
     return result
@@ -418,31 +466,44 @@ export class PortManager {
    * The session decides what the evidence is; the manager only routes it, so the
    * panel, the routes and the model all ask the same question in the same way.
    *
-   * @param ownerSessionId - the requesting session.
    * @param consoleId - the console handle.
    * @returns whether the device answered the Enter.
-   * @throws {Error} when the console is unknown to this owner.
+   * @throws {Error} when the console is unknown.
    */
-  async wake(ownerSessionId: string, consoleId: string): Promise<boolean> {
-    const tracked = this.require(ownerSessionId, consoleId)
+  async wake(consoleId: string): Promise<boolean> {
+    const tracked = this.require(consoleId)
     const answered = await tracked.session.wake('probe')
     this.refresh(consoleId)
     return answered
   }
 
   /**
-   * Close one console and drop it from the registry.
-   * @param ownerSessionId - the requesting session.
+   * Close one console and drop it from the pool.
    * @param consoleId - the console handle.
    * @param options - `force` destroys the socket.
-   * @throws {Error} when the console is unknown to this owner.
+   * @throws {Error} when the console is unknown.
    */
-  async close(ownerSessionId: string, consoleId: string, options: { force?: boolean } = {}): Promise<void> {
-    const tracked = this.require(ownerSessionId, consoleId)
+  async close(consoleId: string, options: { force?: boolean } = {}): Promise<void> {
+    const tracked = this.require(consoleId)
     await tracked.session.close(options)
     tracked.session.dispose()
     this.consoles.delete(consoleId)
     this.banners.delete(consoleId)
+  }
+
+  /**
+   * Close every console in the pool.
+   *
+   * Deliberately the whole pool and not "mine": there is no per-session
+   * partition left to scope it to, and a caller that wants a subset has the
+   * handles to close them individually.
+   *
+   * @returns how many were closed.
+   */
+  async closeAll(): Promise<number> {
+    const ids = [...this.consoles.keys()]
+    for (const consoleId of ids) await this.close(consoleId, { force: true })
+    return ids.length
   }
 
   /**
@@ -482,18 +543,34 @@ export class PortManager {
     }
   }
 
-  /** Every tracked console owned by one session. */
-  private ownedBy(ownerSessionId: string): Tracked[] {
-    return [...this.consoles.values()].filter(tracked => tracked.entry.ownerSessionId === ownerSessionId)
+  /**
+   * The console already serving a target, when there is a usable one.
+   *
+   * Only a console that is still `open` or `connecting` counts. A dead one is
+   * discarded here rather than returned: handing a caller a handle that cannot
+   * work would look like a successful reconnect and fail on the next call, and
+   * leaving it in place would also block the target forever, since no second
+   * connection to the same port is possible.
+   */
+  private liveForTarget(host: string, port: number): Tracked | undefined {
+    for (const [consoleId, tracked] of [...this.consoles]) {
+      if (tracked.entry.host !== host || tracked.entry.port !== port) continue
+      const state = tracked.session.status().state
+      if (state === 'open' || state === 'connecting') return tracked
+      // Dead: drop it so the target is free. Synchronous teardown, because the
+      // caller is about to open a replacement for the same port.
+      tracked.session.dispose()
+      this.consoles.delete(consoleId)
+      this.banners.delete(consoleId)
+    }
+    return undefined
   }
 
-  /** Resolve a console for an owner or throw the not-found error. */
-  private require(ownerSessionId: string, consoleId: string): Tracked {
+  /** Resolve a console or throw the not-found error. */
+  private require(consoleId: string): Tracked {
     const tracked = this.consoles.get(consoleId)
-    if (tracked === undefined || tracked.entry.ownerSessionId !== ownerSessionId) {
-      // Deliberately the same message for "does not exist" and "belongs to
-      // someone else": a session must not be able to probe another's inventory.
-      throw new Error(`console-hub: console "${consoleId}" not found for this session`)
+    if (tracked === undefined) {
+      throw new Error(`console-hub: console "${consoleId}" not found`)
     }
     return tracked
   }

@@ -98,7 +98,6 @@ function toolExec(): ConsoleToolRunContext {
 /** Read repeatedly from a GIVEN cursor until `check` holds, accumulating what it sees. */
 async function readFrom(
   ports: PortManager,
-  sessionId: string,
   consoleId: string,
   cursor: number,
   check: (text: string) => boolean,
@@ -111,7 +110,7 @@ async function readFrom(
   let accumulated = ''
   const deadline = Date.now() + budgetMs
   while (Date.now() < deadline) {
-    const result = ports.read(sessionId, consoleId, { after: at })
+    const result = ports.read(consoleId, { after: at })
     at = result.cursor
     accumulated += result.text
     if (check(accumulated)) return accumulated
@@ -123,7 +122,6 @@ async function readFrom(
 /** Read repeatedly until `check` holds, accumulating everything seen. */
 async function readUntil(
   ports: PortManager,
-  sessionId: string,
   consoleId: string,
   check: (text: string) => boolean,
   budgetMs = 8000,
@@ -132,7 +130,7 @@ async function readUntil(
   let accumulated = ''
   const deadline = Date.now() + budgetMs
   while (Date.now() < deadline) {
-    const result = ports.read(sessionId, consoleId, { after: cursor })
+    const result = ports.read(consoleId, { after: cursor })
     cursor = result.cursor
     accumulated += result.text
     if (check(accumulated)) return accumulated
@@ -145,8 +143,8 @@ describe.runIf(LIVE)('live console lab', () => {
   it('connects to the firewall console and reaches its prompt', async () => {
     const ports = manager()
     try {
-      const entry = await ports.connect({
-        ownerSessionId: 'live',
+      const { entry: entry } = await ports.connect({
+        sessionId: 'live',
         label: FW1.label,
         host: FW1.host,
         port: FW1.port,
@@ -160,12 +158,12 @@ describe.runIf(LIVE)('live console lab', () => {
 
       // The device sends nothing on its own, so the wake Enter is what produces
       // the prompt; the shipped prompt pattern must recognize it.
-      const detail = ports.describe('live', entry.consoleId)
+      const detail = ports.describe(entry.consoleId)
       expect(detail?.state.prompt).toBe('<DUT1>')
-      expect(ports.bannerOf('live', entry.consoleId)).toContain('<DUT1>')
+      expect(ports.bannerOf(entry.consoleId)).toContain('<DUT1>')
 
       // And the prompt pattern the plugin compiles matches it.
-      const waited = await ports.waitFor('live', entry.consoleId, { for: 'prompt', timeoutMs: 4000 })
+      const waited = await ports.waitFor(entry.consoleId, { for: 'prompt', timeoutMs: 4000 })
       expect(waited.matched).toBe(true)
     } finally {
       await ports.dispose()
@@ -175,8 +173,8 @@ describe.runIf(LIVE)('live console lab', () => {
   it('runs a read-only command and gets its answer back', async () => {
     const ports = manager()
     try {
-      const entry = await ports.connect({
-        ownerSessionId: 'live',
+      const { entry: entry } = await ports.connect({
+        sessionId: 'live',
         label: FW1.label,
         host: FW1.host,
         port: FW1.port,
@@ -186,8 +184,8 @@ describe.runIf(LIVE)('live console lab', () => {
       })
       // The connect already woke the console, so its prompt is there.
 
-      await ports.send('live', entry.consoleId, 'show version')
-      const text = await readUntil(ports, 'live', entry.consoleId, seen => seen.length > 0)
+      await ports.send(entry.consoleId, 'show version')
+      const text = await readUntil(ports, entry.consoleId, seen => seen.length > 0)
       // The answer is whatever the device prints; the point is that a real
       // round trip completed rather than that it said something specific.
       expect(text.trim().length).toBeGreaterThan(0)
@@ -199,8 +197,8 @@ describe.runIf(LIVE)('live console lab', () => {
   it('reaches the switch console too, so the engine is not firewall-specific', async () => {
     const ports = manager()
     try {
-      const entry = await ports.connect({
-        ownerSessionId: 'live',
+      const { entry: entry } = await ports.connect({
+        sessionId: 'live',
         label: SW1.label,
         host: SW1.host,
         port: SW1.port,
@@ -209,7 +207,7 @@ describe.runIf(LIVE)('live console lab', () => {
         pagingMode: 'manual',
       })
       expect(entry.lastError).toBeNull()
-      const detail = ports.describe('live', entry.consoleId)
+      const detail = ports.describe(entry.consoleId)
       // The switch answers in its CONFIG view -- `[SWITCH]` -- where the firewall
       // answers in its USER view -- `<DUT1>`. That is the `<>` / `[]` distinction
       // these devices use: square brackets mean the config view, angle brackets
@@ -231,8 +229,8 @@ describe.runIf(LIVE)('live console lab', () => {
   it('strips telnet negotiation instead of leaking it into the transcript', async () => {
     const ports = manager()
     try {
-      const entry = await ports.connect({
-        ownerSessionId: 'live',
+      const { entry: entry } = await ports.connect({
+        sessionId: 'live',
         label: FW1.label,
         host: FW1.host,
         port: FW1.port,
@@ -240,7 +238,7 @@ describe.runIf(LIVE)('live console lab', () => {
         encoding: 'utf-8',
         pagingMode: 'manual',
       })
-      const banner = ports.bannerOf('live', entry.consoleId)
+      const banner = ports.bannerOf(entry.consoleId)
       // IAC is 0xFF. The firewall opens with a negotiation burst, so a banner
       // that still carried it would be full of raw 0xFF bytes -- and the model
       // would be reading protocol noise as device output.
@@ -251,68 +249,110 @@ describe.runIf(LIVE)('live console lab', () => {
     }
   }, 30_000)
 
-  it('sees on one console what another console writes to the same device', async () => {
-    // The requested measurement, and the one thing a fake cannot show: TWO
-    // consoles against ONE physical device, where a command typed into the first
-    // appears on the SECOND. A serial console mapping means both connections
-    // share the device's one console line, so the device echoes the command to
-    // every attached session.
+  it('attaches a second connect to the SAME device instead of opening a second link', async () => {
+    // The measurement this whole design rests on, asserted against the real
+    // switch. Two sessions asking for one console-server port must end up on ONE
+    // TCP connection: a second connection to the same port makes the device tear
+    // down the first (that is what the half-close test below relies on), so
+    // "open another one" would not hand the caller an independent console -- it
+    // would silently break whoever was already connected.
     //
-    // The two halves assert different mechanisms, which is why both are here:
-    //   - console A's own read sees its answer (the ordinary path).
-    //   - console B's `waitFor` sees the command text A typed, with B having
-    //     sent nothing. That is the real wait_for contract: it observes output
-    //     arriving from elsewhere, not merely its own round trip.
+    // SCOPE: SW1 only, and no command is sent. Connecting is not a command, and
+    // the point here is the CONNECTION, not the conversation.
     const ports = manager()
     try {
-      const open = async (label: string): Promise<string> => {
-        const entry = await ports.connect({
-          ownerSessionId: 'live',
-          label,
-          host: SW1.host,
-          port: SW1.port,
-          kind: 'telnet',
-          encoding: 'utf-8',
-          pagingMode: 'manual',
-        })
-        await ports.waitFor('live', entry.consoleId, { for: 'prompt', timeoutMs: 8000 })
-        return entry.consoleId
-      }
-      const writer = await open('WRITER')
-      const watcher = await open('WATCHER')
-      expect(ports.list('live')).toHaveLength(2)
+      const first = await ports.connect({
+        sessionId: 'live-a',
+        label: 'SW-first',
+        host: SW1.host,
+        port: SW1.port,
+        kind: 'telnet',
+        encoding: 'utf-8',
+        pagingMode: 'manual',
+      })
+      await ports.waitFor(first.entry.consoleId, { for: 'prompt', timeoutMs: 8000 })
+      expect(first.reused).toBe(false)
+      expect(ports.list()).toHaveLength(1)
 
-      // Both consoles are positioned at a clean cursor before the command, so
-      // anything either reads afterward arrived because of this command.
-      const writerAt = ports.read('live', writer, { after: 0 }).cursor
-      const watcherAt = ports.read('live', watcher, { after: 0 }).cursor
+      const second = await ports.connect({
+        sessionId: 'live-b',
+        label: 'SW-second',
+        host: SW1.host,
+        port: SW1.port,
+        kind: 'telnet',
+        encoding: 'utf-8',
+        pagingMode: 'manual',
+      })
+      // Same console, reported as reused, still one device link.
+      expect(second.reused).toBe(true)
+      expect(second.entry.consoleId).toBe(first.entry.consoleId)
+      expect(second.entry.openedBy).toBe('live-a')
+      expect(ports.list()).toHaveLength(1)
 
-      // A distinctive marker, so a match cannot come from unrelated device
-      // output that happened to contain generic text.
+      // The FIRST console is still alive: nothing evicted it, which is the whole
+      // reason to attach rather than reconnect. Its prompt is still there.
+      const detail = ports.describe(first.entry.consoleId)
+      expect(detail?.entry.state).toBe('open')
+      expect(detail?.state.prompt).toMatch(/[<\[]\s*[\w.-]+\s*[>\]]/)
+      // ...and the attach left a mark on the shared console's trail.
+      const trail = detail?.state.audit ?? []
+      expect(trail.some(entry => entry.action === 'attach' && entry.detail.includes('live-b'))).toBe(true)
+    } finally {
+      await ports.dispose()
+    }
+  }, 40_000)
+
+  it('sees on one console what another session writes to the same device', async () => {
+    // A serial console mapping means every connection shares the device's one
+    // console line, and the pool now models that directly: a second connect
+    // ATTACHES, so both sessions hold the same handle and read the same stream.
+    //
+    // This is what the older two-connection version of this test was reaching
+    // for, now asserted against the shape the engine actually has. What it still
+    // proves is the part a fake cannot: the DEVICE really does echo a command to
+    // the session that did not send it.
+    const ports = manager()
+    try {
+      const first = await ports.connect({
+        sessionId: 'live-writer',
+        label: 'WRITER',
+        host: SW1.host,
+        port: SW1.port,
+        kind: 'telnet',
+        encoding: 'utf-8',
+        pagingMode: 'manual',
+      })
+      await ports.waitFor(first.entry.consoleId, { for: 'prompt', timeoutMs: 8000 })
+      const second = await ports.connect({
+        sessionId: 'live-watcher',
+        label: 'WATCHER',
+        host: SW1.host,
+        port: SW1.port,
+        kind: 'telnet',
+        encoding: 'utf-8',
+        pagingMode: 'manual',
+      })
+      // One console, two sessions.
+      expect(second.entry.consoleId).toBe(first.entry.consoleId)
+      expect(ports.list()).toHaveLength(1)
+
+      const at = ports.read(first.entry.consoleId, { after: 0 }).cursor
+      // A distinctive marker, so a match cannot come from unrelated device output.
       const marker = `echo live-sync-${String(Date.now())}`
-      await ports.send('live', writer, marker)
-
-      // The WATCHER waits for text it never sent. `waitFor` here is the real
-      // one: it polls the session's own scrollback, so a match means the device
-      // forwarded the writer's line to this connection.
-      const seen = await ports.waitFor('live', watcher, {
+      // Written through the WRITER's handle and observed through the WATCHER's --
+      // the same console, so this asserts the device echoed it, not that two
+      // objects share state.
+      await ports.send(first.entry.consoleId, marker)
+      const seen = await ports.waitFor(second.entry.consoleId, {
         for: 'pattern',
         pattern: marker,
-        after: watcherAt,
+        after: at,
         timeoutMs: 8000,
       })
       expect(seen.matched).toBe(true)
-      expect(seen.reason).toBe('matched')
-
-      // And the watcher can READ what it matched -- `matched: true` with nothing
+      // And it can be READ, not merely matched: `matched: true` with nothing
       // readable would make the wait useless to a caller.
-      const watcherText = ports.read('live', watcher, { after: watcherAt }).text
-      expect(watcherText).toContain(marker)
-
-      // The writer sees its own echo too, so the two views agree about what was
-      // typed while remaining separate sessions.
-      const writerText = ports.read('live', writer, { after: writerAt }).text
-      expect(writerText).toContain(marker)
+      expect(ports.read(second.entry.consoleId, { after: at }).text).toContain(marker)
     } finally {
       await ports.dispose()
     }
@@ -324,8 +364,8 @@ describe.runIf(LIVE)('live console lab', () => {
     // question, because the device is emitting prompts the whole time.
     const ports = manager()
     try {
-      const entry = await ports.connect({
-        ownerSessionId: 'live',
+      const { entry: entry } = await ports.connect({
+        sessionId: 'live',
         label: SW1.label,
         host: SW1.host,
         port: SW1.port,
@@ -333,11 +373,11 @@ describe.runIf(LIVE)('live console lab', () => {
         encoding: 'utf-8',
         pagingMode: 'manual',
       })
-      await ports.waitFor('live', entry.consoleId, { for: 'prompt', timeoutMs: 8000 })
-      const at = ports.read('live', entry.consoleId, { after: 0 }).cursor
+      await ports.waitFor(entry.consoleId, { for: 'prompt', timeoutMs: 8000 })
+      const at = ports.read(entry.consoleId, { after: 0 }).cursor
 
       const started = Date.now()
-      const missed = await ports.waitFor('live', entry.consoleId, {
+      const missed = await ports.waitFor(entry.consoleId, {
         for: 'pattern',
         pattern: `never-printed-${String(Date.now())}`,
         after: at,
@@ -350,7 +390,7 @@ describe.runIf(LIVE)('live console lab', () => {
       expect(Date.now() - started).toBeGreaterThanOrEqual(1000)
       expect(Date.now() - started).toBeLessThan(8000)
       // Still usable afterward: a timeout is a result, not a broken console.
-      expect(ports.describe('live', entry.consoleId)?.state.state).toBe('open')
+      expect(ports.describe(entry.consoleId)?.state.state).toBe('open')
     } finally {
       await ports.dispose()
     }
@@ -402,8 +442,8 @@ describe.runIf(LIVE)('live console lab', () => {
     // running the very command the fence exists to gate.
     const ports = manager()
     try {
-      const entry = await ports.connect({
-        ownerSessionId: 'live',
+      const { entry: entry } = await ports.connect({
+        sessionId: 'live',
         label: SW1.label,
         host: SW1.host,
         port: SW1.port,
@@ -411,14 +451,14 @@ describe.runIf(LIVE)('live console lab', () => {
         encoding: 'utf-8',
         pagingMode: 'manual',
       })
-      await ports.waitFor('live', entry.consoleId, { for: 'prompt', timeoutMs: 8000 })
+      await ports.waitFor(entry.consoleId, { for: 'prompt', timeoutMs: 8000 })
       // The prompt is asserted only as PRESENT, not as a particular view. The
       // device keeps its CLI view across console sessions, so it may legitimately
       // be in either `<SWITCH>` (user) or `[SWITCH]` (config) -- and the operator
       // runs this rollback from the USER view (`<SWITCH>`). Pinning a bracket
       // here would make the suite fail on the device's remembered state rather
       // than on anything the plugin did.
-      const prompt = ports.describe('live', entry.consoleId)?.state.prompt
+      const prompt = ports.describe(entry.consoleId)?.state.prompt
       expect(prompt).toMatch(/^[<[].*[>\]]$/)
       console.log(`[live] switch view at connect: ${String(prompt)}`)
 
@@ -450,8 +490,8 @@ describe.runIf(LIVE)('live console lab', () => {
       expect(asked).toMatch(/replaces the running configuration/i)
 
       // 2. The device has not seen it: a rejected ask writes nothing.
-      const before = ports.read('live', entry.consoleId, { after: 0 }).cursor
-      expect(ports.read('live', entry.consoleId, { after: before }).text).toBe('')
+      const before = ports.read(entry.consoleId, { after: 0 }).cursor
+      expect(ports.read(entry.consoleId, { after: before }).text).toBe('')
 
       // 3. Approved once, it runs -- and the device answers, which is the only
       //    proof that the command is real and the view is right.
@@ -461,7 +501,7 @@ describe.runIf(LIVE)('live console lab', () => {
       )
       expect(approved.approved).toBe(true)
 
-      await ports.send('live', entry.consoleId, command)
+      await ports.send(entry.consoleId, command)
       // Wait for the PROMPT, not for a keyword -- and pass the cursor, which is
       // load-bearing. `for: "prompt"` matches a prompt at the tail, and the
       // connect's wake already left one there, so without `after` this returned
@@ -472,19 +512,19 @@ describe.runIf(LIVE)('live console lab', () => {
       // `scripts/probe-rollback.mjs`: this firmware answers the rollback with the
       // ECHO and then a bare prompt about 3.2s later, and prints no success or
       // failure text at all. "The prompt came back" IS the completion signal.
-      const waited = await ports.waitFor('live', entry.consoleId, {
+      const waited = await ports.waitFor(entry.consoleId, {
         for: 'prompt',
         after: before,
         timeoutMs: 25_000,
       })
-      const answer = ports.read('live', entry.consoleId, { after: before }).text
+      const answer = ports.read(entry.consoleId, { after: before }).text
 
       // The command reached the device and it responded: the echo proves the
       // write landed, and the console is still usable afterwards.
       expect(waited.matched).toBe(true)
       expect(answer).toContain(command)
       expect(answer.length).toBeGreaterThan(command.length)
-      expect(ports.describe('live', entry.consoleId)?.state.state).toBe('open')
+      expect(ports.describe(entry.consoleId)?.state.state).toBe('open')
       // Reported rather than asserted: the exact wording is firmware-specific, and
       // this suite must not fail on a device that phrased it differently.
       console.log(
@@ -499,8 +539,8 @@ describe.runIf(LIVE)('live console lab', () => {
   it('pages automatically when the device offers --More--', async () => {
     const ports = manager()
     try {
-      const entry = await ports.connect({
-        ownerSessionId: 'live',
+      const { entry: entry } = await ports.connect({
+        sessionId: 'live',
         label: FW1.label,
         host: FW1.host,
         port: FW1.port,
@@ -509,13 +549,13 @@ describe.runIf(LIVE)('live console lab', () => {
         // The one mode that keeps a pager flowing without a human.
         pagingMode: 'auto-more',
       })
-      await ports.waitFor('live', entry.consoleId, { for: 'prompt', timeoutMs: 8000 })
+      await ports.waitFor(entry.consoleId, { for: 'prompt', timeoutMs: 8000 })
       // A long read-only listing is the usual way to provoke a pager.
-      await ports.send('live', entry.consoleId, 'show running-config')
-      const text = await readUntil(ports, 'live', entry.consoleId, seen => seen.length > 2000, 15_000)
+      await ports.send(entry.consoleId, 'show running-config')
+      const text = await readUntil(ports, entry.consoleId, seen => seen.length > 2000, 15_000)
       // Either the device paged and the engine consumed pages, or the output
       // fit on one screen. Both are correct; a hung console is not.
-      const detail = ports.describe('live', entry.consoleId)
+      const detail = ports.describe(entry.consoleId)
       expect(detail?.state.state).toBe('open')
       expect(text.length).toBeGreaterThan(0)
     } finally {
@@ -530,8 +570,8 @@ describe.runIf(LIVE)('live console lab', () => {
     // real follow-up command can tell the two apart.
     const ports = manager()
     try {
-      const entry = await ports.connect({
-        ownerSessionId: 'live',
+      const { entry: entry } = await ports.connect({
+        sessionId: 'live',
         label: SW1.label,
         host: SW1.host,
         port: SW1.port,
@@ -539,24 +579,24 @@ describe.runIf(LIVE)('live console lab', () => {
         encoding: 'utf-8',
         pagingMode: 'manual',
       })
-      await ports.waitFor('live', entry.consoleId, { for: 'prompt', timeoutMs: 8000 })
-      await ports.send('live', entry.consoleId, 'show version')
-      const before = await readUntil(ports, 'live', entry.consoleId, seen => seen.length > 0, 15_000)
+      await ports.waitFor(entry.consoleId, { for: 'prompt', timeoutMs: 8000 })
+      await ports.send(entry.consoleId, 'show version')
+      const before = await readUntil(ports, entry.consoleId, seen => seen.length > 0, 15_000)
       expect(before.length).toBeGreaterThan(0)
 
-      const cleared = ports.clear('live', entry.consoleId)
+      const cleared = ports.clear(entry.consoleId)
       expect(cleared.droppedBytes).toBeGreaterThan(0)
       // The buffer really is empty, and the cursor it hands back is where the
       // next read must resume.
-      expect(ports.read('live', entry.consoleId, { after: 0 }).text).toBe('')
-      expect(ports.read('live', entry.consoleId, { after: cleared.cursor }).text).toBe('')
+      expect(ports.read(entry.consoleId, { after: 0 }).text).toBe('')
+      expect(ports.read(entry.consoleId, { after: cleared.cursor }).text).toBe('')
 
       // Still open, and still usable: the device answers a fresh command. The
       // read starts from the cursor the clear handed back, since everything
       // before it was discarded.
-      expect(ports.describe('live', entry.consoleId)?.state.state).toBe('open')
-      await ports.send('live', entry.consoleId, 'show version')
-      const after = await readFrom(ports, 'live', entry.consoleId, cleared.cursor, seen => seen.includes('Software'), 15_000)
+      expect(ports.describe(entry.consoleId)?.state.state).toBe('open')
+      await ports.send(entry.consoleId, 'show version')
+      const after = await readFrom(ports, entry.consoleId, cleared.cursor, seen => seen.includes('Software'), 15_000)
       expect(after).toContain('Software')
     } finally {
       await ports.dispose()
@@ -577,8 +617,8 @@ describe.runIf(LIVE)('live console lab', () => {
     const holder = new ManagerHolder({ ...base, connectTimeoutMs: 8000, readTimeoutMs: 8000, pagingMode: 'manual', wakeOnConnect: true })
     try {
       // Open one console and leave it open across the policy change.
-      const first = await holder.get().connect({
-        ownerSessionId: 'live',
+      const { entry: first } = await holder.get().connect({
+        sessionId: 'live',
         label: 'FIRST',
         host: SW1.host,
         port: SW1.port,
@@ -586,17 +626,17 @@ describe.runIf(LIVE)('live console lab', () => {
         encoding: 'utf-8',
         pagingMode: 'manual',
       })
-      await holder.get().waitFor('live', first.consoleId, { for: 'prompt', timeoutMs: 8000 })
-      expect(holder.get().describe('live', first.consoleId)?.state.prompt).toBeTruthy()
+      await holder.get().waitFor(first.consoleId, { for: 'prompt', timeoutMs: 8000 })
+      expect(holder.get().describe(first.consoleId)?.state.prompt).toBeTruthy()
 
       // Flip wake OFF while that console is still open. Applied in place: the
       // open console is untouched, and the NEXT connect sees the new policy.
       expect(holder.reconfigure({ ...holder.currentPolicy(), wakeOnConnect: false })).toBe('applied')
-      expect(holder.get().describe('live', first.consoleId)?.state.state).toBe('open')
+      expect(holder.get().describe(first.consoleId)?.state.state).toBe('open')
 
       // The silent device cannot produce a prompt when nothing wakes it.
-      const second = await holder.get().connect({
-        ownerSessionId: 'live',
+      const { entry: second } = await holder.get().connect({
+        sessionId: 'live',
         label: 'SECOND',
         host: SW1.host,
         port: SW1.port,
@@ -606,13 +646,13 @@ describe.runIf(LIVE)('live console lab', () => {
       })
       // Both consoles are open at once, which is the state the old code refused
       // to change policy in.
-      expect(holder.get().list('live')).toHaveLength(2)
-      expect(holder.get().describe('live', second.consoleId)?.state.prompt).toBeNull()
+      expect(holder.get().list()).toHaveLength(2)
+      expect(holder.get().describe(second.consoleId)?.state.prompt).toBeNull()
 
       // ...and flipping it back ON is picked up by the next connect.
       expect(holder.reconfigure({ ...holder.currentPolicy(), wakeOnConnect: true })).toBe('applied')
-      const third = await holder.get().connect({
-        ownerSessionId: 'live',
+      const { entry: third } = await holder.get().connect({
+        sessionId: 'live',
         label: 'THIRD',
         host: SW1.host,
         port: SW1.port,
@@ -620,8 +660,8 @@ describe.runIf(LIVE)('live console lab', () => {
         encoding: 'utf-8',
         pagingMode: 'manual',
       })
-      await holder.get().waitFor('live', third.consoleId, { for: 'prompt', timeoutMs: 8000 })
-      expect(holder.get().describe('live', third.consoleId)?.state.prompt).toBeTruthy()
+      await holder.get().waitFor(third.consoleId, { for: 'prompt', timeoutMs: 8000 })
+      expect(holder.get().describe(third.consoleId)?.state.prompt).toBeTruthy()
     } finally {
       await holder.dispose()
     }
@@ -630,8 +670,8 @@ describe.runIf(LIVE)('live console lab', () => {
   it('closes the console and drops it from the inventory', async () => {
     const ports = manager()
     try {
-      const entry = await ports.connect({
-        ownerSessionId: 'live',
+      const { entry: entry } = await ports.connect({
+        sessionId: 'live',
         label: FW1.label,
         host: FW1.host,
         port: FW1.port,
@@ -639,9 +679,9 @@ describe.runIf(LIVE)('live console lab', () => {
         encoding: 'utf-8',
         pagingMode: 'manual',
       })
-      expect(ports.list('live')).toHaveLength(1)
-      await ports.close('live', entry.consoleId, { force: true })
-      expect(ports.list('live')).toHaveLength(0)
+      expect(ports.list()).toHaveLength(1)
+      await ports.close(entry.consoleId, { force: true })
+      expect(ports.list()).toHaveLength(0)
     } finally {
       await ports.dispose()
     }
@@ -661,8 +701,8 @@ describe.runIf(LIVE)('live console lab', () => {
     // unit test cannot show that, because it is a property of the device.
     const ports = manager()
     try {
-      const first = await ports.connect({
-        ownerSessionId: 'live',
+      const { entry: first } = await ports.connect({
+        sessionId: 'live',
         label: 'FW1-first',
         host: FW1.host,
         port: FW1.port,
@@ -670,13 +710,13 @@ describe.runIf(LIVE)('live console lab', () => {
         encoding: 'utf-8',
         pagingMode: 'manual',
       })
-      await ports.waitFor('live', first.consoleId, { for: 'prompt', timeoutMs: 8000 })
-      expect(ports.describe('live', first.consoleId)?.state.prompt).toBeTruthy()
+      await ports.waitFor(first.consoleId, { for: 'prompt', timeoutMs: 8000 })
+      expect(ports.describe(first.consoleId)?.state.prompt).toBeTruthy()
 
       // A second connection to the SAME console port takes the device session
       // away from the first.
-      const second = await ports.connect({
-        ownerSessionId: 'live',
+      const { entry: second } = await ports.connect({
+        sessionId: 'live',
         label: 'FW1-second',
         host: FW1.host,
         port: FW1.port,
@@ -684,14 +724,14 @@ describe.runIf(LIVE)('live console lab', () => {
         encoding: 'utf-8',
         pagingMode: 'manual',
       })
-      await ports.waitFor('live', second.consoleId, { for: 'prompt', timeoutMs: 8000 })
+      await ports.waitFor(second.consoleId, { for: 'prompt', timeoutMs: 8000 })
       await sleep(500)
 
       // The first console is now the "idle" one. Whatever the device printed, the
       // engine must be able to recover it with a bare Enter -- and `wake` reports
       // whether the device actually answered rather than assuming it did.
-      const answered = await ports.wake('live', first.consoleId)
-      const detail = ports.describe('live', first.consoleId)
+      const answered = await ports.wake(first.consoleId)
+      const detail = ports.describe(first.consoleId)
       // The engine never claims a recovery it cannot see: `answered` must agree
       // with whether fresh output arrived.
       expect(typeof answered).toBe('boolean')
@@ -699,10 +739,9 @@ describe.runIf(LIVE)('live console lab', () => {
       // If the device did answer, the first console is usable again -- the real
       // assertion that the wake was a recovery and not just a write.
       if (answered) {
-        await ports.send('live', first.consoleId, 'show version')
+        await ports.send(first.consoleId, 'show version')
         const text = await readFrom(
           ports,
-          'live',
           first.consoleId,
           0,
           seen => /Software|Version/i.test(seen),
@@ -735,8 +774,8 @@ describe.runIf(LIVE)('live console lab', () => {
       dormantProbeMs: 3000,
     })
     try {
-      const entry = await ports.connect({
-        ownerSessionId: 'live',
+      const { entry: entry } = await ports.connect({
+        sessionId: 'live',
         label: 'FW1-idle',
         host: FW1.host,
         port: FW1.port,
@@ -744,12 +783,12 @@ describe.runIf(LIVE)('live console lab', () => {
         encoding: 'utf-8',
         pagingMode: 'manual',
       })
-      await ports.waitFor('live', entry.consoleId, { for: 'prompt', timeoutMs: 8000 })
+      await ports.waitFor(entry.consoleId, { for: 'prompt', timeoutMs: 8000 })
 
       // Sit idle across several probe periods. Nothing may close, error, or go
       // dormant, because the keepalive is doing its job.
       await sleep(10_000)
-      const detail = ports.describe('live', entry.consoleId)
+      const detail = ports.describe(entry.consoleId)
       expect(detail?.state.state).toBe('open')
       expect(detail?.state.lastError).toBeNull()
       expect(detail?.state.dormancy?.keepalivesSent ?? 0).toBeGreaterThanOrEqual(1)
@@ -759,8 +798,8 @@ describe.runIf(LIVE)('live console lab', () => {
       expect(detail?.entry.idleMs ?? 0).toBeGreaterThan(3000)
 
       // And it is genuinely usable, which is the only thing that matters.
-      await ports.send('live', entry.consoleId, 'show version')
-      const text = await readFrom(ports, 'live', entry.consoleId, 0, seen => /Software|Version/i.test(seen), 15_000)
+      await ports.send(entry.consoleId, 'show version')
+      const text = await readFrom(ports, entry.consoleId, 0, seen => /Software|Version/i.test(seen), 15_000)
       expect(text).toMatch(/Software|Version/i)
     } finally {
       await ports.dispose()
@@ -773,8 +812,8 @@ describe.runIf(LIVE)('live console lab', () => {
     // route refused an empty text outright.
     const ports = manager()
     try {
-      const entry = await ports.connect({
-        ownerSessionId: 'live',
+      const { entry: entry } = await ports.connect({
+        sessionId: 'live',
         label: 'FW1-enter',
         host: FW1.host,
         port: FW1.port,
@@ -782,14 +821,14 @@ describe.runIf(LIVE)('live console lab', () => {
         encoding: 'utf-8',
         pagingMode: 'manual',
       })
-      await ports.waitFor('live', entry.consoleId, { for: 'prompt', timeoutMs: 8000 })
-      const before = ports.read('live', entry.consoleId, { after: 0 }).cursor
+      await ports.waitFor(entry.consoleId, { for: 'prompt', timeoutMs: 8000 })
+      const before = ports.read(entry.consoleId, { after: 0 }).cursor
 
-      await ports.send('live', entry.consoleId, '')
-      const text = await readFrom(ports, 'live', entry.consoleId, before, seen => /[<\[]/.test(seen), 8000)
+      await ports.send(entry.consoleId, '')
+      const text = await readFrom(ports, entry.consoleId, before, seen => /[<\[]/.test(seen), 8000)
       // The device echoed nothing but its prompt: an empty line runs no command.
       expect(text).not.toMatch(/Software|Version/i)
-      expect(ports.read('live', entry.consoleId, { after: before }).dormant).toBe(false)
+      expect(ports.read(entry.consoleId, { after: before }).dormant).toBe(false)
     } finally {
       await ports.dispose()
     }
@@ -808,8 +847,8 @@ describe.runIf(LIVE)('live console lab', () => {
     // half would pass just as well if the device happened to answer in one slab.
     const ports = manager()
     try {
-      const entry = await ports.connect({
-        ownerSessionId: 'live',
+      const { entry: entry } = await ports.connect({
+        sessionId: 'live',
         label: 'FW1-idle-wait',
         host: FW1.host,
         port: FW1.port,
@@ -817,20 +856,20 @@ describe.runIf(LIVE)('live console lab', () => {
         encoding: 'utf-8',
         pagingMode: 'manual',
       })
-      await ports.waitFor('live', entry.consoleId, { for: 'prompt', timeoutMs: 8000 })
+      await ports.waitFor(entry.consoleId, { for: 'prompt', timeoutMs: 8000 })
 
       /** Send the command and report what one idle wait saw, then what followed. */
       const run = async (idleMs: number): Promise<{ matched: boolean, atMatch: number, after: number, complete: boolean }> => {
-        const start = ports.read('live', entry.consoleId, { after: 0 }).cursor
-        await ports.send('live', entry.consoleId, 'show running-config')
-        const waited = await ports.waitFor('live', entry.consoleId, { for: 'idle', timeoutMs: 25_000, idleMs })
-        const atMatch = ports.read('live', entry.consoleId, { after: start })
+        const start = ports.read(entry.consoleId, { after: 0 }).cursor
+        await ports.send(entry.consoleId, 'show running-config')
+        const waited = await ports.waitFor(entry.consoleId, { for: 'idle', timeoutMs: 25_000, idleMs })
+        const atMatch = ports.read(entry.consoleId, { after: start })
         // Whatever arrives now is output the wait claimed had stopped.
         let extra = ''
         let cursor = atMatch.cursor
         let lastGrowth = Date.now()
         while (Date.now() - lastGrowth < 2500) {
-          const next = ports.read('live', entry.consoleId, { after: cursor })
+          const next = ports.read(entry.consoleId, { after: cursor })
           if (next.cursor !== cursor) {
             extra += next.text
             cursor = next.cursor

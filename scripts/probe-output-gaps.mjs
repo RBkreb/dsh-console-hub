@@ -48,7 +48,7 @@ const ports = new PortManager({
 })
 
 const entry = await ports.connect({
-  ownerSessionId: 'probe',
+  sessionId: 'probe',
   label: 'GAPS',
   host,
   port: Number(portText),

@@ -1051,6 +1051,19 @@ export class ConsoleSession {
     this.record('system', 'reap', 'closed after the idle window elapsed')
   }
 
+  /**
+   * Record that another session attached to this already-open console.
+   *
+   * The audit trail lives on the console, so without this a device link under
+   * two sessions would have a trail naming only whoever opened it -- and the
+   * second session's reads and writes would appear from nowhere.
+   *
+   * @param sessionId - the session that attached.
+   */
+  recordAttach(sessionId: string): void {
+    this.record('system', 'attach', `session ${sessionId} attached to this shared console`)
+  }
+
   /** Release every resource; safe to call repeatedly. */
   async dispose(): Promise<void> {
     if (this.pagingTimer !== undefined) {

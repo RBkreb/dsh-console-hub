@@ -2,7 +2,7 @@
  * dsh-console-hub — host half.
  *
  * Manages network-device console mappings (Telnet / Raw TCP console servers):
- * device views with credentials kept in the credential seam, per-session
+ * device views with credentials kept in the credential seam, ONE shared pool of
  * console connections with paging-aware reads, the plugin's fenced JSON API for
  * the sidebar tab, and the model-facing `console_*` tools.
  *
@@ -456,7 +456,7 @@ function installApi(
     // Deliberately a pass-through to the live manager rather than an inline
     // body, so there is one implementation of "what clearing means" -- the
     // session's -- reachable from both the panel and the model.
-    clear: (sessionId, consoleId) => holder.get().clear(sessionId, consoleId),
+    clear: (_sessionId, consoleId) => holder.get().clear(consoleId),
   }
 
   ctx.inject(['webServer'], (webScoped) => {
@@ -571,7 +571,7 @@ function installTools(
         const decision = await approveConsoleCommand(
           {
             exec,
-            consoleLabel: holder.get().get(sessionId, consoleId)?.label ?? consoleId,
+            consoleLabel: holder.get().get(consoleId)?.label ?? consoleId,
             command: text,
           },
           {
@@ -635,9 +635,15 @@ function installPrompt(ctx: Context, readSettings: () => ConsoleHubSettings): ()
         const extra = settings.agentInstructions.trim()
         return [
           'Network device consoles are available through the console_* tools.',
-          'A console is scoped to YOUR session: console_list and console_connect only ever see consoles this session opened.',
+          'There is ONE SHARED console pool for the whole host, not one per session: network devices accept very few',
+          'console connections, so consoles are shared rather than duplicated. console_list therefore shows EVERY open',
+          'console, including ones another session opened, and each row carries `openedBy` so you can tell whose it is.',
+          'You may read, write and wake any console in the pool, but do not CLOSE one you did not open unless asked:',
+          'closing it pulls the device link out from under whoever is using it. console_connect to a device that is',
+          'already connected ATTACHES to that console (the result says `reused: true`) rather than opening a second',
+          'connection, which would make the device tear down the first.',
           'Two different questions have two different tools, and mixing them up wastes a round trip:',
-          '- console_list answers "what am I connected to right now". Its handles are what console_send / console_read /',
+          '- console_list answers "what is connected right now". Its handles are what console_send / console_read /',
           '  console_close accept. A configured-but-unconnected device does NOT appear here.',
           '- console_list_views answers "what devices are configured". Its viewIds are what console_connect accepts.',
           'To work on a named device: console_list_views to find its viewId, then console_connect with that viewId. Prefer',

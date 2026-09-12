@@ -1,11 +1,15 @@
 /**
  * The model-facing console tools.
  *
- * The scope rule is the whole shape of this module: a tool binds to the CALLING
- * AGENT'S SESSION through `exec.agent.session.id`, so the model never passes a
- * session id and can never reach another session's consoles. Every tool is a
- * thin translation into `PortManager` calls — the session, paging, encoding and
- * ownership behaviour all live below it.
+ * The pool rule is the whole shape of this module: consoles live in ONE shared
+ * pool for the whole host, so a handle addresses a console directly and the model
+ * never passes a session id to reach one. The calling agent's session is still
+ * READ, to attribute an action (`openedBy` on a connect, the actor on a send), but
+ * it never filters what is reachable -- which is what makes a console opened by a
+ * session that has since ended still usable and still closeable.
+ *
+ * Every tool is a thin translation into `PortManager` calls: the device link,
+ * paging, encoding and lifecycle all live below it.
  *
  * Two conventions from the DSH tool contract shape the definitions:
  * - `execute` returns ONE canonical JSON value; `output.render` is a separate
@@ -367,8 +371,12 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
   register({
     name: 'console_list',
     description:
-      'List the device consoles this session has CONNECTED (open right now). Each row carries the handle to pass to '
-      + 'console_send / console_read / console_close, plus its label, address, transport, state and idle time. '
+      'List the device consoles that are CONNECTED right now. There is ONE SHARED POOL for the whole host, so this '
+      + 'lists every open console, not only ones you opened -- network devices accept very few console connections, so '
+      + 'consoles are shared rather than duplicated per session. Each row carries the handle to pass to console_send / '
+      + 'console_read / console_wake / console_close, plus its label, address, transport, state, idle time and '
+      + '`openedBy` (provenance only: you may use any console in the pool, and another session may be using the same '
+      + 'one -- do not close a console you did not open without being asked). '
       + 'A row marked `dormant: true` is still open but the DEVICE half-closed it after sitting idle: it will print '
       + 'nothing until someone presses Enter, so wake it with console_wake before expecting any output. '
       + 'This does NOT list configured-but-unconnected devices -- call console_list_views for those, then '
@@ -387,6 +395,7 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
             state: { type: 'string' },
             secure: { type: 'boolean' },
             idleMs: { type: 'number' },
+            openedBy: { type: 'string' },
             lastErrorCode: { type: 'string' },
             dormant: { type: 'boolean' },
             dormantText: { type: 'string' },
@@ -395,13 +404,13 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
       }, ['consoles']),
       render: (_args: unknown, value: unknown) => {
         const consoles = (value as { consoles: ConsoleListRow[] }).consoles
-        if (consoles.length === 0) return text('No device consoles are open in this session.')
+        if (consoles.length === 0) return text('No device consoles are open.')
         return text(consoles.map(consoleRowLine).join('\n'))
       },
     },
     execute: async (args: unknown, exec: ConsoleToolRunContext) => {
       assertLive(exec)
-      const consoles: ConsoleListRow[] = deps.manager.list(sessionIdOf(exec)).map(entry => ({
+      const consoles: ConsoleListRow[] = deps.manager.list().map(entry => ({
         consoleId: entry.consoleId,
         label: entry.label,
         host: entry.host,
@@ -410,6 +419,9 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
         state: entry.state,
         secure: entry.secure,
         idleMs: entry.idleMs,
+        // Provenance, so a caller can tell whether a console is already someone
+        // else's. It gates nothing: the pool is shared.
+        openedBy: entry.openedBy,
         // The failure code is why a console needs attention, so the list carries
         // it. Omitted rather than null when there is none: the schema declares an
         // optional string, and an explicit null would violate it.
@@ -666,14 +678,15 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
       const stored = explicit === undefined || explicit === '' ? await storedSecret(deps, target.viewId) : undefined
       const password = explicit === undefined || explicit === '' ? stored?.password : explicit
 
-      const entry = await deps.manager.connect({
-        ownerSessionId: sessionId,
+      const outcome = await deps.manager.connect({
+        sessionId,
         ...target,
         // A view with a stored user supplies it when no explicit password came
         // with one; an explicit password always pairs with the caller's user.
         ...password === undefined || password === '' ? {} : { password },
       })
-      const detail = deps.manager.describe(sessionId, entry.consoleId)
+      const entry = outcome.entry
+      const detail = deps.manager.describe(entry.consoleId)
       return {
         consoleId: entry.consoleId,
         state: entry.state,
@@ -681,7 +694,13 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
         host: entry.host,
         port: entry.port,
         secure: entry.secure,
-        banner: deps.manager.bannerOf(sessionId, entry.consoleId),
+        // Whether this call ATTACHED to a console someone else already had open.
+        // The model needs it: a reused console may be under another session's
+        // control, so closing it to "tidy up" would pull the device link out from
+        // under whoever else is using it.
+        reused: outcome.reused,
+        openedBy: entry.openedBy,
+        banner: deps.manager.bannerOf(entry.consoleId),
         ...detail?.state.prompt === null || detail?.state.prompt === undefined
           ? {}
           : { prompt: detail.state.prompt },
@@ -748,13 +767,13 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
       const submit = parsed.submit
       if (submit !== undefined && typeof submit !== 'boolean') throw new Error('"submit" must be a boolean')
       const submitKey = optionalText(parsed.submitKey, 'submitKey')
-      const entry = await deps.manager.send(sessionId, consoleId, line, {
+      const entry = await deps.manager.send(consoleId, line, {
         ...encoding === undefined ? {} : { encoding },
         ...submit === undefined ? {} : { submit },
         ...submitKey === undefined ? {} : { submitKey },
         actor: 'model',
       })
-      const detail = deps.manager.describe(sessionId, consoleId)
+      const detail = deps.manager.describe(consoleId)
       return {
         consoleId,
         state: entry.state,
@@ -817,8 +836,8 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
       // Deliberately NOT behind the high-risk fence: a bare Enter runs no
       // command. Putting the recovery keystroke behind an approval prompt would
       // make an idle console harder to recover than it is to disturb.
-      const answered = await deps.manager.wake(sessionId, consoleId)
-      const detail = deps.manager.describe(sessionId, consoleId)
+      const answered = await deps.manager.wake(consoleId)
+      const detail = deps.manager.describe(consoleId)
       return {
         consoleId,
         answered,
@@ -890,7 +909,7 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
       const stripEcho = optionalText(parsed.stripEcho, 'stripEcho')
       const encoding = checkedEncoding(parsed.encoding)
 
-      const read = deps.manager.read(sessionId, consoleId, {
+      const read = deps.manager.read(consoleId, {
         ...after === undefined ? {} : { after },
         ...maxBytes === undefined ? {} : { maxBytes },
         ...stripEcho === undefined ? {} : { stripEcho },
@@ -1008,7 +1027,7 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
       const idleMs = parsed.idleMs
       if (idleMs !== undefined && typeof idleMs !== 'number') throw new Error('"idleMs" must be a number')
 
-      const waited = await deps.manager.waitFor(sessionId, consoleId, {
+      const waited = await deps.manager.waitFor(consoleId, {
         for: condition as 'prompt' | 'idle' | 'pattern',
         ...pattern === undefined ? {} : { pattern },
         ...timeoutMs === undefined ? {} : { timeoutMs },
@@ -1052,7 +1071,7 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
       if (typeof consoleId !== 'string' || consoleId === '') throw new Error('"consoleId" is required')
       const force = parsed.force
       if (force !== undefined && typeof force !== 'boolean') throw new Error('"force" must be a boolean')
-      await deps.manager.close(sessionId, consoleId, force === undefined ? {} : { force })
+      await deps.manager.close(consoleId, force === undefined ? {} : { force })
       return { consoleId, closed: true }
     },
   })
@@ -1117,8 +1136,8 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
       const parsed = (args ?? {}) as Record<string, unknown>
       const consoleId = parsed.consoleId
       if (typeof consoleId !== 'string' || consoleId === '') throw new Error('"consoleId" is required')
-      const detail = deps.manager.describe(sessionId, consoleId)
-      if (detail === undefined) throw new Error(`console "${consoleId}" not found for this session`)
+      const detail = deps.manager.describe(consoleId)
+      if (detail === undefined) throw new Error(`console "${consoleId}" not found`)
       const { entry, state } = detail
       return {
         consoleId: entry.consoleId,
@@ -1127,6 +1146,9 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
         port: entry.port,
         kind: entry.kind,
         state: entry.state,
+        // Provenance for a SHARED pool: which session opened this device link,
+        // so a caller can tell it is not alone on it. Gates nothing.
+        openedBy: entry.openedBy,
         encoding: entry.encoding,
         idleMs: entry.idleMs,
         bytesReceived: state.bytesReceived,
@@ -1177,7 +1199,7 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
       if (typeof consoleId !== 'string' || consoleId === '') throw new Error('"consoleId" is required')
       let result: { cursor: number, droppedBytes: number }
       try {
-        result = deps.manager.clear(sessionId, consoleId)
+        result = deps.manager.clear(consoleId)
       } catch (error) {
         throw new Error(error instanceof Error ? error.message : String(error))
       }

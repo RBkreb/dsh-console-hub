@@ -187,7 +187,11 @@ export interface EngineDefaults {
 /** One open console as the API returns it. */
 export interface ConsoleRow {
   consoleId: string
-  ownerSessionId: string
+  /**
+   * The session that OPENED this console. Provenance, not permission: the pool
+   * is shared, so any row may be used and closed by any session.
+   */
+  openedBy: string
   label: string
   host: string
   port: number
@@ -282,6 +286,10 @@ export interface ConsoleHub {
     host: string
     port: number
     secure: boolean
+    /** True when an existing console for this target was attached to. */
+    reused?: boolean
+    /** The session that opened the console, for display. Not a permission. */
+    openedBy?: string
     banner: string
     prompt: string | null
     lastError: { code: string, message: string } | null

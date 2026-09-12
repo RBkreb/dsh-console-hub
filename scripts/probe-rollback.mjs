@@ -45,7 +45,7 @@ const ports = new PortManager({
 })
 
 const entry = await ports.connect({
-  ownerSessionId: 'probe',
+  sessionId: 'probe',
   label: 'SW',
   host: '10.133.5.253',
   port: 10015,

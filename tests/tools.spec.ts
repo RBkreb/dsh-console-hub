@@ -496,13 +496,21 @@ describe('console_connect / console_list / console_describe', () => {
     expect(listed.consoles[0]?.consoleId).toBe(opened.consoleId)
   })
 
-  it('scopes consoles to the calling agent session', async () => {
+  it('lists the SHARED pool, marking which session opened each console', async () => {
+    // The model used to see only its own session's consoles. That scoping is what
+    // made a console opened by a since-dead session invisible -- and therefore
+    // impossible to close. Consoles are a host-wide resource now, so the listing
+    // is too; `openedBy` is what tells the model who else is involved.
     const scene1 = await scene()
     await callTool(scene1, 'console_connect', { viewId: 'v-known' })
     const mine = await callTool(scene1, 'console_list', {}) as { consoles: unknown[] }
     expect(mine.consoles).toHaveLength(1)
-    const theirs = await callTool(scene1, 'console_list', {}, execFor('session-b')) as { consoles: unknown[] }
-    expect(theirs.consoles).toHaveLength(0)
+
+    const theirs = await callTool(scene1, 'console_list', {}, execFor('session-b')) as {
+      consoles: { openedBy: string }[]
+    }
+    expect(theirs.consoles).toHaveLength(1)
+    expect(theirs.consoles[0]?.openedBy).toBe('session-a')
   })
 
   it('connects to an explicit endpoint when no view is named', async () => {
@@ -545,10 +553,25 @@ describe('console_connect / console_list / console_describe', () => {
     expect(described.audit.some(entry => entry.action === 'send')).toBe(true)
   })
 
-  it('refuses another session console', async () => {
+  it('lets another session drive a console it did not open', async () => {
+    // Shared means shared, including for the model. What must NOT be lost is the
+    // provenance: `openedBy` names whoever opened it, so a caller can tell it
+    // attached to someone else's device link.
     const scene1 = await scene()
     const opened = await callTool(scene1, 'console_connect', { viewId: 'v-known' }) as { consoleId: string }
-    await expect(callTool(scene1, 'console_describe', { consoleId: opened.consoleId }, execFor('session-b')))
+    const described = await callTool(
+      scene1,
+      'console_describe',
+      { consoleId: opened.consoleId },
+      execFor('session-b'),
+    ) as { consoleId: string, openedBy?: string }
+    expect(described.consoleId).toBe(opened.consoleId)
+    expect(described.openedBy).toBe('session-a')
+  })
+
+  it('still reports an unknown console id as an error', async () => {
+    const scene1 = await scene()
+    await expect(callTool(scene1, 'console_describe', { consoleId: 'c-nope' }))
       .rejects.toThrow(/not found/i)
   })
 })
@@ -944,10 +967,18 @@ describe('tool renders', () => {
 })
 
 describe('agent context', () => {
-  it('refuses a call with no agent instead of guessing a session', async () => {
+  it('refuses a call with no agent when the action must be attributed to one', async () => {
+    // Not every tool needs a session any more: `console_list` reads a shared pool
+    // and attributes nothing, so it works without an agent. A tool that OPENS a
+    // console does need one -- `openedBy` and the audit trail both name the
+    // session, and guessing one would put a false name in the record.
     const scene1 = await scene()
     const context: ConsoleToolRunContext = { callId: 'c1', signal: new AbortController().signal }
-    await expect(callTool(scene1, 'console_list', {}, context)).rejects.toThrow(/agent|session/i)
+    await expect(callTool(scene1, 'console_connect', { viewId: 'v-known' }, context))
+      .rejects.toThrow(/agent|session/i)
+    // ...and the one that attributes nothing still succeeds.
+    const listed = await callTool(scene1, 'console_list', {}, context) as { consoles: unknown[] }
+    expect(listed.consoles).toEqual([])
   })
 
   it('honours an aborted signal before doing any work', async () => {

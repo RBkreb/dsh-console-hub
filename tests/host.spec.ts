@@ -353,8 +353,30 @@ describe('capability gating', () => {
     expect(text).toContain('console_remove_view')
     // ...and it must say which question each listing tool answers, which is the
     // distinction the report was about.
-    expect(text).toMatch(/connected to right now/)
+    expect(text).toMatch(/what is connected right now/)
     expect(text).toMatch(/devices are configured/)
+  })
+
+  it('tells the model the pool is SHARED, and not to close what it did not open', async () => {
+    // The scoping sentence used to say consoles were scoped to the caller's
+    // session. That is the opposite of the truth now, and a model acting on it
+    // would refuse to touch a console it can legitimately use -- or close one
+    // another session is driving.
+    const settings = settingsService()
+    const prompt = promptRegistry()
+    const { ctx, flush } = fakeContext({ settings: settings.service, systemPrompt: prompt.service })
+    apply(ctx)
+    await flush()
+    const text = prompt.sections().map(entry => entry.text).join('\n')
+    expect(text).toMatch(/ONE SHARED console pool/)
+    expect(text).toMatch(/openedBy/)
+    // The one behavioural rule that goes with sharing.
+    expect(text).toMatch(/do not CLOSE one you did not open/)
+    // And that a repeat connect attaches rather than opening a second link.
+    expect(text).toMatch(/ATTACHES to that console/)
+    expect(text).toMatch(/reused: true/)
+    // The old claim must be gone.
+    expect(text).not.toMatch(/scoped to YOUR session/)
   })
 
   it('tells the model about dormancy, the wake tool, and empty sends', async () => {
