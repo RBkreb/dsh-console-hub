@@ -461,3 +461,158 @@ describe('switching between two consoles', () => {
     })
   })
 })
+
+describe('the input keeps focus across a send', () => {
+  /**
+   * One console that answers a read, so a send can be observed end to end.
+   *
+   * The reported annoyance: after every command the field lost focus and had to
+   * be clicked again. The cause was `disabled={busy}` on the input -- the
+   * browser blurs a focused element the moment it is disabled, and re-enabling
+   * never restores focus. `readOnly` keeps the buttons gated without the blur.
+   *
+   * @returns the hub plus the sends it saw.
+   */
+  function sendingHub(): { hub: ConsoleHub & { send: ConsoleHub['send'] }, sends: string[] } {
+    const sends: string[] = []
+    const hub = {
+      listViews: async () => ({ views: [], defaults: {} }),
+      listConsoles: async () => ({
+        consoles: [{
+          consoleId: 'c0bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+          ownerSessionId: 'session-a',
+          label: 'FW1-focus',
+          host: '10.133.6.253',
+          port: 10003,
+          kind: 'telnet',
+          encoding: 'utf-8',
+          secure: false,
+          state: 'open',
+          lastError: null,
+          idleMs: 0,
+          createdAt: new Date().toISOString(),
+        }],
+      }),
+      fence: async () => ({ risk: 'safe' as const }),
+      send: async (_sessionId: string, _consoleId: string, text: string) => {
+        sends.push(text)
+        return { consoleId: 'c0bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', state: 'open', written: text.length }
+      },
+      read: async () => ({
+        text: '',
+        cursor: 0,
+        truncated: false,
+        bytes: 0,
+        encoding: 'utf-8',
+        paging: { active: false, pagesConsumed: 0, reason: null },
+      }),
+      closeAll: async () => ({ closed: 0 }),
+      clear: async () => ({ consoleId: 'c0bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', cursor: 0, droppedBytes: 0 }),
+    } as unknown as ConsoleHub
+    return { hub, sends }
+  }
+
+  it('stays enabled and focused while a send is in flight', async () => {
+    // The assertion has to happen DURING the busy window, not after it. Busy is
+    // true only while the send is pending, and that is exactly when the old
+    // `disabled={busy}` blurred the field -- an assertion taken after the send
+    // resolves sees an enabled input either way and proves nothing. (Measured:
+    // with `disabled={busy}` restored, an after-the-fact check still passed.)
+    const scene = sendingHub()
+    let releaseSend: (() => void) | undefined
+    const held = new Promise<void>((resolve) => { releaseSend = resolve })
+    scene.hub.send = (async (sessionId: string, consoleId: string, text: string) => {
+      scene.sends.push(text)
+      await held
+      return { consoleId, state: 'open', written: text.length }
+    }) as unknown as typeof scene.hub.send
+
+    const view = renderView(scene.hub)
+    await waitFor(() => {
+      expect(view.getByText('FW1-focus')).toBeTruthy()
+    })
+    fireEvent.click(view.getByText('FW1-focus'))
+
+    const input = view.getByPlaceholderText('输入命令后回车（不发换行前请留空）') as HTMLInputElement
+    input.focus()
+    expect(document.activeElement).toBe(input)
+
+    fireEvent.change(input, { target: { value: 'show version' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => {
+      expect(scene.sends).toContain('show version')
+    })
+
+    // Now the send is pending and `busy` is true. A `disabled` field would be
+    // non-editable here -- and in a real browser it would also have just lost
+    // focus, which is the annoyance that was reported.
+    expect(input.disabled).toBe(false)
+    expect(document.activeElement).toBe(input)
+
+    releaseSend?.()
+    await waitFor(() => {
+      expect(document.activeElement).toBe(input)
+    })
+  })
+})
+
+describe('the clear button', () => {
+  it('asks the host to clear and empties the pane', async () => {
+    const calls: string[] = []
+    const hub = {
+      listViews: async () => ({ views: [], defaults: {} }),
+      listConsoles: async () => ({
+        consoles: [{
+          consoleId: 'c0ccccccccccccccccccccccccccccccc',
+          ownerSessionId: 'session-a',
+          label: 'FW1-clear',
+          host: '10.133.6.253',
+          port: 10003,
+          kind: 'telnet',
+          encoding: 'utf-8',
+          secure: false,
+          state: 'open',
+          lastError: null,
+          idleMs: 0,
+          createdAt: new Date().toISOString(),
+        }],
+      }),
+      read: async () => {
+        calls.push('read')
+        return {
+          text: 'NOISE-TO-CLEAR',
+          cursor: 14,
+          truncated: false,
+          bytes: 14,
+          encoding: 'utf-8',
+          paging: { active: false, pagesConsumed: 0, reason: null },
+        }
+      },
+      clear: async (_sessionId: string, consoleId: string) => {
+        calls.push('clear')
+        // The host reports the cursor that follows the dropped bytes.
+        return { consoleId, cursor: 14, droppedBytes: 14 }
+      },
+      closeAll: async () => ({ closed: 0 }),
+    } as unknown as ConsoleHub
+
+    const view = renderView(hub)
+    await waitFor(() => {
+      expect(view.getByText('FW1-clear')).toBeTruthy()
+    })
+    view.getByText('FW1-clear').click()
+    await waitFor(() => {
+      expect(view.getByText(/NOISE-TO-CLEAR/)).toBeTruthy()
+    })
+
+    fireEvent.click(view.getByText('清空'))
+    await waitFor(() => {
+      expect(calls).toContain('clear')
+    })
+    // The pane is empty again -- and the button is a real host call, not a
+    // local-only clear that the next poll would repaint from the host's copy.
+    await waitFor(() => {
+      expect(view.queryByText(/NOISE-TO-CLEAR/)).toBeNull()
+    })
+  })
+})
