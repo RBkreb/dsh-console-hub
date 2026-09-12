@@ -512,6 +512,20 @@ describe('settings.* methods', () => {
     expect(settings.current().pagingMode).toBe('auto-quit')
     expect(settings.current().defaultEncoding).toBe('gbk')
 
+    // `settings.update` must answer the SAME KEYS as `settings.get`. It once
+    // answered only `{ revision, settings }` while the client declared
+    // `defaults`, and the client read a field that was not there -- `undefined`
+    // -- which cleared its state and made the settings control vanish until a
+    // manual refresh. The key sets are compared rather than the values: the two
+    // reads happen at different times, so a field the write just changed is
+    // expected to differ.
+    const writtenValue = (written.body as { value: Record<string, unknown> }).value
+    const readValue = (read.body as { value: Record<string, unknown> }).value
+    expect(Object.keys(writtenValue).sort()).toEqual(Object.keys(readValue).sort())
+    // ...and the defaults it does carry must reflect the write.
+    expect((writtenValue.defaults as { pagingMode: string }).pagingMode).toBe('auto-quit')
+    expect((writtenValue.defaults as { defaultEncoding: string }).defaultEncoding).toBe('gbk')
+
     const stale = await call(api, 'settings.update', {
       sessionId: 'session-a',
       patch: { pagingMode: 'manual' },

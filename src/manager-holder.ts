@@ -1,23 +1,23 @@
 /**
  * Live reconfiguration of the port manager.
  *
- * `PortManager` captures its options at construction, but the settings document
- * that supplies them is user-editable and marked `live`. Rebuilding the manager
- * on every settings write would destroy open consoles — a slider drag must not
- * close someone's session — so reconfiguration is deferred while consoles are
- * live and applied at the first moment nothing is open.
+ * A settings write must never close a console someone is using — but it also
+ * must never be SILENTLY IGNORED, and that is what this module used to get
+ * wrong. It parked the whole policy while any console was open and applied it
+ * once the last one closed, so toggling a setting changed nothing until the user
+ * closed every console and toggled it again. The setting appeared broken.
  *
- * The rule this module owns is deliberately narrow:
+ * The parked design existed because policy changes were applied by REPLACING
+ * the manager, and the outgoing manager had to be disposed — which closes the
+ * consoles it owns. Admitting the change in place removes that dilemma
+ * entirely: `PortManager.updateOptions` swaps the policy without touching the
+ * open consoles, because each `ConsoleSession` already copies the values it
+ * needs at construction.
  *
- * - No console open → apply immediately.
- * - Any console open → remember the new policy; `sync` applies it once the last
- *   console closes.
- *
- * A policy applied by `sync` is applied to consoles opened AFTER it, never
- * retroactively: the manager builds each session from the options it holds at
- * `connect` time, so an already-open console keeps the timeouts it was opened
- * with. That is the behaviour that keeps a console usable while its owner is
- * editing settings.
+ * So there is no deferral left to reason about. A policy change applies
+ * immediately, and it applies to consoles opened AFTER it — an already-open
+ * console keeps the timeouts, patterns and wake behaviour it was opened with,
+ * which is the property the deferred version was protecting.
  *
  * @module dsh-console-hub/manager-holder
  */
@@ -32,7 +32,7 @@ import type { ConsoleHubSettings } from './config-shared.ts'
  *
  * @param settings - the resolved plugin settings.
  * @param idleSweepMs - how often the host's reaper runs.
- * @returns the manager options to construct (or reconfigure) with.
+ * @returns the manager options to construct (or adopt).
  */
 export function policyFromSettings(settings: ConsoleHubSettings, idleSweepMs: number): PortManagerOptions {
   return {
@@ -61,21 +61,19 @@ export function policyDiffers(left: PortManagerOptions, right: PortManagerOption
 }
 
 /** How a reconfiguration request was resolved. */
-export type ReconfigureOutcome = 'applied' | 'deferred' | 'unchanged'
+export type ReconfigureOutcome = 'applied' | 'unchanged'
 
 /**
- * Owns the manager instance and applies policy changes at safe moments.
+ * Owns the manager instance and keeps its policy in step with the settings
+ * document.
  *
  * @example
  * const holder = new ManagerHolder(policyFromSettings(settings, 15_000))
- * holder.reconfigure(policyFromSettings(next, 15_000)) // 'deferred'
- * holder.sync()                                        // applies once idle
+ * holder.reconfigure(policyFromSettings(next, 15_000)) // 'applied'
  */
 export class ManagerHolder {
-  private manager: PortManager
+  private readonly manager: PortManager
   private policy: PortManagerOptions
-  private pending: PortManagerOptions | undefined
-  private reaperStarted = false
 
   /** @param policy - the initial manager policy. */
   constructor(policy: PortManagerOptions) {
@@ -93,73 +91,36 @@ export class ManagerHolder {
     return this.policy
   }
 
-  /** The policy waiting for the manager to drain, when one is pending. */
-  pendingPolicy(): PortManagerOptions | undefined {
-    return this.pending
-  }
-
   /**
-   * Start the idle reaper on the current manager (idempotent), so a replacement
-   * manager is rearmed by {@link sync} without the host tracking it.
+   * Start the idle reaper on the manager (idempotent).
+   *
+   * Kept as a holder method so the host has one place to arm the reaper without
+   * reaching through `get()`, and so arming stays paired with ownership.
    */
   startReaper(): void {
     this.manager.startReaper()
-    this.reaperStarted = true
   }
 
   /**
-   * Request a policy change.
+   * Adopt a policy change.
    *
-   * @param next - the policy to apply.
-   * @returns `unchanged` when it matches the live policy, `applied` when the
-   *   manager was replaced now, `deferred` when a console is open and the change
-   *   is parked until {@link sync} finds the manager empty.
+   * Applies immediately, including while consoles are open: the manager keeps
+   * its consoles and only its future behaviour changes. Deliberately NOT
+   * deferred — a change that waits for the user to close everything is a change
+   * that appears not to work.
+   *
+   * @param next - the policy to adopt.
+   * @returns `unchanged` when it matches the live policy, else `applied`.
    */
   reconfigure(next: PortManagerOptions): ReconfigureOutcome {
-    if (this.pending === undefined && !policyDiffers(this.policy, next)) return 'unchanged'
-    // An already-parked change is superseded by the newer one: the user's latest
-    // intent is what should land, not the first edit of a burst.
-    this.pending = next
-    return this.applyIfIdle() ? 'applied' : 'deferred'
+    if (!policyDiffers(this.policy, next)) return 'unchanged'
+    this.policy = next
+    this.manager.updateOptions(next)
+    return 'applied'
   }
 
-  /**
-   * Apply a parked policy if nothing is open.
-   *
-   * The host calls this when a console may have been closed or reaped; it is
-   * cheap and idempotent so a short interval is a fine driver.
-   *
-   * @returns true when a parked policy was applied by this call.
-   */
-  sync(): boolean {
-    return this.applyIfIdle()
-  }
-
-  /** Replace the manager when a parked policy exists and nothing is open. */
-  private applyIfIdle(): boolean {
-    const pending = this.pending
-    if (pending === undefined) return false
-    if (this.hasLiveConsoles()) return false
-
-    const previous = this.manager
-    this.manager = new PortManager(pending)
-    this.policy = pending
-    this.pending = undefined
-    if (this.reaperStarted) this.manager.startReaper()
-    // Disposal is fire-and-forget: the old manager holds no consoles (that is
-    // the precondition), so this only settles its own handles.
-    void previous.dispose()
-    return true
-  }
-
-  /** Whether any session still holds an open console. */
-  private hasLiveConsoles(): boolean {
-    return this.manager.openCount() > 0
-  }
-
-  /** Dispose the current manager, draining any parked change. */
+  /** Dispose the manager, closing every console it holds. */
   async dispose(): Promise<void> {
-    this.pending = undefined
     await this.manager.dispose()
   }
 }

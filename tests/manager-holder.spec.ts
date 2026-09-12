@@ -140,113 +140,103 @@ describe('ManagerHolder', () => {
     const next = { ...basePolicy(), idleTimeoutMs: 1234 }
     expect(holder.reconfigure(next)).toBe('applied')
     expect(holder.currentPolicy().idleTimeoutMs).toBe(1234)
-    expect(holder.pendingPolicy()).toBeUndefined()
   })
 
   it('reports an identical policy as unchanged and does not replace the manager', () => {
     const holder = holderFor()
     const before = holder.get()
     expect(holder.reconfigure({ ...basePolicy() })).toBe('unchanged')
-    // Replacing the instance for a no-op write would be observable to anything
-    // holding the old reference, so identity is part of the contract.
+    // The manager instance is stable now: a policy change mutates it rather than
+    // replacing it, so anything holding the reference keeps working.
     expect(holder.get()).toBe(before)
   })
 
-  it('defers a policy change while a console is open, keeping the console usable', async () => {
-    const device = await startDevice()
-    openDevices.push(device)
-    const holder = holderFor()
-    const consoleId = await connect(holder, device)
-    const before = holder.get()
-
-    expect(holder.reconfigure({ ...basePolicy(), idleTimeoutMs: 999 })).toBe('deferred')
-    // The console survives the settings write: this is the whole point.
-    expect(holder.get()).toBe(before)
-    expect(holder.get().get('session-a', consoleId)?.state).toBe('open')
-    expect(holder.pendingPolicy()?.idleTimeoutMs).toBe(999)
-    // The live policy is still the old one.
-    expect(holder.currentPolicy().idleTimeoutMs).toBe(60_000)
-  })
-
-  it('lands the parked policy once the last console closes', async () => {
+  it('applies a policy change WHILE a console is open, and keeps that console usable', async () => {
+    // The reported defect. A change used to be parked until every console
+    // closed, so toggling a setting changed nothing for the next connect until
+    // the user closed everything and toggled it again. Applying in place is what
+    // removes that, and the console must survive it either way.
     const device = await startDevice()
     openDevices.push(device)
     const holder = holderFor()
     const consoleId = await connect(holder, device)
 
-    holder.reconfigure({ ...basePolicy(), idleTimeoutMs: 999 })
-    // A sync with a console still open is a no-op.
-    expect(holder.sync()).toBe(false)
-    expect(holder.pendingPolicy()).toBeDefined()
-
-    await holder.get().close('session-a', consoleId)
-    expect(holder.sync()).toBe(true)
+    expect(holder.reconfigure({ ...basePolicy(), idleTimeoutMs: 999 })).toBe('applied')
+    // The new policy is LIVE, not parked.
     expect(holder.currentPolicy().idleTimeoutMs).toBe(999)
-    expect(holder.pendingPolicy()).toBeUndefined()
+    // And the open console is untouched: same manager, still open, still usable.
+    expect(holder.get().get('session-a', consoleId)?.state).toBe('open')
+    await holder.get().send('session-a', consoleId, 'show version')
+    await until(() => holder.get().read('session-a', consoleId, {}).text.includes('answer:show version'))
   })
 
-  it('keeps the newest parked policy when several writes arrive while busy', async () => {
+  it('gives the change to the NEXT console, so a toggle takes effect at once', async () => {
+    // The behaviour the user actually wants from a settings toggle: flip it, open
+    // a console, get the new behaviour -- without closing the old ones first.
     const device = await startDevice()
     openDevices.push(device)
     const holder = holderFor()
-    const consoleId = await connect(holder, device)
+    await connect(holder, device, 'BEFORE')
 
-    // A burst of edits (a number input firing per keystroke) must converge on
-    // the LAST value, not the first.
+    holder.reconfigure({ ...basePolicy(), maxConsoles: 9 })
+    expect(holder.currentPolicy().maxConsoles).toBe(9)
+    // The manager reads the new value on its next connect, which is the whole
+    // point of applying in place.
+    expect(holder.get().openCount()).toBe(1)
+    await connect(holder, device, 'AFTER')
+    expect(holder.get().openCount()).toBe(2)
+  })
+
+  it('keeps a burst of edits converging on the LAST value', async () => {
+    // A number input fires per keystroke; the final value must win, and it must
+    // be the live policy rather than a queued one.
+    const holder = holderFor()
     holder.reconfigure({ ...basePolicy(), idleTimeoutMs: 111 })
     holder.reconfigure({ ...basePolicy(), idleTimeoutMs: 222 })
     holder.reconfigure({ ...basePolicy(), idleTimeoutMs: 333 })
-    expect(holder.pendingPolicy()?.idleTimeoutMs).toBe(333)
-
-    await holder.get().close('session-a', consoleId)
-    holder.sync()
     expect(holder.currentPolicy().idleTimeoutMs).toBe(333)
   })
 
-  it('does not apply a parked policy to a console that is already open', async () => {
+  it('does not apply a policy change retroactively to an open console', async () => {
     const device = await startDevice()
     openDevices.push(device)
     const holder = holderFor()
     const consoleId = await connect(holder, device)
 
-    // Park a change with a much shorter read timeout, then confirm the OPEN
-    // console still answers under the policy it was opened with.
+    // Park a change with a much shorter read timeout: the OPEN console must keep
+    // answering under the policy it was opened with, so editing settings never
+    // breaks a session in progress.
     holder.reconfigure({ ...basePolicy(), readTimeoutMs: 50 })
     await holder.get().send('session-a', consoleId, 'show version')
     await until(() => holder.get().read('session-a', consoleId, {}).text.includes('answer:show version'))
-    const read = holder.get().read('session-a', consoleId, {})
-    expect(read.text).toContain('answer:show version')
+    expect(holder.get().read('session-a', consoleId, {}).text).toContain('answer:show version')
   })
 
-  it('rearms the idle reaper on a replacement manager, so the new policy actually reaps', async () => {
+  it('re-arms the idle reaper when the sweep interval changes', async () => {
     const device = await startDevice()
     openDevices.push(device)
     // A short idle lifetime and sweep so the reaper fires inside the test.
     const holder = holderFor({ ...basePolicy(), idleTimeoutMs: 50, idleSweepMs: 20 })
     holder.startReaper()
 
-    const first = await connect(holder, device)
-    holder.reconfigure({ ...basePolicy(), idleTimeoutMs: 50, idleSweepMs: 20, maxConsoles: 7 })
-    await holder.get().close('session-a', first)
-    expect(holder.sync()).toBe(true)
+    await connect(holder, device)
+    // Changing the cadence must actually take effect: the interval was armed
+    // with the old value, so adopting a new one without re-arming would leave
+    // the manager sweeping at the old rate.
+    holder.reconfigure({ ...basePolicy(), idleTimeoutMs: 50, idleSweepMs: 15 })
+    expect(holder.currentPolicy().idleSweepMs).toBe(15)
 
-    // The REPLACEMENT manager must have its own reaper running. Without one the
-    // idle console below would never be collected, which is exactly the leak a
-    // naive reconfigure introduces.
-    await connect(holder, device, 'FW2')
     await until(() => holder.get().openCount() === 0, 4000)
     expect(holder.get().openCount()).toBe(0)
   })
 
-  it('drops a parked policy on dispose instead of applying it', async () => {
+  it('closes everything on dispose', async () => {
     const device = await startDevice()
     openDevices.push(device)
     const holder = holderFor()
     await connect(holder, device)
-    holder.reconfigure({ ...basePolicy(), idleTimeoutMs: 999 })
     await holder.dispose()
     openHolders.splice(openHolders.indexOf(holder), 1)
-    expect(holder.pendingPolicy()).toBeUndefined()
     expect(holder.get().openCount()).toBe(0)
   })
 })

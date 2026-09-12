@@ -43,6 +43,7 @@ import {
   compileCommandFence,
 } from '../../src/config-shared.ts'
 import { classifyCommand, compileFence, type ConsoleFenceSettings } from '../../src/guard.ts'
+import { ManagerHolder, policyFromSettings } from '../../src/manager-holder.ts'
 
 /** The lab devices, from PHASE0.md. */
 const FW1 = { host: '10.133.6.253', port: 10003, label: 'FW1' }
@@ -316,6 +317,70 @@ describe.runIf(LIVE)('live console lab', () => {
       await ports.dispose()
     }
   }, 45_000)
+
+  it('applies a wake change to the next console without closing the open one', async () => {
+    // The reported defect, reproduced on hardware. Toggling `wakeOnConnect` used
+    // to be deferred while any console was open, so the ONLY way to make it take
+    // effect was to close everything, toggle, and toggle back -- and the next
+    // connect still behaved the old way until then.
+    //
+    // This drives the real `ManagerHolder`, which is what the host uses, and
+    // asserts on the SECOND console's actual behaviour: with wake on it reaches
+    // a prompt, with wake off it stays silent. That is the device's own answer,
+    // not a policy field the manager merely claims to hold.
+    const base = policyFromSettings(DEFAULT_CONSOLE_HUB_SETTINGS, 15_000)
+    const holder = new ManagerHolder({ ...base, connectTimeoutMs: 8000, readTimeoutMs: 8000, pagingMode: 'manual', wakeOnConnect: true })
+    try {
+      // Open one console and leave it open across the policy change.
+      const first = await holder.get().connect({
+        ownerSessionId: 'live',
+        label: 'FIRST',
+        host: SW1.host,
+        port: SW1.port,
+        kind: 'telnet',
+        encoding: 'utf-8',
+        pagingMode: 'manual',
+      })
+      await holder.get().waitFor('live', first.consoleId, { for: 'prompt', timeoutMs: 8000 })
+      expect(holder.get().describe('live', first.consoleId)?.state.prompt).toBeTruthy()
+
+      // Flip wake OFF while that console is still open. Applied in place: the
+      // open console is untouched, and the NEXT connect sees the new policy.
+      expect(holder.reconfigure({ ...holder.currentPolicy(), wakeOnConnect: false })).toBe('applied')
+      expect(holder.get().describe('live', first.consoleId)?.state.state).toBe('open')
+
+      // The silent device cannot produce a prompt when nothing wakes it.
+      const second = await holder.get().connect({
+        ownerSessionId: 'live',
+        label: 'SECOND',
+        host: SW1.host,
+        port: SW1.port,
+        kind: 'telnet',
+        encoding: 'utf-8',
+        pagingMode: 'manual',
+      })
+      // Both consoles are open at once, which is the state the old code refused
+      // to change policy in.
+      expect(holder.get().list('live')).toHaveLength(2)
+      expect(holder.get().describe('live', second.consoleId)?.state.prompt).toBeNull()
+
+      // ...and flipping it back ON is picked up by the next connect.
+      expect(holder.reconfigure({ ...holder.currentPolicy(), wakeOnConnect: true })).toBe('applied')
+      const third = await holder.get().connect({
+        ownerSessionId: 'live',
+        label: 'THIRD',
+        host: SW1.host,
+        port: SW1.port,
+        kind: 'telnet',
+        encoding: 'utf-8',
+        pagingMode: 'manual',
+      })
+      await holder.get().waitFor('live', third.consoleId, { for: 'prompt', timeoutMs: 8000 })
+      expect(holder.get().describe('live', third.consoleId)?.state.prompt).toBeTruthy()
+    } finally {
+      await holder.dispose()
+    }
+  }, 60_000)
 
   it('closes the console and drops it from the inventory', async () => {
     const ports = manager()

@@ -459,6 +459,11 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
     setError(null)
     try {
       const result = await hub.updateSettings(sessionId, { [key]: value })
+      // `settings.update` answers the same `{ revision, defaults }` shape as
+      // `settings.get`. It used to answer `{ revision, settings }` while this
+      // side declared `defaults` -- so `result.defaults` was `undefined`,
+      // `setDefaults(undefined)` cleared the state, and the control vanished
+      // until a manual refresh re-read it.
       setDefaults(result.defaults)
       setStatus(`已更新引擎设置：${key} = ${String(value)}`)
     } catch (failure) {

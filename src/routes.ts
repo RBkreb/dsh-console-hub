@@ -365,7 +365,11 @@ function settingsHandlers(api: ConsoleHubApi): Record<string, Handler> {
         )
       }
       const settings = await applySettingsPatch(api, patch)
-      return { revision: api.settings.revision(), settings }
+      // The SAME shape `settings.get` answers, so a caller can refresh its view
+      // from either reply. Answering the raw section here while the client
+      // declared `defaults` is what made a settings control vanish after a
+      // toggle: the field it read was simply absent.
+      return { revision: api.settings.revision(), settings, defaults: defaultsFor(settings) }
     },
   }
 }

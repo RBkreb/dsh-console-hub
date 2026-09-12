@@ -556,6 +556,97 @@ describe('the input keeps focus across a send', () => {
   })
 })
 
+describe('the engine settings controls', () => {
+  /**
+   * A hub whose inventory carries engine defaults and whose settings update
+   * answers the same shape `settings.get` does.
+   *
+   * The reported defect: after toggling, the control DISAPPEARED until the
+   * refresh button was pressed. `settings.update` answered
+   * `{ revision, settings }` while this side read `result.defaults`, so that
+   * field was `undefined` and `setDefaults(undefined)` hid the control. The
+   * shape of the reply is therefore the thing under test.
+   *
+   * @returns the hub plus the updates it saw.
+   */
+  function settingsHub(): { hub: ConsoleHub, updates: Array<Record<string, unknown>> } {
+    const updates: Array<Record<string, unknown>> = []
+    let wake = false
+    const defaults = (): Record<string, unknown> => ({
+      defaultEncoding: 'utf-8',
+      defaultKind: 'telnet',
+      pagingMode: 'auto-more',
+      approvalMode: 'high-risk',
+      highRiskPatterns: [],
+      promptPattern: '.',
+      pagerPattern: '--more--',
+      wakeOnConnect: wake,
+      connectTimeoutMs: 8000,
+      readTimeoutMs: 15000,
+      idleTimeoutMs: 600000,
+      maxConsoles: 16,
+      outputLimitBytes: 65536,
+      scrollbackLimitBytes: 262144,
+      pagingMaxPages: 50,
+      pagingQuietMs: 120,
+      agentConsoleTools: true,
+    })
+    const hub = {
+      listViews: async () => ({ views: [], defaults: defaults() }),
+      listConsoles: async () => ({ consoles: [] }),
+      updateSettings: async (_sessionId: string, patch: Record<string, unknown>) => {
+        updates.push(patch)
+        if (typeof patch.wakeOnConnect === 'boolean') wake = patch.wakeOnConnect
+        // Exactly what the host answers: the section AND the derived defaults.
+        return { revision: 2, settings: {}, defaults: defaults() }
+      },
+      closeAll: async () => ({ closed: 0 }),
+    } as unknown as ConsoleHub
+    return { hub, updates }
+  }
+
+  it('keeps the wake switch visible after a toggle, showing the new value', async () => {
+    const scene = settingsHub()
+    const view = renderView(scene.hub)
+    await waitFor(() => {
+      expect(view.getByLabelText('连接后自动唤醒')).toBeTruthy()
+    })
+
+    const toggle = view.getByLabelText('连接后自动唤醒') as HTMLInputElement
+    expect(toggle.checked).toBe(false)
+    fireEvent.click(toggle)
+
+    await waitFor(() => {
+      expect(scene.updates).toEqual([{ wakeOnConnect: true }])
+    })
+    // THE assertion: the control is STILL THERE and shows the new state with no
+    // refresh. Reading a missing field cleared it and it vanished until the
+    // refresh button re-read the inventory.
+    await waitFor(() => {
+      expect((view.getByLabelText('连接后自动唤醒') as HTMLInputElement).checked).toBe(true)
+    })
+  })
+
+  it('survives a second toggle, so the control is not a one-shot', async () => {
+    const scene = settingsHub()
+    const view = renderView(scene.hub)
+    await waitFor(() => {
+      expect(view.getByLabelText('连接后自动唤醒')).toBeTruthy()
+    })
+
+    fireEvent.click(view.getByLabelText('连接后自动唤醒'))
+    await waitFor(() => {
+      expect((view.getByLabelText('连接后自动唤醒') as HTMLInputElement).checked).toBe(true)
+    })
+    // Turning it back off must work from the same control.
+    fireEvent.click(view.getByLabelText('连接后自动唤醒'))
+    await waitFor(() => {
+      expect((view.getByLabelText('连接后自动唤醒') as HTMLInputElement).checked).toBe(false)
+    })
+    expect(scene.updates).toEqual([{ wakeOnConnect: true }, { wakeOnConnect: false }])
+  })
+})
+
 describe('the clear button', () => {
   it('asks the host to clear and empties the pane', async () => {
     const calls: string[] = []

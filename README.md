@@ -47,7 +47,7 @@ host 半改动需要重启 Host；client 半由 `/plugins` 通道下发，刷新
 | 字段 | 默认 | 说明 |
 | --- | --- | --- |
 | `requestBodyLimitBytes` | `1048576` | 插件 API 单次请求体上限 |
-| `sessionIdleSweepMs` | `15000` | 空闲会话回收器与「延迟策略生效」检查的间隔 |
+| `sessionIdleSweepMs` | `15000` | 空闲会话回收器的扫描间隔 |
 | `trustedHosts` | `[]` | 非回环部署必须声明自己被访问的 `host:port`，否则 Host 栅栏会拒绝所有请求 |
 
 ## 开发
@@ -142,6 +142,36 @@ pnpm test settings-seam                  # 用真实 settings 服务跑整条 co
 断言**provider 存下来的文档**里那条设备真的没了。`dsh-settings` 不是本插件的依赖
 （它是宿主在运行时提供的），所以没有部署时该套件会**显式 skip 并打印原因**，
 不会静默变成"通过"。
+
+### 引擎策略：**就地生效**，不要「等会话都关掉再应用」（踩过一次）
+
+`ManagerHolder` 曾经在有会话打开时把整个新策略**暂存**，等到最后一个控制台关闭才应用。
+结果是：改一个开关后**新建连接仍然沿用旧行为**，必须先关掉全部会话、再改一次，才按预期工作。
+
+暂存当初是有理由的——旧实现靠**替换** PortManager 来换策略，而替换必须 `dispose()` 旧的，
+`dispose` 会关掉它持有的所有控制台。但那个理由站不住：`ConsoleSession` **在构造时就已经
+拷贝**了它需要的每一项设置，所以已打开的会话本来就与 manager 的 options 解耦。
+
+现在改为 `PortManager.updateOptions()` **就地替换策略**：
+
+- 已打开的控制台**不受影响**，继续用它打开时的超时/模式/唤醒行为；
+- 改动**立刻**对**下一个** connect 生效——这正是用户对"开关"的预期；
+- `idleTimeoutMs` 每轮扫描现读，所以改短会立刻开始回收；
+- `idleSweepMs` 变化时会**重新挂载**回收器（否则仍按旧节奏扫描）；
+- `maxConsoles` 只在 connect 时读取，所以调低不会驱逐已打开的会话。
+
+真机用例 `tests/live/lab.spec.ts` 的 "applies a wake change to the next console…"
+复现的就是这个场景：保持第一个控制台开着 → 关掉唤醒 → 第二个控制台**确实拿不到提示符**
+→ 再打开 → 第三个控制台**确实拿到提示符**。断言的是**设备的真实反应**，不是策略字段。
+
+### 设置读写的返回形状必须与 `settings.get` 一致（踩过一次）
+
+`settings.update` 曾经只返回 `{ revision, settings }`，而客户端那边声明的是
+`{ revision, defaults }`。客户端读 `result.defaults` 得到 `undefined`，
+`setDefaults(undefined)` 直接把控件**从界面上抹掉**——必须手动点「刷新」才能重新读回来。
+
+两个响应现在形状一致（都带 `defaults`），并且 `tests/routes.spec.ts` 会**逐字比较两次
+响应的 key 集合**，防止再次漂移：只比形状、不比数值（两次读取时刻不同，刚写过的字段本就应该不同）。
 
 它抓到的正是替身抓不到的那一类：把 `applySettingsPatch` 改回 `update`，这套用例立刻
 红——而 `tests/routes.spec.ts` 里的替身版本仍然全绿。

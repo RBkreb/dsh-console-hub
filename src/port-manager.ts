@@ -113,7 +113,8 @@ export interface ConsoleDetail {
 
 /** Owns every live console and their lifetimes. */
 export class PortManager {
-  private readonly options: PortManagerOptions
+  /** The policy in force. Replaced wholesale by {@link updateOptions}. */
+  private options: PortManagerOptions
   private readonly consoles = new Map<string, Tracked>()
   /** Connect banners, keyed by console id (see `connect`). */
   private readonly banners = new Map<string, string>()
@@ -123,6 +124,45 @@ export class PortManager {
   /** @param options - fully-defaulted manager settings. */
   constructor(options: PortManagerOptions) {
     this.options = options
+  }
+
+  /**
+   * Adopt a new policy WITHOUT disturbing the open consoles.
+   *
+   * This exists so a settings change never has to be deferred. Replacing the
+   * manager would work, but the replacement owns no consoles, so the outgoing
+   * one has to be disposed -- and `dispose` closes every console it holds. That
+   * is what forced the old deferred-until-empty behaviour, and the visible
+   * result was a setting that silently did nothing until the user closed
+   * everything and toggled it again.
+   *
+   * Mutating in place is safe because a live console is already insulated from
+   * this object: {@link connect} copies each value it needs into the
+   * `ConsoleSession` it builds, so an open session keeps the timeouts, patterns
+   * and wake behaviour it was opened with. What changes is what the NEXT
+   * connect uses, which is exactly what a policy edit means.
+   *
+   * The two fields read live rather than copied are handled deliberately:
+   *
+   * - `idleTimeoutMs`: `sweep` reads it per tick, so a shorter lifetime starts
+   *   applying at once. A user who shortens it wants that.
+   * - `idleSweepMs`: the interval was armed with the old value, so the reaper is
+   *   re-armed when it changes.
+   * - `maxConsoles`: only consulted at `connect`, so a limit lowered below the
+   *   current count stops new consoles without evicting open ones.
+   *
+   * @param next - the policy to adopt.
+   */
+  updateOptions(next: PortManagerOptions): void {
+    const sweepChanged = next.idleSweepMs !== this.options.idleSweepMs
+    this.options = next
+    if (sweepChanged && this.reaper !== undefined) {
+      // Re-arm so the new cadence takes effect; `startReaper` is idempotent, so
+      // clearing first is what makes it start again.
+      clearInterval(this.reaper)
+      this.reaper = undefined
+      this.startReaper()
+    }
   }
 
   /** Start the periodic idle reaper (no-op when already started or disposed). */

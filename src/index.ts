@@ -213,21 +213,10 @@ export function apply(ctx: Context, config?: ConsoleHubConfig): void {
     holder.reconfigure(policyFromSettings(initial, resolved.sessionIdleSweepMs))
     active = { holder, settings: readSettings }
 
-    // A parked policy lands as soon as the manager drains. The interval matches
-    // the idle sweep: cheap, and one comparison per tick while idle.
-    const drain = setInterval(() => {
-      if (holder.sync() && logger !== undefined) logger.info('console-hub: applied the deferred engine policy')
-    }, Math.max(1000, resolved.sessionIdleSweepMs))
-    drain.unref?.()
-    ctx.effect(() => () => {
-      clearInterval(drain)
-    }, 'dsh-console-hub: policy drain')
-
     const policyWatch = binding.scope.watch((next) => {
-      const outcome = holder.reconfigure(policyFromSettings(next, resolved.sessionIdleSweepMs))
-      if (outcome === 'deferred' && logger !== undefined) {
-        logger.info('console-hub: engine policy change deferred until the open consoles close')
-      }
+      // Applied in place, so this takes effect for the NEXT connect without
+      // disturbing the consoles already open -- no parking, nothing to drain.
+      holder.reconfigure(policyFromSettings(next, resolved.sessionIdleSweepMs))
     })
     ctx.effect(() => policyWatch, 'dsh-console-hub: policy watch')
 
@@ -398,8 +387,11 @@ function installApi(
     get credentials(): ConsoleCredentialProvider | undefined {
       return ctx.get<ConsoleCredentialProvider>('credentials')
     },
-    // Read through the holder on EVERY call: a deferred policy change replaces
-    // the instance, and a captured reference would keep serving the disposed one.
+    // Read through the holder on EVERY call. The holder now mutates its manager
+    // in place rather than replacing it, so this is belt-and-braces -- but a
+    // captured reference is exactly the bug this plugin has already shipped
+    // twice (the settings cache and the credential seam), and reading through
+    // the holder costs nothing.
     get manager(): PortManager {
       return holder.get()
     },
