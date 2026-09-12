@@ -129,12 +129,22 @@ settings seam 的两个写路径语义不同，选错**不会报错**，只会�
 
 所以 `applySettingsPatch` 一律走 `replace`。这条不能用测试替身保证：替身当初写的是
 `{ ...document, ...patch }`（顶层浅覆盖，"能删"），而真实的 `mergeLayers` 不能——
-**替身比真东西宽松，于是 bug 全绿通过**。现在替身逐字复刻 `mergeLayers`，并且有一个
-直接加载已安装 seam 源码来复核的脚本：
+**替身比真东西宽松，于是 bug 全绿通过**。现在替身逐字复刻 `mergeLayers`，并且有两个
+直接加载**已安装** seam 的闸门：
 
 ```sh
 node scripts/verify-settings-merge.mjs   # 从 profile 里读真实 seam，证明只有 replace 能删
+pnpm test settings-seam                  # 用真实 settings 服务跑整条 config.remove 路径
 ```
+
+`tests/settings-seam.spec.ts` 是**唯一**不依赖替身的用例：它加载部署里那个真正的
+`@deepseek-ai/dsh-settings`，把插件的真实命名空间注册上去，然后走插件的真实路由，
+断言**provider 存下来的文档**里那条设备真的没了。`dsh-settings` 不是本插件的依赖
+（它是宿主在运行时提供的），所以没有部署时该套件会**显式 skip 并打印原因**，
+不会静默变成"通过"。
+
+它抓到的正是替身抓不到的那一类：把 `applySettingsPatch` 改回 `update`，这套用例立刻
+红——而 `tests/routes.spec.ts` 里的替身版本仍然全绿。
 
 ## 真机实测结论（重要）
 
