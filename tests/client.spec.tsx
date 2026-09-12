@@ -100,6 +100,31 @@ describe('consoleTabDescriptor', () => {
     const descriptor = consoleTabDescriptor({} as never)
     expect(descriptor.hidden).not.toBe(true)
   })
+
+  it('declares its settings as rows ONLY, never also as a custom panel', () => {
+    // The rendered defect: the descriptor declared `pluginToggles` and ALSO a
+    // `settings.render` that drew the same four controls, and the shell renders
+    // the rows and then the custom panel -- so every option appeared twice,
+    // stacked, in the side card.
+    //
+    // The rows are the shell-native path (it persists them itself), so the
+    // custom panel must be absent. The declared type no longer even has a
+    // `render` member, which is the compile-time half of this guarantee; the
+    // runtime cast below keeps the assertion honest for a future edit that
+    // widens that type back.
+    const descriptor = consoleTabDescriptor({} as never)
+    expect(descriptor.settings?.pluginToggles?.length).toBeGreaterThan(0)
+    const settings = descriptor.settings as { render?: unknown } | undefined
+    expect(settings?.render).toBeUndefined()
+  })
+
+  it('declares each settings row exactly once', () => {
+    // A duplicate key would render two controls bound to one value, which is
+    // the same duplication from the other direction.
+    const descriptor = consoleTabDescriptor({} as never)
+    const keys = (descriptor.settings?.pluginToggles ?? []).map(row => row.key)
+    expect(new Set(keys).size).toBe(keys.length)
+  })
 })
 
 describe('shouldPoll', () => {

@@ -17,6 +17,7 @@
  */
 import { useCallback, useEffect, useRef, useState, type ReactElement } from 'react'
 import { HubApiError } from './api.ts'
+import { ConsoleBuffers } from './buffer.ts'
 import type { ClientTabPropsLike, ConsoleHub, ConsoleRow, ViewRow } from './hub.ts'
 import { shouldPoll } from './poll.ts'
 import { uiPrefs } from './prefs.ts'
@@ -99,12 +100,16 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
   const [paging, setPaging] = useState(false)
   const [prefs, setPrefs] = useState(() => uiPrefs.get())
 
-  // The cursor lives in a ref, not state: it changes on every read, and putting
-  // it in the poll effect's dependencies would tear down and rebuild the
-  // interval after each one.
+  // One buffer per console, held in a ref: a read appends on every tick, and
+  // routing that through state for a console the user is not looking at would
+  // re-render the whole tab per byte for no visible change. `output` above is
+  // the VIEW of whichever buffer is selected, which is the only part React
+  // needs to re-render. The cursor lives beside the text it produced, and in a
+  // ref for the same reason: it changes on every read, so putting it in the
+  // poll effect's dependencies would rebuild the interval after each one.
   const cursorRef = useRef(0)
+  const buffersRef = useRef(new ConsoleBuffers())
   const outputRef = useRef<HTMLPreElement | null>(null)
-
   useEffect(() => uiPrefs.subscribe(setPrefs), [])
 
   /**
@@ -124,7 +129,15 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
       hub.listConsoles(sessionId),
     ])
     if (inventory.status === 'fulfilled') setViews(inventory.value.views)
-    if (live.status === 'fulfilled') setConsoles(live.value.consoles)
+    if (live.status === 'fulfilled') {
+      setConsoles(live.value.consoles)
+      // Forget consoles that ended elsewhere (closed from another surface, or
+      // idle-reaped), so their output does not sit in memory for the life of
+      // the tab. Safe to do unconditionally: the host's list is authoritative
+      // for what is live, and a console missing from it can never be selected
+      // again.
+      buffersRef.current.retainOnly(live.value.consoles.map(row => row.consoleId))
+    }
     // Report whichever failed, so a broken read is never mistaken for an empty
     // result -- but only after the successful half has been applied.
     const failures: string[] = []
@@ -137,12 +150,22 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
     void refresh()
   }, [refresh])
 
-  /** Select a console and restart the read cursor for it. */
+  /**
+   * Select a console and show ITS buffered output.
+   *
+   * Nothing is cleared and nothing is re-read. The cursor advances only from a
+   * real read, so it is already correct for a console the user is returning to;
+   * clearing it would re-deliver output already shown, and resetting the text
+   * to empty is what produced the `(暂无输出)` flash on every switch.
+   *
+   * @param consoleId - the console to select.
+   */
   const select = useCallback((consoleId: string) => {
     setSelected(consoleId)
-    setOutput('')
-    setPaging(false)
-    cursorRef.current = 0
+    const buffered = buffersRef.current.get(consoleId)
+    setOutput(buffered.text)
+    setPaging(buffered.paging)
+    cursorRef.current = buffered.cursor
   }, [])
 
   /** Connect one saved view, or an ad-hoc host/port. */
@@ -174,20 +197,29 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
       // A failed connect is a result, not an exception: render it rather than
       // throwing the banner away.
       if (entry.lastError !== null) setError(`${entry.lastError.code}: ${entry.lastError.message}`)
-      select(entry.consoleId)
-      if (entry.banner !== '') setOutput(entry.banner)
+      // No buffer seeding here. The banner is decoded from the host's own
+      // scrollback, so a first read at cursor 0 returns those same bytes --
+      // seeding them and then reading would render the banner TWICE. The
+      // immediate read that `select` triggers delivers it exactly once. The
+      // banner itself is still surfaced through the connect result, which is
+      // what the model-facing tool reports.
+      // Honour the tab's own setting. The row existed but nothing read it, so
+      // turning it off changed nothing: a connect always stole the selection.
+      if (prefs.openOnConnect) select(entry.consoleId)
       await refresh()
     } catch (failure) {
       setError(messageOf(failure))
     } finally {
       setBusy(false)
     }
-  }, [hub, sessionId, refresh, select])
+  }, [hub, sessionId, refresh, select, prefs.openOnConnect])
 
   const closeConsole = useCallback(async (consoleId: string, force: boolean) => {
     setBusy(true)
     try {
       await hub.close(sessionId, consoleId, force)
+      // A closed console's output is unreachable, so holding it would only leak.
+      buffersRef.current.clear(consoleId)
       if (selected === consoleId) {
         setSelected(undefined)
         setOutput('')
@@ -210,23 +242,36 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
    * the list kept listing it because polling never refreshed the inventory.
    * Drop it, refresh, and keep going.
    */
-  const readOnce = useCallback(async () => {
-    if (selected === undefined) return
+  const readOnce = useCallback(async (consoleId?: string) => {
+    // Defaults to the selection, but a caller that just sent a command knows
+    // which console it wrote to and passes it explicitly -- so a switch racing
+    // the read cannot append one console's output to another's buffer.
+    const target = consoleId ?? selected
+    if (target === undefined) return
     try {
-      const result = await hub.read(sessionId, selected, cursorRef.current)
-      cursorRef.current = result.cursor
-      if (result.text !== '') setOutput(previous => previous + result.text)
-      setPaging(result.paging.active)
+      const result = await hub.read(sessionId, target, buffersRef.current.get(target).cursor)
+      const next = buffersRef.current.append(target, result.text, result.cursor, result.paging.active)
+      if (target === selected) {
+        // Only the visible console drives React state; the others keep
+        // accumulating in the ref and are rendered the moment they are shown.
+        setOutput(next.text)
+        setPaging(next.paging)
+        cursorRef.current = next.cursor
+      }
       if (result.paging.active && result.paging.reason === 'max-pages') {
         setStatus('自动翻页达到页数上限，点击“继续翻页”接着读。')
       }
     } catch (failure) {
       if (isGone(failure)) {
-        // The console ended elsewhere. Clear the selection so the poll stops, and
-        // re-read the inventory so the list agrees with the host.
-        setSelected(undefined)
-        setOutput('')
-        setPaging(false)
+        // The console ended elsewhere. Drop its buffer, clear the selection so
+        // the poll stops, and re-read the inventory so the list agrees with the
+        // host.
+        buffersRef.current.clear(target)
+        if (target === selected) {
+          setSelected(undefined)
+          setOutput('')
+          setPaging(false)
+        }
         setStatus('该控制台已结束（被关闭或已超时回收）。')
         setError(null)
         await refresh()
@@ -236,11 +281,29 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
     }
   }, [hub, sessionId, selected, refresh])
 
+  // Read IMMEDIATELY on selection change, then let the interval take over.
+  //
+  // Without this a switch to a console that has never been read shows an empty
+  // pane until the next tick -- up to a full poll interval of nothing. Cached
+  // consoles are already rendered by `select`, so this only fills in the gap
+  // for one that is new (or that grew while the user looked elsewhere).
+  useEffect(() => {
+    if (selected === undefined) return
+    void readOnce(selected)
+    // Deliberately keyed on `selected` alone: `readOnce` changes whenever the
+    // live selection does, so including it would re-run this on every tick and
+    // turn the poll into a double read.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selected])
+
   // The read loop. `visible` is part of the condition, not just a dependency:
   // a hidden tab stays mounted in this shell and must not keep polling.
   useEffect(() => {
     if (!shouldPoll({ visible, consoleId: selected })) return undefined
     const timer = setInterval(() => {
+      // Read the LIVE selection, not the one captured when the interval was
+      // built: `readOnce` defaults to it, so a switch is picked up on the next
+      // tick without rebuilding the interval.
       void readOnce()
     }, prefs.pollIntervalMs)
     return () => {
@@ -267,7 +330,7 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
       })
       setDraft('')
       setPending(undefined)
-      await readOnce()
+      await readOnce(selected)
     } catch (failure) {
       setError(messageOf(failure))
     } finally {
@@ -308,7 +371,7 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
     try {
       await hub.control(sessionId, selected, 'drain')
       setPaging(false)
-      await readOnce()
+      await readOnce(selected)
     } catch (failure) {
       setError(messageOf(failure))
     }

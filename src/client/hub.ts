@@ -14,7 +14,6 @@
 import { createElement } from 'react'
 import type { ApiClient } from './api.ts'
 import { ConsoleHubView } from './ConsoleHubView.tsx'
-import { ConsoleSettingsPanel } from './SettingsPanel.tsx'
 
 /** The tab type this plugin registers. */
 export const CONSOLE_TAB_ID = 'dsh-console-hub:consoles'
@@ -72,14 +71,12 @@ export interface ClientSettingRow {
   options?: readonly { value: string | number | boolean, title: string | (() => string) }[]
 }
 
-/** Props a settings renderer receives. */
-export interface ClientSettingsProps {
-  pluginSettings: Record<string, unknown>
-  updatePluginSetting(key: string, value: unknown): void
-  close(): void
-}
-
-/** The tab descriptor this plugin registers. */
+/**
+ * The tab descriptor this plugin registers.
+ *
+ * `settings` declares `pluginToggles` and nothing else: the custom-panel half
+ * is deliberately absent, because declaring both showed every control twice.
+ */
 export interface ClientTabDescriptor {
   id: string
   title: string | (() => string)
@@ -91,9 +88,14 @@ export interface ClientTabDescriptor {
   dedupeKey: (tab: ClientTabLike) => string
   settings: {
     pluginToggles: readonly ClientSettingRow[]
-    render: (props: ClientSettingsProps) => unknown
   }
   component: (props: ClientTabPropsLike) => unknown
+}
+
+/** The `ctx.betterSidebar` slice this plugin uses. */
+/** The sidebar snapshot slice this plugin reads its own prefs from. */
+export interface SidebarSnapshotLike {
+  prefs: { pluginSettings: Record<string, Record<string, unknown>> }
 }
 
 /** The `ctx.betterSidebar` slice this plugin uses. */
@@ -104,6 +106,14 @@ export interface BetterSidebarLike {
   openTab(seed: { type: string, title?: string, id?: string }, scope?: ClientScopeLike): void
   updateTab(tabId: string, patch: { title?: string, path?: string, meta?: unknown }): void
   closeTab(tabId: string, scope?: ClientScopeLike): void
+  /**
+   * The current snapshot, carrying the side card prefs. Optional because it
+   * arrives with a sidebar version this plugin may predate; a missing one
+   * leaves the tab on its defaults rather than failing to render.
+   */
+  getSnapshot?(): SidebarSnapshotLike
+  /** Subscribe to snapshot changes (session switch, prefs writes). */
+  subscribeState?(listener: () => void): () => void
 }
 
 // ── Wire shapes ─────────────────────────────────────────────────────────────
@@ -368,9 +378,14 @@ export function consoleTabDescriptor(hub: ConsoleHub): ClientTabDescriptor {
     // than starting a second poll loop.
     single: true,
     dedupeKey: () => CONSOLE_TAB_ID,
+    // Declarative rows ONLY. This descriptor once declared `pluginToggles`
+    // AND rendered the same four controls through `settings.render`, and the
+    // shell renders the rows and then the custom panel -- so every option
+    // appeared twice, stacked. The rows are the shell-native path (it persists
+    // them to `pluginSettings[<id>]` itself), so the custom panel is what goes;
+    // the tab now reads those same values back out of the sidebar snapshot.
     settings: {
       pluginToggles: settingsRows(),
-      render: props => createElement(ConsoleSettingsPanel, props),
     },
     component: props => createElement(ConsoleHubView, { ...props, hub }),
   }

@@ -331,6 +331,43 @@ describe('capability gating', () => {
     await flush()
     expect(injected).not.toContain('approval')
   })
+
+  it('finds the credential seam even when it activates after the API is installed', async () => {
+    // The reported crash, reproduced at the level it happened: the API table was
+    // built with a ONE-TIME `ctx.get('credentials')` while only `settings` is
+    // injected, so a provider that activated a moment later was never seen and
+    // deleting a view threw "Cannot read properties of undefined (reading
+    // 'deleteRecord')".
+    //
+    // The service is therefore registered AFTER `apply` has run: a lazy lookup
+    // finds it, a captured one cannot.
+    const settings = settingsService()
+    const server = webServer()
+    const services: Record<string, unknown> = { settings: settings.service, webServer: server.service }
+    const { ctx, flush } = fakeContext(services)
+    apply(ctx)
+    await flush()
+
+    // The provider arrives late, exactly as Cordis activates an independent row.
+    services.credentials = credentials()
+
+    await settings.write({ views: { fw1: { name: 'FW1', host: '10.133.6.253', port: 10003, kind: 'telnet' } } })
+    const route = server.routes[0] as ConsoleWebRoute
+
+    // A credential write proves the seam was reached: with a captured
+    // `undefined` this answers 500/credential-rejected instead of 200.
+    const set = await callRoute(route, 'secret.set', {
+      sessionId: 'session-a',
+      viewId: 'fw1',
+      password: 'late-provider',
+    })
+    expect(set.status).toBe(200)
+
+    // And the delete that started this: it must not throw.
+    const removed = await callRoute(route, 'config.remove', { sessionId: 'session-a', viewId: 'fw1' })
+    expect(removed.status).toBe(200)
+    expect((removed.body as { value: { removed: boolean } }).value.removed).toBe(true)
+  })
 })
 
 /** Send one call through a registered route. */

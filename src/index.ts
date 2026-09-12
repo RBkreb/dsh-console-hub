@@ -383,9 +383,17 @@ function installApi(
 
   const hub: ConsoleHubApi = {
     settings: settingsFace,
-    // The credential seam is optional: `secrets.ts` reads an absent provider as
-    // "no credential configured", so devices needing no login still work.
-    credentials: ctx.get<ConsoleCredentialProvider>('credentials') as ConsoleCredentialProvider,
+    // Read on EVERY call, never captured: Cordis resolves a service only once
+    // its providing fiber is ACTIVE, and this plugin does not inject
+    // `credentials`. It injects only `settings`, so this table is built while
+    // the credentials provider may still be activating -- a one-time read
+    // stored `undefined` and every credential path then threw
+    // "Cannot read properties of undefined (reading 'deleteRecord')".
+    // `sessionExists` below reads ITS service the same way, for the same
+    // reason.
+    get credentials(): ConsoleCredentialProvider | undefined {
+      return ctx.get<ConsoleCredentialProvider>('credentials')
+    },
     // Read through the holder on EVERY call: a deferred policy change replaces
     // the instance, and a captured reference would keep serving the disposed one.
     get manager(): PortManager {

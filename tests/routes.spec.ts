@@ -101,15 +101,50 @@ function manager(): PortManager {
   })
 }
 
-/** The dependencies one API needs. */
-function apiFor(options: { settings?: ReturnType<typeof fakeSettings>, credentials?: ConsoleCredentialProvider } = {}): {
+/**
+ * The dependencies one API needs, as built from the fakes in this file.
+ *
+ * `credentials` distinguishes "not supplied" (use the standard fake) from an
+ * EXPLICIT `undefined` (a composition that mounts no provider). Those were once
+ * the same expression, `options.credentials ?? fakeCredentials()`, which
+ * quietly substituted a provider for an explicit `undefined` -- so no test in
+ * this file could express the state that produced a real crash.
+ *
+ * The two overloads keep the return type honest: asking for the absent provider
+ * yields `undefined`, everything else yields the fake.
+ *
+ * @param options - the dependencies to override.
+ * @returns the API plus the fakes it was built from.
+ */
+function apiFor(options: {
+  settings?: ReturnType<typeof fakeSettings>
+  credentials: undefined
+}): {
+  api: ConsoleHubApi
+  settings: ReturnType<typeof fakeSettings>
+  credentials: undefined
+  manager: PortManager
+}
+function apiFor(options?: {
+  settings?: ReturnType<typeof fakeSettings>
+  credentials?: ConsoleCredentialProvider
+}): {
   api: ConsoleHubApi
   settings: ReturnType<typeof fakeSettings>
   credentials: ConsoleCredentialProvider
   manager: PortManager
+}
+function apiFor(options: {
+  settings?: ReturnType<typeof fakeSettings>
+  credentials?: ConsoleCredentialProvider | undefined
+} = {}): {
+  api: ConsoleHubApi
+  settings: ReturnType<typeof fakeSettings>
+  credentials: ConsoleCredentialProvider | undefined
+  manager: PortManager
 } {
   const settings = options.settings ?? fakeSettings()
-  const credentials = options.credentials ?? fakeCredentials()
+  const credentials = 'credentials' in options ? options.credentials : fakeCredentials()
   const ports = manager()
   return {
     api: {
@@ -311,6 +346,56 @@ describe('config.* methods', () => {
     expect(await credentials.readRecord('dsh-console-hub/c1')).toBeUndefined()
     const again = await call(api, 'config.remove', { sessionId: 'session-a', viewId: 'v-1' })
     expect(again.status).toBe(404)
+  })
+
+  it('removes a view even when no credential provider is mounted', async () => {
+    // The reported crash: `api.credentials` was read ONCE when the plugin
+    // installed its API, while `settings` alone is injected -- so in a profile
+    // whose credentials provider had not yet activated, the captured value was
+    // `undefined` and deleting a view threw
+    // "Cannot read properties of undefined (reading 'deleteRecord')".
+    //
+    // Every other case here supplies a provider, so the fake could not express
+    // this state at all. A composition with no credential store is legitimate
+    // (devices needing no login work in one), and a delete must still succeed:
+    // a credential cannot exist in a store that does not.
+    const { api } = apiFor({ credentials: undefined })
+    const created = await call(api, 'config.upsert', { sessionId: 'session-a', viewId: 'v-1', ...VIEW_INPUT })
+    expect(created.status).toBe(200)
+
+    const removed = await call(api, 'config.remove', { sessionId: 'session-a', viewId: 'v-1' })
+    expect(removed.status).toBe(200)
+    expect((removed.body as { value: { removed: boolean, secretRemoved: boolean } }).value)
+      .toEqual({ removed: true, secretRemoved: false })
+  })
+
+  it('lists a view with no credential when no provider is mounted', async () => {
+    // The read half of the same state: the inventory must still render, with
+    // the row reporting no credential rather than failing the whole list.
+    const { api } = apiFor({ credentials: undefined })
+    await call(api, 'config.upsert', { sessionId: 'session-a', viewId: 'v-1', ...VIEW_INPUT })
+    const listed = await call(api, 'config.list', { sessionId: 'session-a' })
+    expect(listed.status).toBe(200)
+    const value = (listed.body as { value: { views: Array<{ view: { secretConfigured: boolean } }> } }).value
+    expect(value.views[0]?.view.secretConfigured).toBe(false)
+  })
+
+  it('names the missing provider instead of crashing when a password is supplied', async () => {
+    // Fail closed and say why: a password with nowhere to go must not appear to
+    // have been stored.
+    const { api } = apiFor({ credentials: undefined })
+    await call(api, 'config.upsert', { sessionId: 'session-a', viewId: 'v-1', ...VIEW_INPUT })
+    const refused = await call(api, 'secret.set', {
+      sessionId: 'session-a',
+      viewId: 'v-1',
+      password: 'nowhere-to-go',
+    })
+    expect(refused.status).toBe(400)
+    const body = refused.body as { error: { code: string, message: string } }
+    expect(body.error.code).toBe('credential-rejected')
+    expect(body.error.message).toMatch(/no credential provider/i)
+    // The value must not travel back out on the failure path.
+    expect(JSON.stringify(refused.body)).not.toContain('nowhere-to-go')
   })
 })
 

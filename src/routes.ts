@@ -47,7 +47,15 @@ export interface HubSettingsFace {
 /** Everything the API methods need from the host. */
 export interface ConsoleHubApi {
   settings: HubSettingsFace
-  credentials: ConsoleCredentialProvider
+  /**
+   * The credential seam, or `undefined` in a composition that mounts none.
+   *
+   * Deliberately optional rather than required: devices needing no login work
+   * without one, and `secrets.ts` reads absence as "no credential configured".
+   * Every consumer must therefore handle it -- a delete of a view whose
+   * credential cannot exist is a no-op, not a crash.
+   */
+  credentials: ConsoleCredentialProvider | undefined
   manager: PortManager
   /** Cap on one request body. */
   requestBodyLimitBytes: number

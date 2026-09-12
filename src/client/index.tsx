@@ -41,10 +41,24 @@ const hub = createConsoleHub(api)
  * @returns a disposer that unregisters the tab, or `undefined` when the service
  *   is not available yet (in which case `ctx.inject` retries when it appears).
  */
-function mount(ctx: { get<T = unknown>(name: string): T | undefined }): (() => void) | undefined {
-  const sidebar = ctx.get<BetterSidebarLike>('betterSidebar')
-  if (sidebar === undefined || typeof sidebar.registerTab !== 'function') return undefined
-  return sidebar.registerTab(consoleTabDescriptor(hub))
+function mount(sidebar: BetterSidebarLike): (() => void) | undefined {
+  if (typeof sidebar.registerTab !== 'function') return undefined
+  const disposeTab = sidebar.registerTab(consoleTabDescriptor(hub))
+  // Seed the tab's prefs from the sidebar's OWN persisted blob, then keep them
+  // in step. The settings panel used to do this push -- and also rendered a
+  // second copy of every control, so it is gone and its one useful side effect
+  // moves here. The tab receives no prefs prop, so the snapshot is the only
+  // place it can see what the declarative rows persisted.
+  const readPrefs = (): void => {
+    const blob = sidebar.getSnapshot?.().prefs.pluginSettings[CONSOLE_TAB_ID]
+    if (blob !== undefined) applyStoredPrefs(blob)
+  }
+  readPrefs()
+  const disposePrefs = sidebar.subscribeState?.(readPrefs)
+  return () => {
+    disposePrefs?.()
+    disposeTab()
+  }
 }
 
 /** Client plugin body. */
@@ -58,17 +72,23 @@ export function apply(ctx: unknown): void {
   // Prefer `inject`: it re-runs the callback when the service is replaced (HMR,
   // profile switch), and its disposer unregisters the tab with the fiber.
   if (typeof context.inject === 'function') {
-    context.inject(['betterSidebar'], inner => mount(inner as never))
+    context.inject(['betterSidebar'], inner => {
+      const sidebar = (inner as { get<T = unknown>(name: string): T | undefined })
+        .get<BetterSidebarLike>('betterSidebar')
+      return sidebar === undefined ? undefined : mount(sidebar)
+    })
     return
   }
-  mount(context)
+  const sidebar = context.get<BetterSidebarLike>('betterSidebar')
+  if (sidebar !== undefined) mount(sidebar)
 }
 
 /**
  * Seed the shared UI prefs from the shell's persisted plugin settings.
  *
- * Exported so the settings panel (which receives the bag as a prop) and this
- * entry agree on how a stored value becomes a preference.
+ * The settings rows write into `pluginSettings[<tab id>]` inside the sidebar's
+ * own prefs document; this is how those values reach the tab, which receives no
+ * prefs prop of its own.
  *
  * @param settings - the shell's opaque per-plugin settings bag.
  */

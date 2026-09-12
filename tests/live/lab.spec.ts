@@ -18,9 +18,21 @@
  * rather than aspirational): both devices send ONLY the Telnet negotiation
  * burst on connect -- 6 bytes, no banner, no prompt -- and stay completely
  * silent until a key is pressed. One bare Enter produces their prompt
- * (`<DUT1>` on the firewall, `<SWITCH>` on the switch). That is why
+ * (`<DUT1>` on the firewall, `[SWITCH]` on the switch). That is why
  * `wakeOnConnect` exists and why the assertions below never expect a banner
  * without it.
+ *
+ * Measured later, and worth keeping: the two devices come up in DIFFERENT
+ * views. The firewall lands in its USER view (`<DUT1>`) and the switch in its
+ * CONFIG view (`[SWITCH]`); `conf-mode` is what moves between them. Both are
+ * ordinary prompts, which is why {@link DEFAULT_PROMPT_PATTERN} accepts either
+ * bracket pair -- narrowing it to one would break one of these two devices.
+ *
+ * Also measured: the wake Enter is answered in ~35-45ms by both (see
+ * `scripts/probe-wake.mjs`), well inside the 300ms window `open()` allows, so a
+ * woken console reliably reports its prompt. And a command sent WITHOUT any wake
+ * still executes in full -- the devices do not swallow the first line. What a
+ * silent connect costs is the PROMPT, not the command.
  */
 import { describe, expect, it } from 'vitest'
 import { PortManager } from '../../src/port-manager.ts'
@@ -154,7 +166,19 @@ describe.runIf(LIVE)('live console lab', () => {
       })
       expect(entry.lastError).toBeNull()
       const detail = ports.describe('live', entry.consoleId)
-      expect(detail?.state.prompt).toBe('<SWITCH>')
+      // The switch answers in its CONFIG view -- `[SWITCH]` -- where the firewall
+      // answers in its USER view -- `<DUT1>`. That is the `<>` / `[]` distinction
+      // these devices use: square brackets mean the config view, angle brackets
+      // the user view, and `conf-mode` is what moves between them. Both are
+      // ordinary prompts, which is exactly why the shipped pattern accepts
+      // either (`[<\[] ... [>\]]`) and must not be narrowed to one pair.
+      //
+      // This assertion used to read `<SWITCH>`, which the device never emits: it
+      // pinned a bracket the hardware does not use, so it failed against a
+      // WORKING console. Assert the shape instead of a fixed spelling, so a
+      // device that comes up in either view passes while one that comes up in
+      // neither still fails.
+      expect(detail?.state.prompt).toMatch(/^[<[][\w.-]+[>\]]$/)
     } finally {
       await ports.dispose()
     }

@@ -85,19 +85,25 @@ function grantOf(payload: ConsoleSecretPayload): ConsoleCredentialRecord {
 
 /**
  * Store (or replace) the credential for one view.
- * @param credentials - the credential seam.
+ * @param credentials - the credential seam, when the deployment has one.
  * @param viewId - the view whose credential this is.
  * @param secret - the password and optional user.
- * @throws {TypeError} when the password is empty.
- * @throws {Error} when the store refuses the write (read-only shadow, absent provider).
+ * @throws {TypeError} when the password is empty, or when no provider is mounted.
+ * @throws {Error} when the store refuses the write (read-only shadow).
  */
 export async function writeSecret(
-  credentials: ConsoleCredentialProvider,
+  credentials: ConsoleCredentialProvider | undefined,
   viewId: string,
   secret: { password: string, user?: string },
 ): Promise<void> {
   if (typeof secret.password !== 'string' || secret.password === '') {
     throw new TypeError('console-hub: a credential password must be a non-empty string')
+  }
+  if (credentials === undefined) {
+    // Naming the missing capability beats the TypeError a member access would
+    // raise: that one reads as a bug in this plugin rather than as a
+    // composition that simply has no credential provider.
+    throw new TypeError('console-hub: no credential provider is mounted, so a password cannot be stored')
   }
   const payload: ConsoleSecretPayload = {
     version: 1,
@@ -110,11 +116,21 @@ export async function writeSecret(
 }
 
 /**
- * Remove one view's credential. Removing an absent one is a no-op.
- * @param credentials - the credential seam.
+ * Remove one view's credential. Removing an absent one is a no-op -- and so is
+ * removing one when no provider is mounted, because a record can only exist in
+ * a store that exists.
+ *
+ * The absent case is explicit rather than left to a caught member access: this
+ * is the call a view deletion makes, and a deletion that has already removed
+ * the view must not fail over a credential that was never there.
+ * @param credentials - the credential seam, when the deployment has one.
  * @param viewId - the view whose credential to drop.
  */
-export async function clearSecret(credentials: ConsoleCredentialProvider, viewId: string): Promise<void> {
+export async function clearSecret(
+  credentials: ConsoleCredentialProvider | undefined,
+  viewId: string,
+): Promise<void> {
+  if (credentials === undefined) return
   await credentials.deleteRecord(secretKeyOfView(viewId))
 }
 
@@ -125,9 +141,13 @@ export async function clearSecret(credentials: ConsoleCredentialProvider, viewId
  * @returns the payload, or `undefined` when none is stored or the store is unreadable.
  */
 export async function readSecret(
-  credentials: ConsoleCredentialProvider,
+  credentials: ConsoleCredentialProvider | undefined,
   viewId: string,
 ): Promise<ConsoleSecretPayload | undefined> {
+  // Absence is answered directly instead of letting a member access throw into
+  // the catch below: that catch turns anything into "no credential", which is
+  // the one answer that must never be a guess.
+  if (credentials === undefined) return undefined
   try {
     const record = await credentials.readRecord(secretKeyOfView(viewId))
     if (record === undefined) return undefined
@@ -146,10 +166,13 @@ export async function readSecret(
  * @returns configured/source/writable facts; never the value.
  */
 export async function describeSecret(
-  credentials: ConsoleCredentialProvider,
+  credentials: ConsoleCredentialProvider | undefined,
   viewId: string,
 ): Promise<ConsoleCredentialInfo & { recordConfigured: boolean }> {
   const ref = secretRefOfView(viewId)
+  // No provider is not the same as an empty store, but both mean the same thing
+  // to a configuration surface: nothing to show, and nothing it can write.
+  if (credentials === undefined) return { configured: false, writable: false, recordConfigured: false }
   try {
     const info = await credentials.describe(ref as never)
     const record = await credentials.readRecord(secretKeyOfView(viewId))
@@ -184,10 +207,11 @@ export async function describeSecret(
  * @returns the resolved credential, or `undefined` when none is configured.
  */
 export async function resolveSecret(
-  credentials: ConsoleCredentialProvider,
+  credentials: ConsoleCredentialProvider | undefined,
   viewId: string,
   fallbackUser?: string,
 ): Promise<ConsoleResolvedSecret | undefined> {
+  if (credentials === undefined) return undefined
   const record = await readSecret(credentials, viewId)
 
   let ambient: string | undefined
