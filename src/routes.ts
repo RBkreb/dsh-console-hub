@@ -100,6 +100,12 @@ function defaultsFor(settings: ConsoleHubSettings): {
   highRiskPatterns: string[]
   promptPattern: string
   pagerPattern: string
+  /** Marker text a device prints when it half-closed an idle console. */
+  dormantPattern: string
+  /** Whether that marker is answered with one bare Enter. */
+  dormantAutoWake: boolean
+  /** Idle input milliseconds before a keepalive Enter; `0` disables it. */
+  dormantProbeMs: number
   /** Whether a silent console is woken with one bare Enter on connect. */
   wakeOnConnect: boolean
   connectTimeoutMs: number
@@ -120,6 +126,9 @@ function defaultsFor(settings: ConsoleHubSettings): {
     highRiskPatterns: [...settings.highRiskPatterns],
     promptPattern: settings.promptPattern,
     pagerPattern: settings.pagerPattern,
+    dormantPattern: settings.dormantPattern,
+    dormantAutoWake: settings.dormantAutoWake,
+    dormantProbeMs: settings.dormantProbeMs,
     wakeOnConnect: settings.wakeOnConnect,
     connectTimeoutMs: settings.connectTimeoutMs,
     readTimeoutMs: settings.readTimeoutMs,

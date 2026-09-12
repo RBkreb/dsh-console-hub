@@ -12,7 +12,7 @@
  *
  * @module dsh-console-hub/port-manager
  */
-import { compilePattern, type PagingMode, type ConsoleKind } from './config-shared.ts'
+import { compilePattern, compileSearchPattern, type PagingMode, type ConsoleKind } from './config-shared.ts'
 import { ConsoleSession, type ConsoleSessionState } from './session.ts'
 
 /** Everything needed to open one console. */
@@ -59,6 +59,16 @@ export interface ConsoleEntry {
   state: ConsoleSessionState['state']
   /** Terminal failure, when one happened. */
   lastError: ConsoleSessionState['lastError']
+  /**
+   * Whether the DEVICE has half-closed this console while the socket stayed up.
+   *
+   * Surfaced on the entry, not only in the detailed status, because it changes
+   * what a caller should DO: a dormant console answers nothing until someone
+   * presses Enter, so a list showing `open` is actively misleading without it.
+   */
+  dormant: boolean
+  /** The marker text that proved it, when it is dormant. */
+  dormantText: string | null
   /** Milliseconds since the last read or write. */
   idleMs: number
   /** Session start (ISO). */
@@ -82,6 +92,12 @@ export interface PortManagerOptions {
   pagingQuietMs: number
   /** Prompt pattern source, compiled per console (a view may override it). */
   promptPattern: string
+  /** Marker source for a device that half-closed an idle console. */
+  dormantPattern: string
+  /** Whether a detected dormancy is answered with one bare Enter. */
+  dormantAutoWake: boolean
+  /** Idle milliseconds before a keepalive Enter; `0` disables it. */
+  dormantProbeMs: number
   /**
    * Send one bare Enter when a device says nothing on connect.
    *
@@ -203,6 +219,11 @@ export class PortManager {
       pagingQuietMs: this.options.pagingQuietMs,
       promptPattern: descriptor.promptPattern ?? compilePattern(this.options.promptPattern),
       pagerPattern: descriptor.pagerPattern ?? compilePattern(this.options.pagerPattern),
+      // SEARCH-compiled: the half-close marker is printed mid-stream, so the
+      // tail-anchored `compilePattern` would never see it.
+      dormantPattern: compileSearchPattern(this.options.dormantPattern),
+      dormantAutoWake: this.options.dormantAutoWake,
+      dormantProbeMs: this.options.dormantProbeMs,
       scrollbackLimitBytes: this.options.scrollbackLimitBytes,
       outputLimitBytes: this.options.outputLimitBytes,
       // Wake a console that says nothing on connect. Some console servers (both
@@ -222,6 +243,8 @@ export class PortManager {
       secure: descriptor.password !== undefined && descriptor.password !== '',
       state: 'connecting',
       lastError: null,
+      dormant: false,
+      dormantText: null,
       idleMs: 0,
       createdAt: new Date().toISOString(),
     }
@@ -386,6 +409,25 @@ export class PortManager {
   }
 
   /**
+   * Send one bare Enter to wake a console the device half-closed, or to keep an
+   * idle one from timing out.
+   *
+   * The session decides what the evidence is; the manager only routes it, so the
+   * panel, the routes and the model all ask the same question in the same way.
+   *
+   * @param ownerSessionId - the requesting session.
+   * @param consoleId - the console handle.
+   * @returns whether the device answered the Enter.
+   * @throws {Error} when the console is unknown to this owner.
+   */
+  async wake(ownerSessionId: string, consoleId: string): Promise<boolean> {
+    const tracked = this.require(ownerSessionId, consoleId)
+    const answered = await tracked.session.wake('probe')
+    this.refresh(consoleId)
+    return answered
+  }
+
+  /**
    * Close one console and drop it from the registry.
    * @param ownerSessionId - the requesting session.
    * @param consoleId - the console handle.
@@ -463,6 +505,8 @@ export class PortManager {
       state: live.state,
       lastError: live.lastError,
       idleMs: live.idleMs,
+      dormant: live.dormancy.dormant,
+      dormantText: live.dormancy.marker,
     }
     return tracked.entry
   }

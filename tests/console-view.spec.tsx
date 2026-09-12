@@ -576,7 +576,7 @@ describe('the input keeps focus across a send', () => {
     })
     fireEvent.click(view.getByText('FW1-focus'))
 
-    const input = view.getByPlaceholderText('输入命令后回车（不发换行前请留空）') as HTMLInputElement
+    const input = view.container.querySelector('[data-console-hub-input="command"]') as HTMLInputElement
     input.focus()
     expect(document.activeElement).toBe(input)
 
@@ -612,9 +612,15 @@ describe('the engine settings controls', () => {
    *
    * @returns the hub plus the updates it saw.
    */
-  function settingsHub(): { hub: ConsoleHub, updates: Array<Record<string, unknown>> } {
+  function settingsHub(options: {
+    dormantAutoWake?: boolean
+    dormantProbeMs?: number
+    dormant?: boolean
+  } = {}): { hub: ConsoleHub, updates: Array<Record<string, unknown>> } {
     const updates: Array<Record<string, unknown>> = []
     let wake = false
+    let autoWake = options.dormantAutoWake ?? true
+    let probeMs = options.dormantProbeMs ?? 120_000
     const defaults = (): Record<string, unknown> => ({
       defaultEncoding: 'utf-8',
       defaultKind: 'telnet',
@@ -623,6 +629,9 @@ describe('the engine settings controls', () => {
       highRiskPatterns: [],
       promptPattern: '.',
       pagerPattern: '--more--',
+      dormantPattern: 'please press enter',
+      dormantAutoWake: autoWake,
+      dormantProbeMs: probeMs,
       wakeOnConnect: wake,
       connectTimeoutMs: 8000,
       readTimeoutMs: 15000,
@@ -640,6 +649,8 @@ describe('the engine settings controls', () => {
       updateSettings: async (_sessionId: string, patch: Record<string, unknown>) => {
         updates.push(patch)
         if (typeof patch.wakeOnConnect === 'boolean') wake = patch.wakeOnConnect
+        if (typeof patch.dormantAutoWake === 'boolean') autoWake = patch.dormantAutoWake
+        if (typeof patch.dormantProbeMs === 'number') probeMs = patch.dormantProbeMs
         // Exactly what the host answers: the section AND the derived defaults.
         return { revision: 2, settings: {}, defaults: defaults() }
       },
@@ -687,6 +698,231 @@ describe('the engine settings controls', () => {
       expect((view.getByLabelText('连接后自动唤醒') as HTMLInputElement).checked).toBe(false)
     })
     expect(scene.updates).toEqual([{ wakeOnConnect: true }, { wakeOnConnect: false }])
+  })
+
+  it('writes the dormancy auto-wake toggle through to the host', async () => {
+    const scene = settingsHub({ dormantAutoWake: true })
+    const view = renderView(scene.hub)
+    await waitFor(() => {
+      expect(view.getByLabelText('空闲休眠自动唤醒')).toBeTruthy()
+    })
+    fireEvent.click(view.getByLabelText('空闲休眠自动唤醒'))
+    await waitFor(() => {
+      expect(scene.updates).toEqual([{ dormantAutoWake: false }])
+    })
+    // The control stays and reflects the new value: this is the same
+    // `setDefaults(undefined)` failure mode the wake switch already had.
+    expect((view.getByLabelText('空闲休眠自动唤醒') as HTMLInputElement).checked).toBe(false)
+  })
+
+  it('edits the keepalive window in SECONDS and writes milliseconds', async () => {
+    // The document field is a millisecond count, but an operator thinks in
+    // seconds. Converting at the boundary is what keeps the control honest:
+    // showing "120000" in the box would be a number nobody can act on.
+    const scene = settingsHub({ dormantProbeMs: 120_000 })
+    const view = renderView(scene.hub)
+    await waitFor(() => {
+      expect(view.getByDisplayValue('120')).toBeTruthy()
+    })
+
+    // Committed on blur, not per keystroke: writing every digit as it is typed
+    // would set 1ms then 12ms then 120ms, and a 1ms probe would flood the device.
+    const box = view.getByDisplayValue('120') as HTMLInputElement
+    fireEvent.change(box, { target: { value: '45' } })
+    expect(scene.updates).toEqual([])
+    fireEvent.blur(box)
+    await waitFor(() => {
+      expect(scene.updates).toEqual([{ dormantProbeMs: 45_000 }])
+    })
+  })
+
+  it('allows disabling the keepalive with 0', async () => {
+    const scene = settingsHub({ dormantProbeMs: 120_000 })
+    const view = renderView(scene.hub)
+    await waitFor(() => {
+      expect(view.getByDisplayValue('120')).toBeTruthy()
+    })
+    const box = view.getByDisplayValue('120') as HTMLInputElement
+    fireEvent.change(box, { target: { value: '0' } })
+    fireEvent.blur(box)
+    await waitFor(() => {
+      expect(scene.updates).toEqual([{ dormantProbeMs: 0 }])
+    })
+  })
+})
+
+describe('the dormancy banner', () => {
+  /** A hub with one open console whose dormancy is settable. */
+  function dormantHub(): {
+    hub: ConsoleHub
+    wakes: number
+    setDormant(value: boolean): void
+  } {
+    const state = { dormant: true }
+    const counter = { wakes: 0 }
+    const row = (): Record<string, unknown> => ({
+      consoleId: 'c0ddddddddddddddddddddddddddddddd',
+      ownerSessionId: 'session-a',
+      label: 'FW1-dormant',
+      host: '10.133.6.253',
+      port: 10003,
+      kind: 'telnet',
+      encoding: 'utf-8',
+      secure: false,
+      state: 'open',
+      lastError: null,
+      idleMs: 0,
+      createdAt: new Date().toISOString(),
+      dormant: state.dormant,
+      dormantText: state.dormant ? 'Vty connection is timed out. Please press ENTER.' : null,
+    })
+    const hub = {
+      listViews: async () => ({ views: [], defaults: { dormantAutoWake: true, dormantProbeMs: 120_000 } }),
+      listConsoles: async () => ({ consoles: [row()] }),
+      read: async () => ({
+        text: '',
+        cursor: 0,
+        truncated: false,
+        bytes: 0,
+        encoding: 'utf-8',
+        paging: { active: false, pagesConsumed: 0, reason: null },
+        dormant: state.dormant,
+        ...state.dormant ? { dormantText: 'Vty connection is timed out. Please press ENTER.' } : {},
+      }),
+      wake: async () => {
+        counter.wakes += 1
+        state.dormant = false
+        return { consoleId: 'c0ddddddddddddddddddddddddddddddd', answered: true, dormant: false, dormantText: null }
+      },
+      describe: async () => ({ entry: row(), state: {}, banner: '' }),
+      closeAll: async () => ({ closed: 0 }),
+    } as unknown as ConsoleHub
+    return {
+      hub,
+      get wakes() { return counter.wakes },
+      setDormant(value: boolean) { state.dormant = value },
+    } as unknown as { hub: ConsoleHub, wakes: number, setDormant(value: boolean): void }
+  }
+
+  it('shows the mark in the list and the banner in the pane', async () => {
+    const scene = dormantHub()
+    const view = renderView(scene.hub)
+    await waitFor(() => {
+      expect(view.getByText('FW1-dormant')).toBeTruthy()
+    })
+    // The LIST mark matters because a dormant console answers nothing: a user
+    // scanning several consoles must see which one needs an Enter without
+    // clicking through each of them.
+    expect(view.getByText('● 休眠')).toBeTruthy()
+
+    fireEvent.click(view.getByText('FW1-dormant'))
+    await waitFor(() => {
+      expect(view.getByText('唤醒（发送回车）')).toBeTruthy()
+    })
+    // The device's own words are shown, not a paraphrase: they are what tells a
+    // user this is an idle timeout rather than a broken link.
+    expect(view.getByText(/Vty connection is timed out/)).toBeTruthy()
+  })
+
+  it('wakes through the button and clears the banner', async () => {
+    const scene = dormantHub()
+    const view = renderView(scene.hub)
+    await waitFor(() => {
+      expect(view.getByText('● 休眠')).toBeTruthy()
+    })
+    fireEvent.click(view.getByText('FW1-dormant'))
+    await waitFor(() => {
+      expect(view.getByText('唤醒（发送回车）')).toBeTruthy()
+    })
+    fireEvent.click(view.getByText('唤醒（发送回车）'))
+    await waitFor(() => {
+      expect(scene.wakes).toBe(1)
+    })
+    // The banner goes away once the host says the console is live again -- the
+    // panel must not keep showing a dormancy the host has cleared.
+    await waitFor(() => {
+      expect(view.queryByText('唤醒（发送回车）')).toBeNull()
+    })
+  })
+
+  it('sends an EMPTY line when the draft is empty, instead of refusing', async () => {
+    // The reported requirement: an empty box must send one Enter. Before this,
+    // `submit` trimmed the draft and returned early on an empty result, so the
+    // panel could not perform the very recovery gesture it was showing a button
+    // for.
+    const sends: Array<{ text: string, submit?: boolean }> = []
+    const scene = dormantHub()
+    scene.hub.fence = async () => ({ risk: 'safe' })
+    scene.hub.send = (async (_s: string, _c: string, text: string, options?: { submit?: boolean }) => {
+      sends.push({ text, ...options === undefined ? {} : { submit: options.submit } })
+      return { consoleId: 'c0ddddddddddddddddddddddddddddddd', state: 'open', written: 1 }
+    }) as unknown as ConsoleHub['send']
+
+    const view = renderView(scene.hub)
+    await waitFor(() => {
+      expect(view.getByText('FW1-dormant')).toBeTruthy()
+    })
+    fireEvent.click(view.getByText('FW1-dormant'))
+    await waitFor(() => {
+      expect(view.container.querySelector('[data-console-hub-input="command"]')).not.toBeNull()
+    })
+
+    // The draft is empty (never touched). Clicking 发送 must send ''.
+    fireEvent.click(view.getByText('发送'))
+    await waitFor(() => {
+      expect(sends).toEqual([{ text: '' }])
+    })
+  })
+
+  it('does NOT trim a whitespace-only draft', async () => {
+    // A single space is a pager's next-page key. Trimming it would send an empty
+    // line instead, silently paging nowhere.
+    const sends: string[] = []
+    const scene = dormantHub()
+    scene.hub.fence = async () => ({ risk: 'safe' })
+    scene.hub.send = (async (_s: string, _c: string, text: string) => {
+      sends.push(text)
+      return { consoleId: 'c0ddddddddddddddddddddddddddddddd', state: 'open', written: 1 }
+    }) as unknown as ConsoleHub['send']
+
+    const view = renderView(scene.hub)
+    await waitFor(() => {
+      expect(view.getByText('FW1-dormant')).toBeTruthy()
+    })
+    fireEvent.click(view.getByText('FW1-dormant'))
+    const input = await waitFor(() => {
+      const node = view.container.querySelector('[data-console-hub-input="command"]')
+      if (node === null) throw new Error('input not rendered')
+      return node as HTMLInputElement
+    })
+    fireEvent.change(input, { target: { value: ' ' } })
+    fireEvent.click(view.getByText('发送'))
+    await waitFor(() => {
+      expect(sends).toEqual([' '])
+    })
+  })
+
+  it('offers a dedicated Enter button that sends exactly one CR', async () => {
+    const sends: string[] = []
+    const scene = dormantHub()
+    scene.hub.fence = async () => ({ risk: 'safe' })
+    scene.hub.send = (async (_s: string, _c: string, text: string) => {
+      sends.push(text)
+      return { consoleId: 'c0ddddddddddddddddddddddddddddddd', state: 'open', written: 1 }
+    }) as unknown as ConsoleHub['send']
+
+    const view = renderView(scene.hub)
+    await waitFor(() => {
+      expect(view.getByText('FW1-dormant')).toBeTruthy()
+    })
+    fireEvent.click(view.getByText('FW1-dormant'))
+    await waitFor(() => {
+      expect(view.getByText('回车')).toBeTruthy()
+    })
+    fireEvent.click(view.getByText('回车'))
+    await waitFor(() => {
+      expect(sends).toEqual([''])
+    })
   })
 })
 

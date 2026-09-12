@@ -12,12 +12,14 @@ import {
   CONSOLE_ENCODINGS,
   CONSOLE_KINDS,
   DEFAULT_CONSOLE_HUB_SETTINGS,
+  DEFAULT_DORMANT_PATTERN,
   DEFAULT_PAGER_PATTERN,
   DEFAULT_PROMPT_PATTERN,
   PAGING_MODES,
   SECRET_REF_PREFIX,
-compileCommandFence,
+  compileCommandFence,
   compilePattern,
+  compileSearchPattern,
   isConsoleEncoding,
   recordIdOf,
   secretRefOf,
@@ -72,6 +74,33 @@ describe('config-shared', () => {
     expect(prompt.test('  [DUT1-interface-Gi0/1] ')).toBe(true)
     expect(prompt.test('show version output')).toBe(false)
     expect(() => compilePattern('(')).toThrow()
+  })
+
+  it('matches the dormancy marker ANYWHERE, unlike the tail-anchored matchers', () => {
+    // The half-close announcement is emitted mid-stream and is then followed by
+    // nothing at all. A tail-anchored matcher would therefore never see it: the
+    // device goes silent, so the marker is not at the tail for long. This is the
+    // distinction the two matchers exist for.
+    const dormant = compileSearchPattern(DEFAULT_DORMANT_PATTERN)
+    // Verbatim bytes from the real device (`scripts/probe-dormant.mjs`).
+    const marker = '\r\nVty connection is timed out.\r\n\r\nPlease press ENTER.'
+    expect(dormant.test(marker)).toBe(true)
+    // It matched the WHOLE announcement, not just its first sentence: the text a
+    // caller is shown must read as a request for a keystroke.
+    expect(dormant.exec(marker)?.[0]).toContain('Please press ENTER')
+    // Case-insensitive, and it survives output arriving after it.
+    expect(dormant.test('vty connection is timed out')).toBe(true)
+    expect(dormant.test('...timeout...\r\nPlease press Enter')).toBe(true)
+    expect(dormant.test(marker + '\r\n%LINK-3-UPDOWN: an event')).toBe(true)
+    // A tail-anchored matcher would MISS the trailing-output case, which is why
+    // the wrong matcher would be a silent regression rather than a failure.
+    const anchored = compilePattern(DEFAULT_DORMANT_PATTERN)
+    expect(anchored.test(marker + '\r\n%LINK-3-UPDOWN: an event')).toBe(false)
+    // Ordinary output is not a marker, and `press enter` is not the pager's
+    // `press any key`.
+    expect(dormant.test('normal output line')).toBe(false)
+    expect(dormant.test('Press any key to continue')).toBe(false)
+    expect(dormant.test('--More--')).toBe(false)
   })
 
   it('compiles the high-risk fence as case-insensitive command-line matches', () => {

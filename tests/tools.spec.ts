@@ -9,7 +9,7 @@ import { createServer, type Server, type Socket } from 'node:net'
 import { afterEach, describe, expect, it } from 'vitest'
 import { CONSOLE_TOOL_NAMES, registerConsoleTools, type ConsoleToolDeps } from '../src/tools.ts'
 import { PortManager } from '../src/port-manager.ts'
-import { DEFAULT_PAGER_PATTERN, DEFAULT_PROMPT_PATTERN } from '../src/config-shared.ts'
+import { DEFAULT_DORMANT_PATTERN, DEFAULT_PAGER_PATTERN, DEFAULT_PROMPT_PATTERN } from '../src/config-shared.ts'
 import { normalizeView } from '../src/views.ts'
 import type { ConsoleToolRegistry, ConsoleToolRunContext } from '../src/context-types.ts'
 import type { ConsoleView } from '../src/config-shared.ts'
@@ -66,6 +66,17 @@ interface Device {
 /** Start a device with a configurable answer. */
 async function startDevice(
   answer: (line: string) => string | undefined = line => `answer:${line}`,
+  options: {
+    /**
+     * Answer a bare Enter (a lone CR).
+     *
+     * A real console answers a bare Enter with its prompt; the loop below skips
+     * an empty line as "nothing was typed", so this needs its own hook. Without
+     * it, a `console_wake` test could only assert that bytes were written --
+     * never that the device acknowledged them.
+     */
+    onBareEnter?: () => string | undefined
+  } = {},
 ): Promise<Device> {
   const sockets: Socket[] = []
   const server: Server = createServer((socket) => {
@@ -76,7 +87,13 @@ async function startDevice(
     })
     socket.write('<DUT1>')
     socket.on('data', (chunk: Buffer) => {
-      for (const line of chunk.toString('utf8').split(/[\r\n]+/)) {
+      const text = chunk.toString('utf8')
+      if (options.onBareEnter !== undefined && text === '\r') {
+        const reply = options.onBareEnter()
+        if (reply !== undefined) socket.write(reply)
+        return
+      }
+      for (const line of text.split(/[\r\n]+/)) {
         if (line === '') continue
         const reply = answer(line)
         if (reply !== undefined) socket.write(`\r\n${reply}\r\n<DUT1>`)
@@ -222,8 +239,16 @@ function inventoryDeps(
 async function scene(options: {
   /** Credential resolution, when the case needs a stored secret. */
   resolveSecret?: (viewId: string) => Promise<{ password: string, user?: string } | undefined>
+  /** Start the device with a bare-Enter answer, for the wake cases. */
+  onBareEnter?: () => string | undefined
+  /** How the device answers a non-empty line. */
+  answer?: (line: string) => string | undefined
+  /** Manager policy overrides, for timing-sensitive cases. */
+  manager?: Partial<ConstructorParameters<typeof PortManager>[0]>
 } = {}): Promise<Scene> {
-  const device = await startDevice()
+  const device = await startDevice(options.answer ?? (line => `answer:${line}`), {
+    ...options.onBareEnter === undefined ? {} : { onBareEnter: options.onBareEnter },
+  })
   devices.push(device)
   const manager = new PortManager({
     maxConsoles: 3,
@@ -238,6 +263,10 @@ async function scene(options: {
     pagingQuietMs: 20,
     promptPattern: DEFAULT_PROMPT_PATTERN,
     pagerPattern: DEFAULT_PAGER_PATTERN,
+    dormantPattern: DEFAULT_DORMANT_PATTERN,
+    dormantAutoWake: true,
+    dormantProbeMs: 0,
+    ...options.manager,
   })
   managers.push(manager)
   const registry = fakeRegistry()
@@ -291,6 +320,9 @@ function emptyScene(): Scene {
     pagingQuietMs: 20,
     promptPattern: DEFAULT_PROMPT_PATTERN,
     pagerPattern: DEFAULT_PAGER_PATTERN,
+    dormantPattern: DEFAULT_DORMANT_PATTERN,
+    dormantAutoWake: true,
+    dormantProbeMs: 0,
   })
   managers.push(manager)
   const dispose = registerConsoleTools({
@@ -546,6 +578,52 @@ describe('console_send / console_read / console_wait_for', () => {
     expect(listed.consoles).toEqual([])
   })
 
+  it('sends an EMPTY line, which is how a dormant console is woken', async () => {
+    // The guard used to demand a non-empty `text`, so the model could not press
+    // Enter -- the one keystroke a half-closed console is asking for.
+    //
+    // The device's answer to a bare Enter is a marker that appears NOWHERE else
+    // (the connect greeting is just `<DUT1>`), so matching it proves the CR
+    // reached the device and was understood -- not merely that a byte was
+    // counted locally.
+    const scene1 = await scene({ onBareEnter: () => '\r\nWAKE-ACCEPTED\r\n<DUT1>' })
+    const opened = await callTool(scene1, 'console_connect', { viewId: 'v-known' }) as { consoleId: string }
+    const sent = await callTool(scene1, 'console_send', { consoleId: opened.consoleId, text: '' }) as {
+      state: string, written: number
+    }
+    expect(sent.state).toBe('open')
+
+    const waited = await callTool(scene1, 'console_wait_for', {
+      consoleId: opened.consoleId,
+      for: 'pattern',
+      pattern: 'WAKE-ACCEPTED',
+      timeoutMs: 2000,
+    }) as { matched: boolean }
+    expect(waited.matched).toBe(true)
+  })
+
+  it('sends whitespace verbatim, because a space is a pager key', async () => {
+    const scene1 = await scene({ answer: line => (line === ' ' ? 'NEXT-PAGE' : 'other') })
+    const opened = await callTool(scene1, 'console_connect', { viewId: 'v-known' }) as { consoleId: string }
+    await callTool(scene1, 'console_send', { consoleId: opened.consoleId, text: ' ' })
+    // The device answers only the exact single-space line: a trimmed send would
+    // have produced an empty line, and a `\n`-substituted one would answer 'other'.
+    const waited = await callTool(scene1, 'console_wait_for', {
+      consoleId: opened.consoleId,
+      for: 'pattern',
+      pattern: 'NEXT-PAGE',
+      timeoutMs: 2000,
+    }) as { matched: boolean }
+    expect(waited.matched).toBe(true)
+  })
+
+  it('still refuses a non-string text', async () => {
+    const scene1 = await scene()
+    const opened = await callTool(scene1, 'console_connect', { viewId: 'v-known' }) as { consoleId: string }
+    await expect(callTool(scene1, 'console_send', { consoleId: opened.consoleId, text: 42 }))
+      .rejects.toThrow(/must be a string/)
+  })
+
   it('bounds a large read and says so', async () => {
     const device = await startDevice(line => (line === 'flood' ? 'X'.repeat(5000) : `answer:${line}`))
     devices.push(device)
@@ -562,6 +640,9 @@ describe('console_send / console_read / console_wait_for', () => {
       pagingQuietMs: 20,
       promptPattern: DEFAULT_PROMPT_PATTERN,
       pagerPattern: DEFAULT_PAGER_PATTERN,
+      dormantPattern: DEFAULT_DORMANT_PATTERN,
+      dormantAutoWake: true,
+      dormantProbeMs: 0,
     })
     managers.push(manager)
     const registry = fakeRegistry()
@@ -591,6 +672,108 @@ describe('console_send / console_read / console_wait_for', () => {
     }
     expect(read.truncated).toBe(true)
     expect(Buffer.byteLength(read.text, 'utf8')).toBeLessThanOrEqual(128)
+  })
+})
+
+/**
+ * The model's view of the device half-close.
+ *
+ * These are the assertions that matter for the reported defect: a console whose
+ * device half-closed it is still `open`, still has no `lastError`, and answers
+ * nothing. A model that cannot SEE that state will retry forever, so every
+ * surface it reads must carry it.
+ */
+describe('console dormancy through the tools', () => {
+  /** The marker, byte for byte as the real device emits it. */
+  const MARKER = '\r\nVty connection is timed out.\r\n\r\nPlease press ENTER.'
+
+  /** Reach into the fake device behind a scene and push raw bytes. */
+  function pushTo(scene1: { view: { port: number } }, text: string): void {
+    const device = devices.find(candidate => candidate.port === scene1.view.port)
+    if (device === undefined) throw new Error('test device not found')
+    for (const socket of device.sockets) socket.write(text)
+  }
+
+  it('reports dormancy in console_read, and wakes with console_wake', async () => {
+    const scene1 = await scene({ onBareEnter: () => '\r\nWAKE-ACCEPTED\r\n<DUT1>' })
+    const opened = await callTool(scene1, 'console_connect', { viewId: 'v-known' }) as { consoleId: string }
+
+    pushTo(scene1, MARKER)
+    // The host answers the marker by itself (dormantAutoWake is on), so wait for
+    // the automatic recovery to land -- the point here is what the MODEL sees.
+    const waited = await callTool(scene1, 'console_wait_for', {
+      consoleId: opened.consoleId,
+      for: 'pattern',
+      pattern: 'WAKE-ACCEPTED',
+      timeoutMs: 2000,
+    }) as { matched: boolean, dormant: boolean }
+    expect(waited.matched).toBe(true)
+
+    const read = await callTool(scene1, 'console_read', { consoleId: opened.consoleId, after: 0 }) as {
+      text: string, dormant: boolean, dormantText?: string
+    }
+    // The marker itself is in the output, so the model can see why the console
+    // went quiet, and the state is reported alongside it.
+    expect(read.text).toContain('Vty connection is timed out')
+    expect(read.dormant).toBe(false)
+  })
+
+  it('marks a still-dormant console in console_list', async () => {
+    // `dormantAutoWake: false` and a device that ignores the Enter: the console
+    // stays dormant, which is the state a model must be able to detect.
+    const scene1 = await scene({ manager: { dormantAutoWake: false } })
+    const opened = await callTool(scene1, 'console_connect', { viewId: 'v-known' }) as { consoleId: string }
+    pushTo(scene1, MARKER)
+    await new Promise(resolve => setTimeout(resolve, 100))
+
+    const listed = await callTool(scene1, 'console_list', {}) as {
+      consoles: { consoleId: string, state: string, dormant: boolean, dormantText?: string }[]
+    }
+    const row = listed.consoles.find(entry => entry.consoleId === opened.consoleId)
+    expect(row?.state).toBe('open')
+    expect(row?.dormant).toBe(true)
+    expect(row?.dormantText).toContain('Please press ENTER')
+  })
+
+  it('reports dormantBlocked when a wait cannot match a dormant console', async () => {
+    const scene1 = await scene({ manager: { dormantAutoWake: false } })
+    const opened = await callTool(scene1, 'console_connect', { viewId: 'v-known' }) as { consoleId: string }
+    pushTo(scene1, MARKER)
+    await new Promise(resolve => setTimeout(resolve, 100))
+
+    const waited = await callTool(scene1, 'console_wait_for', {
+      consoleId: opened.consoleId,
+      for: 'pattern',
+      pattern: 'NEVER-APPEARS',
+      timeoutMs: 120,
+    }) as { matched: boolean, reason: string, dormant: boolean, dormantBlocked?: boolean }
+    expect(waited.matched).toBe(false)
+    expect(waited.reason).toBe('timeout')
+    expect(waited.dormant).toBe(true)
+    // Without this the model would simply wait again: a bare timeout is
+    // indistinguishable from "the device is slow".
+    expect(waited.dormantBlocked).toBe(true)
+  })
+
+  it('console_wake presses exactly one Enter and reports whether it worked', async () => {
+    const scene1 = await scene({ onBareEnter: () => '\r\nWAKE-ACCEPTED\r\n<DUT1>' })
+    const opened = await callTool(scene1, 'console_connect', { viewId: 'v-known' }) as { consoleId: string }
+    const woken = await callTool(scene1, 'console_wake', { consoleId: opened.consoleId }) as {
+      answered: boolean, dormant: boolean, state: string
+    }
+    expect(woken.answered).toBe(true)
+    expect(woken.dormant).toBe(false)
+    expect(woken.state).toBe('open')
+  })
+
+  it('console_wake reports a wake nobody answered as unanswered', async () => {
+    // The device ignores a bare Enter, so claiming recovery would be a lie.
+    const scene1 = await scene()
+    const opened = await callTool(scene1, 'console_connect', { viewId: 'v-known' }) as { consoleId: string }
+    const woken = await callTool(scene1, 'console_wake', { consoleId: opened.consoleId }) as {
+      answered: boolean
+    }
+    expect(woken.answered).toBe(false)
   })
 })
 
@@ -900,6 +1083,9 @@ describe('a stored credential reaches the connect', () => {
       pagingQuietMs: 20,
       promptPattern: DEFAULT_PROMPT_PATTERN,
       pagerPattern: DEFAULT_PAGER_PATTERN,
+      dormantPattern: DEFAULT_DORMANT_PATTERN,
+      dormantAutoWake: true,
+      dormantProbeMs: 0,
     })
     managers.push(manager)
     const registry = fakeRegistry()

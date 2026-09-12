@@ -48,6 +48,9 @@ export function policyFromSettings(settings: ConsoleHubSettings, idleSweepMs: nu
     pagingQuietMs: settings.pagingQuietMs,
     promptPattern: settings.promptPattern,
     pagerPattern: settings.pagerPattern,
+    dormantPattern: settings.dormantPattern,
+    dormantAutoWake: settings.dormantAutoWake,
+    dormantProbeMs: settings.dormantProbeMs,
     // Carried through so a deployment with silent console servers gets the
     // wake Enter without a per-view flag.
     wakeOnConnect: settings.wakeOnConnect,

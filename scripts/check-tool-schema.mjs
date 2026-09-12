@@ -32,6 +32,7 @@ const dispose = registerConsoleTools({
     read: () => ({ text: '', cursor: 0, truncated: false, bytes: 0, encoding: 'utf-8', paging: { active: false, pagesConsumed: 0, reason: null } }),
     waitFor: async () => ({ matched: false, reason: 'timeout', cursor: 0, elapsedMs: 0, paging: { active: false, pagesConsumed: 0, reason: null } }),
     resumePaging: () => {},
+    wake: async () => true,
     close: async () => {},
     connect: async () => ({}),
     openCount: () => 0,

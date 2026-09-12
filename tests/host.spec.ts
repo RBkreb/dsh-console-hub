@@ -352,6 +352,25 @@ describe('capability gating', () => {
     expect(text).toMatch(/devices are configured/)
   })
 
+  it('tells the model about dormancy, the wake tool, and empty sends', async () => {
+    // Three behaviours the model must know about or it will work against itself:
+    // a dormant console answers nothing (so a retry is wasted), the recovery is
+    // `console_wake`, and an empty send is legal. Each was added as a fix, and a
+    // prompt that omits them leaves the model rediscovering them by failure.
+    const settings = settingsService()
+    const prompt = promptRegistry()
+    const { ctx, flush } = fakeContext({ settings: settings.service, systemPrompt: prompt.service })
+    apply(ctx)
+    await flush()
+    const text = prompt.sections().map(entry => entry.text).join('\n')
+    expect(text).toContain('console_wake')
+    expect(text).toMatch(/dormant/)
+    expect(text).toMatch(/dormantBlocked/)
+    expect(text).toMatch(/Vty connection is timed out/)
+    // An empty send is legal, and whitespace is not trimmed.
+    expect(text).toMatch(/empty or/)
+  })
+
   it('withdraws the tool family when the setting turns it off, and restores it', async () => {
     const settings = settingsService()
     const tools = toolRegistry()

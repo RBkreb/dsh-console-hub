@@ -148,6 +148,12 @@ export interface EngineDefaults {
   highRiskPatterns: string[]
   promptPattern: string
   pagerPattern: string
+  /** Marker text a device prints when it half-closed an idle console. */
+  dormantPattern: string
+  /** Whether that marker is answered with one bare Enter. */
+  dormantAutoWake: boolean
+  /** Idle input milliseconds before a keepalive Enter; `0` disables it. */
+  dormantProbeMs: number
   /** Whether a silent console is woken with one bare Enter on connect. */
   wakeOnConnect: boolean
   connectTimeoutMs: number
@@ -175,6 +181,16 @@ export interface ConsoleRow {
   lastError: { code: string, message: string } | null
   idleMs: number
   createdAt: string
+  /**
+   * Whether the DEVICE half-closed this idle console.
+   *
+   * The socket is still up and `state` still reads `open`, but the device prints
+   * nothing until somebody presses Enter -- so a panel that showed only `state`
+   * would show a live console that answers nothing.
+   */
+  dormant?: boolean
+  /** The marker the device printed to announce it. */
+  dormantText?: string | null
 }
 
 /** One `console.read` answer. */
@@ -187,6 +203,8 @@ export interface ReadResult {
   prompt?: string
   pager?: string
   paging: { active: boolean, pagesConsumed: number, reason: string | null }
+  dormant?: boolean
+  dormantText?: string
 }
 
 /** One `console.waitFor` answer. */
@@ -263,7 +281,17 @@ export interface ConsoleHub {
     after?: number
     idleMs?: number
   }): Promise<WaitResult>
-  control(sessionId: string, consoleId: string, action: 'drain'): Promise<{ paging: { active: boolean } }>
+  control(sessionId: string, consoleId: string, action: 'drain' | 'wake'): Promise<{ paging?: { active: boolean } }>
+  /**
+   * Press Enter once on a console: wake a dormancy, or keep an idle one alive.
+   * @returns whether the device answered, and whether it is still dormant.
+   */
+  wake(sessionId: string, consoleId: string): Promise<{
+    consoleId: string
+    answered: boolean
+    dormant: boolean
+    dormantText: string | null
+  }>
   /**
    * Discard one console's local scrollback. The connection is untouched.
    * @returns the cursor to read from next, and the bytes that were dropped.
@@ -325,6 +353,7 @@ export function createConsoleHub(client: ApiClient): ConsoleHub {
       client.call('console.read', { sessionId, consoleId, after, ...options }),
     waitFor: (sessionId, consoleId, options) => client.call('console.waitFor', { sessionId, consoleId, ...options }),
     control: (sessionId, consoleId, action) => client.call('console.control', { sessionId, consoleId, action }),
+    wake: (sessionId, consoleId) => client.call('console.wake', { sessionId, consoleId }),
     clear: (sessionId, consoleId) => client.call('console.clear', { sessionId, consoleId }),
     close: (sessionId, consoleId, force) =>
       client.call('console.close', { sessionId, consoleId, ...force === undefined ? {} : { force } }),

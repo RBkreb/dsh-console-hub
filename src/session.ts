@@ -49,6 +49,35 @@ export interface ConsolePagingState {
   lastPager?: string
 }
 
+/**
+ * Whether the DEVICE has torn the console session down while the socket stayed
+ * up — the half-close a console server performs after a long idle period.
+ *
+ * This is distinct from the socket's own liveness, which is why it needs its own
+ * state: the TCP connection is perfectly healthy and the plugin's `state` stays
+ * `open`, but the device prints nothing at all until a key arrives. A caller
+ * that only looked at `state` would wait forever for output that never comes.
+ */
+export interface ConsoleDormancyState {
+  /**
+   * Whether the device is currently believed dormant.
+   *
+   * Set when the marker text is seen, and REFUTED — never merely assumed
+   * recovered — once fresh device output arrives after a wake, or after a
+   * command comes back with a prompt. Seeing the marker is proof; not seeing it
+   * is not.
+   */
+  dormant: boolean
+  /** When the marker was last seen (ISO), or null. */
+  detectedAt: string | null
+  /** The marker text as the device printed it, for display. */
+  marker: string | null
+  /** Bare Enters this session sent to wake or keep the console awake. */
+  wakesSent: number
+  /** Keepalive Enters sent, as opposed to recoveries after a detected dormancy. */
+  keepalivesSent: number
+}
+
 /** One audit entry: who did what on this console. */
 export interface ConsoleAuditEntry {
   /** When it happened (ISO). */
@@ -79,6 +108,8 @@ export interface ConsoleSessionState {
   /** Prompt found on the most recent read, or null. */
   prompt: string | null
   paging: ConsolePagingState
+  /** Whether the device half-closed this idle console (see {@link ConsoleDormancyState}). */
+  dormancy: ConsoleDormancyState
   /** Bytes received in total. */
   bytesReceived: number
   /** Bytes written in total. */
@@ -124,6 +155,16 @@ export interface ConsoleWaitResult {
   reason: 'matched' | 'timeout' | 'closed'
   /** Pager state after the wait. */
   paging: ConsolePagingState
+  /** Whether the device went dormant during the wait (the wait may still have matched). */
+  dormant: boolean
+  /**
+   * Set when the wait STARTED with the device dormant and could not do anything
+   * about it before the budget ran out.
+   *
+   * A caller that waited for a prompt on a dormant console gets no output and no
+   * prompt — indistinguishable from "the device is slow" unless this says so.
+   */
+  dormantBlocked?: boolean
 }
 
 /** How often a wait re-examines the tail of the output. */
@@ -147,6 +188,10 @@ export interface ConsoleReadResult {
   pager?: string
   /** Paging progress after this read. */
   paging: ConsolePagingState
+  /** Whether the device is dormant, for a caller that needs to wake it first. */
+  dormant: boolean
+  /** Where that belief came from: the marker, or an inference. */
+  dormantText?: string
 }
 
 /**
@@ -186,6 +231,33 @@ export interface ConsoleSessionOptions {
   promptPattern: RegExp
   /** Compiled, tail-anchored pager matcher. */
   pagerPattern: RegExp
+  /**
+   * Compiled, UNANCHORED matcher for the "the console timed out, press ENTER"
+   * marker a device prints when it has half-closed an idle session.
+   *
+   * Unanchored on purpose, unlike the prompt and pager matchers: the marker
+   * arrives in the middle of output, not at the tail waiting to be matched.
+   */
+  dormantPattern: RegExp
+  /**
+   * Answer that marker with one bare Enter — the keystroke the device is asking
+   * for by printing it.
+   *
+   * On by default, because the marker IS a request for a keypress: a console
+   * that prints it and receives nothing stays silent forever, and every later
+   * read is empty.
+   */
+  dormantAutoWake: boolean
+  /**
+   * Idle milliseconds after which a bare Enter is sent to stop an idle console
+   * timing out. `0` disables the keepalive entirely.
+   *
+   * A keepalive, not a recovery: it fires BEFORE the device's own timeout, so
+   * the device never half-closes in the first place and keeps printing its
+   * events. Detecting the half-close afterwards is strictly worse — the device
+   * has already stopped printing by then.
+   */
+  dormantProbeMs: number
   scrollbackLimitBytes: number
   /** Cap on one read's returned text (bytes). */
   outputLimitBytes?: number
@@ -217,6 +289,28 @@ const TAIL_BYTES = 1024
 /** Cap on the banner text returned by {@link ConsoleSession.open}. */
 const BANNER_LIMIT_BYTES = 4096
 
+/**
+ * How long a session waits for fresh device output after sending a wake Enter
+ * before concluding the device is still dormant.
+ *
+ * The measured wake round trip on both lab devices is 35-45ms, so this is an
+ * order of magnitude of headroom for a slower box. It is a budget for ONE
+ * attempt, not a retry policy: a second Enter would be a second unsolicited
+ * keystroke, and a console that ignores the first is not fixed by a second.
+ */
+const WAKE_SETTLE_MS = 400
+
+/**
+ * How much of the ringing scrollback is searched for the dormancy marker.
+ *
+ * Search, not tail-match: the marker is emitted mid-stream and is then followed
+ * by nothing at all, so anchoring it to the tail — the way a prompt is anchored
+ * — would miss it as soon as the reader's own output shifted the tail. The
+ * window is the newest bytes only, so a marker printed an hour ago and long
+ * since pushed out cannot resurrect a stale belief.
+ */
+const DORMANT_WINDOW_BYTES = 4096
+
 /** Bound a UTF-8 string to a byte budget without splitting a code point. */
 function boundUtf8(text: string, maxBytes: number): string {
   const buffer = Buffer.from(text, 'utf8')
@@ -240,6 +334,17 @@ export class ConsoleSession {
   private openedAt: string | null = null
   private closedAt: string | null = null
   private lastActivityMs = Date.now()
+  /**
+   * When this session last WROTE a byte to the device.
+   *
+   * Deliberately not the same clock as `lastActivityMs`, which advances on
+   * every read too (a console somebody is watching must not be reaped). This one
+   * drives the keepalive, and it is set ONLY by outbound bytes, because that is
+   * what the device's own idle timer counts: measured, a device that streamed
+   * output continuously for 300s still timed the session out, so inbound traffic
+   * is not what keeps it alive (`scripts/probe-idle-input.mjs`).
+   */
+  private lastWireAt = Date.now()
   private bytesReceived = 0
   private bytesWritten = 0
   private currentPrompt: string | null = null
@@ -247,6 +352,12 @@ export class ConsoleSession {
   private pagingTimer: NodeJS.Timeout | undefined
   private pagingAbandoned = false
   private pagingHandledAtCursor = 0
+  private dormancy: ConsoleDormancyState = { dormant: false, detectedAt: null, marker: null, wakesSent: 0, keepalivesSent: 0 }
+  /** Cursor of the newest byte the dormancy search has already examined. */
+  private dormantScannedTo = 0
+  private keepaliveTimer: NodeJS.Timeout | undefined
+  /** Set while `wake()` is mid-flight so a probe cannot stack Enters. */
+  private waking = false
   private opened: Promise<ConsoleConnectResult> | undefined
   private password: string | undefined
 
@@ -291,6 +402,7 @@ export class ConsoleSession {
       lastError: this.lastError,
       prompt: this.currentPrompt,
       paging: { ...this.paging },
+      dormancy: { ...this.dormancy },
       bytesReceived: this.bytesReceived,
       bytesWritten: this.bytesWritten,
       audit: [...this.auditTrail],
@@ -389,13 +501,30 @@ export class ConsoleSession {
 
     const bannerText = decodeBytes(this.ring.slice(0), this.options.encoding === '' ? 'utf-8' : this.options.encoding)
     this.banner = boundUtf8(bannerText, BANNER_LIMIT_BYTES)
+    // Start guarding against the device's idle timeout from the moment the
+    // console is usable: an unused console is precisely the one that times out,
+    // so waiting for the first read to arm this would arm it too late.
+    this.armKeepalive()
     return this.connectResult()
   }
 
   /** Handle one inbound chunk: strip/filter, append, answer negotiation, page. */
   private onData(raw: Uint8Array): void {
     if (this.phase === 'closed' || this.phase === 'closing') return
-    this.lastActivityMs = Date.now()
+    // An automated wake's ANSWER is not user activity. Without this the keepalive
+    // would make a forgotten console immortal: the probe goes out, the device
+    // answers, that answer refreshes the clock the reaper reads, and the reaper
+    // can never reclaim a console nobody has touched. (Measured: a 3s probe
+    // against the lab firewall drew an answer every cycle, holding `idleMs` under
+    // the probe period indefinitely -- the live suite caught it.)
+    //
+    // Only the wake's own answer is excluded. A panel polling `read` and a model
+    // running a command still count, which is exactly what "somebody is using
+    // this console" means.
+    if (!this.waking) this.lastActivityMs = Date.now()
+    // `lastWireAt` is deliberately NOT touched here: the keepalive measures how
+    // long since WE last wrote, and a chatty device would otherwise postpone it
+    // forever -- while still timing the session out.
     this.bytesReceived += raw.length
 
     const cleaned = this.options.kind === 'telnet' ? stripIac(raw) : raw
@@ -421,11 +550,165 @@ export class ConsoleSession {
     const prompt = matchPrompt(tail, this.options.promptPattern)
     if (prompt !== undefined) this.currentPrompt = prompt
 
+    this.scanForDormancy()
+
     const pager = matchPager(tail, this.options.pagerPattern)
     if (pager !== undefined && !this.pagingAbandoned) {
       this.paging = { ...this.paging, lastPager: pager }
       this.schedulePagingCheck()
     }
+  }
+
+  /**
+   * Look for the dormancy marker in the bytes received since the last scan.
+   *
+   * Scanned incrementally and windowed backwards, which is what makes this
+   * correct rather than merely cheap:
+   *
+   * - Incremental, so a marker is SEEN once and waking it can then clear the
+   *   flag. Re-scanning the whole window on every chunk would re-set the flag
+   *   from a marker that is still sitting in the scrollback, and the session
+   *   would wake the device on every keystroke of its own output.
+   * - Windowed, so a marker printed long ago — since pushed out of the ring by
+   *   newer output — cannot resurrect a stale belief.
+   *
+   * A refusal is the only refutation: once woken, the flag clears, and it is
+   * `wake()` (not this scan) that decides whether the wake worked.
+   */
+  private scanForDormancy(): void {
+    const from = this.dormantScannedTo
+    const to = this.ring.written
+    this.dormantScannedTo = to
+    if (to <= from) return
+    const windowStart = Math.max(from, this.ring.oldestCursor, to - DORMANT_WINDOW_BYTES)
+    if (windowStart >= to) return
+    const text = decodeBytes(
+      this.ring.slice(windowStart),
+      this.options.encoding === '' ? 'utf-8' : this.options.encoding,
+    )
+    const found = this.options.dormantPattern.exec(text)
+    if (found === null) return
+    this.markDormant(found[0].trim())
+  }
+
+  /**
+   * Record that the device reported itself half-closed, and answer it.
+   *
+   * The wake is fired here, from inside the data path, rather than left to the
+   * next `read`: the device has already stopped printing DEVICE EVENTS, and the
+   * whole point is to restart them now, not at the next time somebody happens to
+   * poll. A session in a composition that disabled `dormantAutoWake` only
+   * records the state, so a caller can see it and decide.
+   */
+  private markDormant(marker: string): void {
+    if (this.phase !== 'open') return
+    const first = !this.dormancy.dormant
+    this.dormancy = { ...this.dormancy, dormant: true, detectedAt: new Date().toISOString(), marker }
+    if (first) this.record('system', 'dormant', `the device half-closed this console: ${marker}`)
+    if (this.options.dormantAutoWake === true && !this.waking) void this.wake('marker')
+  }
+
+  /**
+   * Send one bare Enter and report whether the device came back.
+   *
+   * The keystroke is exactly one: a device that asks to be woken by ENTER gets
+   * ENTER, and a second would be a second unsolicited write to hardware nobody
+   * asked to disturb. Whether it worked is decided by EVIDENCE — fresh device
+   * output, or a prompt — never by "we wrote bytes and felt better".
+   *
+   * The write is deliberate about activity: it goes through {@link write}, which
+   * does not touch `lastActivityMs`, because a keepalive must not make a
+   * forgotten console look used. That is what lets the idle reaper still reclaim
+   * it — a console kept awake by a probe is alive, not in use.
+   *
+   * @param reason - `marker` when answering a detected dormancy, `probe` when
+   *   keeping an idle console from timing out, `keepalive` for the timer.
+   * @returns whether the device answered.
+   */
+  async wake(reason: 'marker' | 'probe' | 'keepalive' = 'marker'): Promise<boolean> {
+    if (this.phase !== 'open' || this.waking) return this.dormancy.dormant === false
+    this.waking = true
+    try {
+      const before = this.ring.written
+      this.writeRaw(encodeText('\r', this.options.encoding === '' ? 'utf-8' : this.options.encoding))
+      const keepalive = reason !== 'marker'
+      this.dormancy = {
+        ...this.dormancy,
+        wakesSent: this.dormancy.wakesSent + 1,
+        keepalivesSent: this.dormancy.keepalivesSent + (keepalive ? 1 : 0),
+      }
+      this.record('system', reason === 'marker' ? 'wake' : 'keepalive', keepalive
+        ? 'sent a bare Enter to keep an idle console from timing out'
+        : 'sent a bare Enter to wake a console the device had half-closed')
+
+      // Wait for the device to prove it is back. Output is the evidence: a
+      // prompt alone is enough, but a device that resumes printing its events
+      // without a prompt is just as recovered.
+      const deadline = Date.now() + WAKE_SETTLE_MS
+      while (Date.now() < deadline && this.phase === 'open') {
+        if (this.ring.written > before) break
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+      const answered = this.ring.written > before
+      if (answered) {
+        this.dormancy = { ...this.dormancy, dormant: false }
+        this.record('system', 'wake', 'the device answered the wake Enter')
+        return true
+      }
+      // No answer: the belief stands. Claiming recovery here is exactly the bug
+      // that would leave a caller waiting on a console nobody is listening to.
+      return false
+    } finally {
+      this.waking = false
+    }
+  }
+
+  /**
+   * Arm (or disarm) the idle keepalive.
+   *
+   * Fires `dormantProbeMs` after the last byte the CONSOLE WROTE, so an active
+   * conversation is never interrupted and a console nobody is typing into gets
+   * one bare Enter before the device's own timeout can fire.
+   *
+   * The clock is INPUT-driven, and that is measured rather than assumed.
+   * `scripts/probe-idle-input.mjs` sent nothing at all after the connect wake and
+   * watched the lab firewall for 300s while counting what it sent: the device
+   * kept emitting output the whole time and STILL announced
+   *
+   *     Vty connection is timed out. Please press ENTER.
+   *
+   * So the device's idle timer counts keystrokes, not traffic. Keying the probe
+   * on "any activity" would therefore have suppressed it on exactly the device
+   * that needs it -- a device that streams events would never look idle and would
+   * time out anyway. `lastWireAt` is set by what we SEND, never by what arrives.
+   *
+   * A keepalive deliberately does not restart the countdown from itself: it
+   * checks the clock and re-arms from the last real input.
+   */
+  private armKeepalive(): void {
+    if (this.keepaliveTimer !== undefined) clearTimeout(this.keepaliveTimer)
+    this.keepaliveTimer = undefined
+    const probeMs = this.options.dormantProbeMs
+    if (probeMs <= 0 || this.phase !== 'open') return
+    this.keepaliveTimer = setTimeout(() => {
+      this.keepaliveTimer = undefined
+      if (this.phase !== 'open') return
+      if (Date.now() - this.lastWireAt < probeMs) {
+        // Someone wrote while this timer was pending: re-arm from that moment
+        // rather than probing on a stale clock. Device output is deliberately
+        // NOT a reason to postpone -- see the note above.
+        this.armKeepalive()
+        return
+      }
+      void this.wake('keepalive').finally(() => { this.armKeepalive() })
+    }, probeMs)
+    // A pending keepalive must never hold the process open.
+    this.keepaliveTimer.unref?.()
+  }
+
+  /** Whether the device is currently believed dormant. */
+  isDormant(): boolean {
+    return this.dormancy.dormant
   }
 
   /** Debounce the pager decision so a partly-rendered pager is not answered twice. */
@@ -480,18 +763,42 @@ export class ConsoleSession {
     this.paging = { active: false, pagesConsumed: pages, reason: null, lastPager: pager }
   }
 
-  /** Write raw bytes, counting them. Swallows EPIPE and friends. */
-  private write(bytes: Uint8Array): void {
+  /**
+   * Write raw bytes without counting them as user activity.
+   *
+   * Split out from {@link write} for exactly one caller: the dormancy keepalive.
+   * `lastActivityMs` is what the idle reaper reads, and a probe is not somebody
+   * using the console — folding it in would make a forgotten tab immortal,
+   * which is the opposite of what the reaper exists for. It also resets the
+   * keepalive's own "has anyone spoken" clock, so the two cannot fight.
+   */
+  private writeRaw(bytes: Uint8Array): void {
     const socket = this.socket
     if (socket === undefined || socket.destroyed) return
     socket.write(Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength))
     this.bytesWritten += bytes.byteLength
+    // Every byte OUT is input as far as the device is concerned -- including a
+    // pager answer, a negotiation reply and a wake Enter -- so the device's idle
+    // timer is reset by it. What arrives does NOT count; see `lastWireAt`.
+    this.lastWireAt = Date.now()
+  }
+
+  /** Write raw bytes, counting them. Swallows EPIPE and friends. */
+  private write(bytes: Uint8Array): void {
+    this.writeRaw(bytes)
     this.lastActivityMs = Date.now()
   }
 
   /**
-   * Send one command.
-   * @param text - the text to send (no trailing newline needed).
+   * Send one line.
+   *
+   * An EMPTY line is a legitimate send, not a mistake: it presses Enter, which
+   * is how a dormant console is woken, how a `--More--` prompt is dismissed by
+   * hand, and how a device that swallows the first keystroke is prompted a
+   * second time. The route used to refuse `text === ''`, which left the one
+   * action a stuck console needs as the one action the API would not carry.
+   *
+   * @param text - the text to send; `''` sends the submit key alone.
    * @param options - submit key, encoding override, and the audit actor.
    * @returns the status after writing.
    * @throws {Error} when the session is not open.
@@ -510,7 +817,11 @@ export class ConsoleSession {
     // One `send` starts a new answer, so the pager state resets.
     this.pagingAbandoned = false
     this.paging = { active: false, pagesConsumed: 0, reason: null }
-    this.record(options.actor ?? 'user', 'send', text)
+    // A real write is activity: restart the keepalive's clock from it.
+    this.armKeepalive()
+    // An empty line is recorded as such rather than as an empty string, so the
+    // audit trail says "an Enter was pressed" instead of showing nothing.
+    this.record(options.actor ?? 'user', 'send', text === '' ? '(Enter)' : text)
     return this.status()
   }
 
@@ -544,6 +855,8 @@ export class ConsoleSession {
       ...prompt === undefined ? {} : { prompt },
       ...pager === undefined ? {} : { pager },
       paging: { ...this.paging },
+      dormant: this.dormancy.dormant,
+      ...this.dormancy.marker === null ? {} : { dormantText: this.dormancy.marker },
     }
   }
 
@@ -580,6 +893,9 @@ export class ConsoleSession {
     // A prompt remembered from discarded output would keep `waitFor` reporting
     // `matched` for a prompt the reader cannot see.
     this.currentPrompt = null
+    // The marker was discarded with everything else, so the search starts fresh
+    // from the cursor the window now begins at.
+    this.dormantScannedTo = this.ring.written
     this.record('system', 'clear', `cleared ${String(droppedBytes)} byte(s) of local scrollback`)
     return { cursor: this.ring.written, droppedBytes }
   }
@@ -603,6 +919,10 @@ export class ConsoleSession {
 
     let lastGrowthAt = Date.now()
     let lastWritten = this.ring.written
+    // A wait that begins on a dormant console is waiting for output the device
+    // will not send until someone presses a key. Recorded so the caller can tell
+    // "the device is slow" from "the device is not listening".
+    const startedDormant = this.dormancy.dormant
 
     for (;;) {
       const tail = this.tailText()
@@ -624,10 +944,10 @@ export class ConsoleSession {
         }
       }
       if (this.phase === 'closed' || this.phase === 'error') {
-        return this.waitResult(false, undefined, after, started, 'closed')
+        return this.waitResult(false, undefined, after, started, 'closed', startedDormant)
       }
       if (Date.now() - started >= budgetMs) {
-        return this.waitResult(false, undefined, after, started, 'timeout')
+        return this.waitResult(false, undefined, after, started, 'timeout', startedDormant)
       }
       await new Promise(resolve => setTimeout(resolve, WAIT_POLL_MS))
     }
@@ -640,8 +960,13 @@ export class ConsoleSession {
     after: number,
     started: number,
     reason: ConsoleWaitResult['reason'],
+    startedDormant = false,
   ): ConsoleWaitResult {
     this.lastActivityMs = Date.now()
+    // Only reported when the wait FAILED because of it: a wait that matched
+    // plainly got its answer, and a stale flag would make the caller distrust a
+    // result it can see for itself.
+    const blocked = startedDormant && this.dormancy.dormant && reason !== 'matched'
     return {
       matched,
       ...matchedText === undefined ? {} : { matchedText },
@@ -651,6 +976,8 @@ export class ConsoleSession {
       elapsedMs: Date.now() - started,
       reason,
       paging: { ...this.paging },
+      dormant: this.dormancy.dormant,
+      ...blocked ? { dormantBlocked: true } : {},
     }
   }
 
@@ -696,6 +1023,10 @@ export class ConsoleSession {
       clearTimeout(this.pagingTimer)
       this.pagingTimer = undefined
     }
+    if (this.keepaliveTimer !== undefined) {
+      clearTimeout(this.keepaliveTimer)
+      this.keepaliveTimer = undefined
+    }
     this.password = undefined
     if (this.phase !== 'closed') await this.close({ force: true })
   }
@@ -705,6 +1036,10 @@ export class ConsoleSession {
     if (this.pagingTimer !== undefined) {
       clearTimeout(this.pagingTimer)
       this.pagingTimer = undefined
+    }
+    if (this.keepaliveTimer !== undefined) {
+      clearTimeout(this.keepaliveTimer)
+      this.keepaliveTimer = undefined
     }
     if (this.phase !== 'closed') {
       this.phase = 'closed'

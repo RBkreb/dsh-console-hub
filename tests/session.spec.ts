@@ -6,7 +6,13 @@
 import { createServer, type Server, type Socket } from 'node:net'
 import { afterEach, describe, expect, it } from 'vitest'
 import { ConsoleSession, type ConsoleSessionState } from '../src/session.ts'
-import { DEFAULT_PAGER_PATTERN, DEFAULT_PROMPT_PATTERN, compilePattern } from '../src/config-shared.ts'
+import {
+  DEFAULT_DORMANT_PATTERN,
+  DEFAULT_PAGER_PATTERN,
+  DEFAULT_PROMPT_PATTERN,
+  compilePattern,
+  compileSearchPattern,
+} from '../src/config-shared.ts'
 import { IAC, DO, WILL } from '../src/session-codec.ts'
 
 /** A fake serial server: it answers a connect with negotiations and a prompt. */
@@ -112,6 +118,13 @@ function sessionFor(
     pagingQuietMs: 20,
     promptPattern: compilePattern(DEFAULT_PROMPT_PATTERN),
     pagerPattern: compilePattern(DEFAULT_PAGER_PATTERN),
+    dormantPattern: compileSearchPattern(DEFAULT_DORMANT_PATTERN),
+    dormantAutoWake: true,
+    // The keepalive is OFF for the fixture and opted into per test: a timer
+    // armed 120s out makes a `beforeEach` cheap but a suite's timing depend on
+    // whether some unrelated test ran long enough to fire it. The tests that
+    // exercise the keepalive set a small value explicitly.
+    dormantProbeMs: 0,
     scrollbackLimitBytes: 64 * 1024,
     ...overrides,
   })
@@ -623,6 +636,9 @@ describe('ConsoleSession lifecycle', () => {
       pagingQuietMs: 20,
       promptPattern: compilePattern(DEFAULT_PROMPT_PATTERN),
       pagerPattern: compilePattern(DEFAULT_PAGER_PATTERN),
+      dormantPattern: compileSearchPattern(DEFAULT_DORMANT_PATTERN),
+      dormantAutoWake: true,
+      dormantProbeMs: 0,
       scrollbackLimitBytes: 4096,
       bannerWindowMs: 100,
     })
@@ -653,6 +669,9 @@ describe('ConsoleSession lifecycle', () => {
       pagingQuietMs: 20,
       promptPattern: compilePattern(DEFAULT_PROMPT_PATTERN),
       pagerPattern: compilePattern(DEFAULT_PAGER_PATTERN),
+      dormantPattern: compileSearchPattern(DEFAULT_DORMANT_PATTERN),
+      dormantAutoWake: true,
+      dormantProbeMs: 0,
       scrollbackLimitBytes: 4096,
     })
     open.push(session)
@@ -660,5 +679,307 @@ describe('ConsoleSession lifecycle', () => {
     expect(['error', 'closed']).toContain(result.state)
     expect(result.lastError?.code).toBeTruthy()
     expect(result.lastError?.message).not.toBe('')
+  })
+})
+
+/**
+ * The half-close a device performs on an idle console.
+ *
+ * Measured against the real lab hardware (see `scripts/probe-dormant.mjs`, which
+ * produced this verbatim): after exactly 300s of silence the device prints
+ *
+ *     \r\nVty connection is timed out.\r\n\r\nPlease press ENTER.
+ *
+ * and then goes completely quiet -- no device events, no command output -- while
+ * the TCP connection stays up. The fake below reproduces that, because the whole
+ * failure mode is "the socket is fine and the console is dead".
+ */
+describe('ConsoleSession dormancy', () => {
+  /** The marker, byte for byte as the real device emits it. */
+  const MARKER = '\r\nVty connection is timed out.\r\n\r\nPlease press ENTER.'
+
+  it('detects the marker, wakes the device, and reports the recovery', async () => {
+    // The fake starts silent: it does NOT greet, because a device that has just
+    // half-closed the session prints nothing at all until a key arrives.
+    let awake = false
+    const server = await startFakeConsole({
+      greeting: '<DUT1>',
+      onBareEnter: () => {
+        // This is the essential half of the fake: the device answers the wake
+        // Enter and NOTHING ELSE. A fake that answered every write would let a
+        // broken implementation pass by waking on some other byte.
+        if (awake) return '<DUT1>'
+        awake = true
+        return '\r\n<DUT1>'
+      },
+    })
+    const session = track(sessionFor(server, { dormantAutoWake: true }), server)
+    await session.open()
+    await until(() => session.status().prompt !== null)
+
+    // The device half-closes: the marker arrives, and from now on it ignores
+    // everything except a bare Enter.
+    awake = false
+    const writesBefore = server.received.length
+    server.push(MARKER)
+
+    // Detection is the session's own job -- it happens on the data path, without
+    // anybody reading, because the device's EVENTS are what stopped.
+    await until(() => session.status().dormancy.dormant)
+    expect(session.status().dormancy.marker).toContain('Please press ENTER')
+    expect(session.status().dormancy.detectedAt).not.toBeNull()
+
+    // And the automatic wake recovers it without a caller doing anything.
+    await until(() => session.status().dormancy.dormant === false)
+    const status = session.status()
+    expect(status.dormancy.wakesSent).toBe(1)
+    // A keepalive would have counted itself separately; this was a recovery.
+    expect(status.dormancy.keepalivesSent).toBe(0)
+    const written = server.received.slice(writesBefore).join('')
+    expect(written).toBe('\r')
+  })
+
+  it('does NOT claim recovery when the device stays silent', async () => {
+    // A device that ignores the Enter entirely -- a port held by another
+    // session, say. Reporting `dormant: false` here would be a lie that leaves a
+    // caller waiting on a console nobody is listening to.
+    const server = await startFakeConsole({ greeting: '<DUT1>' })
+    const session = track(sessionFor(server, { dormantAutoWake: false }), server)
+    await session.open()
+    server.push('\r\nVty connection is timed out.\r\n\r\nPlease press ENTER.')
+    await until(() => session.isDormant())
+
+    // `dormantAutoWake: false` means detection only; the explicit wake is the
+    // caller's, and it must report honestly.
+    const answered = await session.wake('probe')
+    expect(answered).toBe(false)
+    expect(session.isDormant()).toBe(true)
+    expect(session.status().dormancy.dormant).toBe(true)
+  })
+
+  it('wakes exactly once per detection, so its own output cannot re-trigger it', async () => {
+    // The scrollback still CONTAINS the marker after the wake. A scanner that
+    // re-examined the whole window on every chunk would re-set the flag from it,
+    // and the session would press Enter again on every byte the device sent --
+    // an unsolicited keystroke per read.
+    let bareEnters = 0
+    const server = await startFakeConsole({
+      greeting: '<DUT1>',
+      onBareEnter: () => {
+        bareEnters += 1
+        // Answer with the prompt AND keep printing, the way a recovered device
+        // would resume its event log.
+        return `\r\n<DUT1>\r\n%LINK-3-UPDOWN: an event`
+      },
+    })
+    const session = track(sessionFor(server, { dormantAutoWake: true }), server)
+    await session.open()
+    server.push('\r\nVty connection is timed out.\r\n\r\nPlease press ENTER.')
+    await until(() => bareEnters >= 1)
+    await until(() => session.status().dormancy.dormant === false)
+
+    // Feed more output, as a live device would.
+    for (let index = 0; index < 5; index += 1) {
+      server.push(`\r\n%LINK-3-UPDOWN: event ${String(index)}`)
+      await wait(20)
+    }
+    expect(bareEnters).toBe(1)
+    expect(session.status().dormancy.wakesSent).toBe(1)
+  })
+
+  it('augments `read` and `waitFor` with the dormancy state', async () => {
+    const server = await startFakeConsole({ greeting: '<DUT1>' })
+    const session = track(sessionFor(server, { dormantAutoWake: false }), server)
+    await session.open()
+
+    // Healthy: no dormancy reported.
+    expect(session.read({ after: 0 }).dormant).toBe(false)
+
+    server.push('\r\nVty connection is timed out.\r\n\r\nPlease press ENTER.')
+    await until(() => session.isDormant())
+    const read = session.read({ after: 0 })
+    expect(read.dormant).toBe(true)
+    expect(read.dormantText).toContain('Please press ENTER')
+
+    // A wait that begins dormant and finds nothing must say so: otherwise the
+    // caller cannot tell "the device is slow" from "the device is not
+    // listening", and will simply wait again.
+    const waited = await session.waitFor({ for: 'prompt', after: 0, timeoutMs: 150 })
+    expect(waited.matched).toBe(false)
+    expect(waited.reason).toBe('timeout')
+    expect(waited.dormant).toBe(true)
+    expect(waited.dormantBlocked).toBe(true)
+  })
+
+  it('does NOT report dormantBlocked when the wait actually matched', async () => {
+    // The device answers before the budget runs out, so the wait succeeded. A
+    // stale flag here would make a caller distrust a result it can see.
+    const server = await startFakeConsole({
+      greeting: '<DUT1>',
+      onBareEnter: () => '\r\n<DUT1>',
+    })
+    const session = track(sessionFor(server, { dormantAutoWake: true }), server)
+    await session.open()
+    server.push('\r\nVty connection is timed out.\r\n\r\nPlease press ENTER.')
+    await until(() => session.status().dormancy.dormant === false)
+
+    // The marker is still in the window; a wait for anything must not be
+    // reported as blocked by a dormancy that is over.
+    const waited = await session.waitFor({ for: 'prompt', after: 0, timeoutMs: 150 })
+    expect(waited.matched).toBe(true)
+    expect(waited.dormantBlocked).toBeUndefined()
+  })
+
+  it('sends a keepalive before the device can time out, and does not count it as use', async () => {
+    // The keepalive exists to stop the half-close happening at all. It must fire
+    // on ITS own clock while nobody is watching -- and it must NOT refresh the
+    // idle clock the reaper reads, or a forgotten tab would become immortal.
+    //
+    // The fake device is SILENT: it never answers the Enter. That is what makes
+    // the assertion sharp, because a device that answers would legitimately
+    // refresh the idle clock with its own reply, and the test could not then tell
+    // the probe's write from the device's answer.
+    const server = await startFakeConsole({ greeting: '<DUT1>' })
+    const session = track(sessionFor(server, { dormantAutoWake: true, dormantProbeMs: 60 }), server)
+    await session.open()
+    expect(server.received.join('')).toBe('')
+
+    // Wait for the first probe to reach the device.
+    await until(() => server.received.join('') !== '', 2500)
+    expect(server.received.join('')).toBe('\r')
+
+    // Now sample the idle clock WITHOUT reading -- a read legitimately resets it,
+    // so reading here would mask exactly the bug this test exists to catch --
+    // and watch across at least one more probe.
+    //
+    // `idleMs` is the clock the reaper reads. The invariant is that a probe does
+    // not touch it: it must keep climbing through the probe, and never jump
+    // backwards. An absolute threshold alone cannot see the difference, because
+    // the clock recovers to a large value between probes either way -- which is
+    // how a `write()` in place of `writeRaw()` slipped past the first version.
+    const startedAt = Date.now()
+    let lastIdle = session.status().idleMs
+    let drops = 0
+    const deadline = startedAt + 900
+    while (Date.now() < deadline) {
+      const idleNow = session.status().idleMs
+      if (idleNow < lastIdle) drops += 1
+      lastIdle = idleNow
+      await wait(10)
+    }
+
+    const elapsed = Date.now() - startedAt
+    const status = session.status()
+    // The clock tracked wall-clock time across the probes: it was never reset.
+    expect(drops).toBe(0)
+    expect(lastIdle).toBeGreaterThanOrEqual(elapsed - 60)
+    expect(lastIdle).toBeGreaterThan(500)
+    // And the probes really did happen in that window, each writing a bare CR.
+    expect(status.dormancy.keepalivesSent).toBeGreaterThanOrEqual(2)
+    expect(server.received.join('')).toBe('\r'.repeat(status.dormancy.keepalivesSent))
+    expect(status.state).toBe('open')
+    // A keepalive nobody answered must NOT mark the console dormant: a device
+    // ignoring a probe is not a device announcing a half-close.
+    expect(status.dormancy.dormant).toBe(false)
+  })
+
+  it('does not let a wake ANSWER keep the console looking used', async () => {
+    // The keepalive must not make a forgotten console immortal. Against the lab
+    // firewall the device answers every probe, and those answers were refreshing
+    // the clock the idle reaper reads -- so a console nobody had touched stayed
+    // below the reaper's threshold forever. The live suite caught it as
+    // `idleMs: 846` where the probe period was 3000ms.
+    //
+    // This is the miniature: a device that answers every bare Enter, probed fast,
+    // and an idle clock that must still cross the probe period.
+    let answers = 0
+    const server = await startFakeConsole({
+      greeting: '<DUT1>',
+      onBareEnter: () => {
+        answers += 1
+        return '\r\n<DUT1>'
+      },
+    })
+    const session = track(sessionFor(server, { dormantAutoWake: true, dormantProbeMs: 100 }), server)
+    await session.open()
+
+    // Wait until several probes have been answered.
+    await until(() => answers >= 3, 3000)
+    // The idle clock has to exceed the probe period, which it cannot do if each
+    // answered probe reset it.
+    expect(session.status().idleMs).toBeGreaterThan(100)
+    // Sanity: the device really did answer, so the exclusion is being exercised.
+    expect(answers).toBeGreaterThanOrEqual(3)
+    expect(session.status().state).toBe('open')
+  })
+
+  it('keeps probing a CHATTY idle device, whose output does not count as input', async () => {
+    // The hardware finding that shaped this design. MEASURED against the lab
+    // firewall (`scripts/probe-idle-input.mjs`): after the connect wake nothing
+    // was sent for 300s, the device streamed output the entire time, and it STILL
+    // announced "Vty connection is timed out. Please press ENTER."
+    //
+    // So the device's idle timer counts INPUT. A keepalive whose clock reset on
+    // inbound bytes would therefore never fire against exactly the device that
+    // needs it -- which is what the live suite caught (`keepalivesSent: 0`).
+    // This test is that case in miniature: a device that talks constantly and
+    // never receives a keystroke.
+    let bareEnters = 0
+    const server = await startFakeConsole({
+      greeting: '<DUT1>',
+      onBareEnter: () => {
+        bareEnters += 1
+        return '\r\n<DUT1>'
+      },
+    })
+    const session = track(sessionFor(server, { dormantAutoWake: true, dormantProbeMs: 150 }), server)
+    await session.open()
+
+    // Keep the DEVICE talking, without ever writing to it.
+    const chatter = setInterval(() => { server.push('\r\n%LINK-3-UPDOWN: an event') }, 25)
+    try {
+      await until(() => bareEnters >= 2, 3000)
+      expect(bareEnters).toBeGreaterThanOrEqual(2)
+      expect(session.status().dormancy.keepalivesSent).toBeGreaterThanOrEqual(2)
+      // It never mistook its own probes for a half-close announcement.
+      expect(session.status().dormancy.dormant).toBe(false)
+    } finally {
+      clearInterval(chatter)
+    }
+  })
+
+  it('real activity resets the keepalive, so an active session is never probed', async () => {
+    let bareEnters = 0
+    const server = await startFakeConsole({
+      greeting: '<DUT1>',
+      onLine: () => '\r\ndone\r\n<DUT1>',
+      onBareEnter: () => {
+        bareEnters += 1
+        return '\r\n<DUT1>'
+      },
+    })
+    const session = track(sessionFor(server, { dormantProbeMs: 120 }), server)
+    await session.open()
+
+    // Send a real command every 40ms for 400ms. The probe window never elapses
+    // without fresh traffic, so no unsolicited Enter may reach the device.
+    for (let index = 0; index < 10; index += 1) {
+      await session.send(`show item ${String(index)}`)
+      await wait(40)
+    }
+    expect(bareEnters).toBe(0)
+    expect(session.status().dormancy.keepalivesSent).toBe(0)
+
+    // Once the conversation stops, the keepalive resumes and fires.
+    await until(() => bareEnters >= 1, 2000)
+    expect(bareEnters).toBeGreaterThanOrEqual(1)
+  })
+
+  it('a read does not disturb a console whose keepalive is disabled', async () => {
+    const server = await startFakeConsole({ greeting: '<DUT1>' })
+    const session = track(sessionFor(server, { dormantProbeMs: 0 }), server)
+    await session.open()
+    await wait(80)
+    expect(server.received.join('')).toBe('')
   })
 })

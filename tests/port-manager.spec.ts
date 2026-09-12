@@ -6,7 +6,7 @@
 import { createServer, type Server, type Socket } from 'node:net'
 import { afterEach, describe, expect, it } from 'vitest'
 import { PortManager, type ConsoleDescriptor } from '../src/port-manager.ts'
-import { DEFAULT_PAGER_PATTERN, DEFAULT_PROMPT_PATTERN } from '../src/config-shared.ts'
+import { DEFAULT_DORMANT_PATTERN, DEFAULT_PAGER_PATTERN, DEFAULT_PROMPT_PATTERN } from '../src/config-shared.ts'
 
 /** A tiny TCP server that greets and then stays up. */
 interface FakeDevice {
@@ -54,6 +54,9 @@ function managerFor(options: Partial<ConstructorParameters<typeof PortManager>[0
     pagingQuietMs: 20,
     promptPattern: DEFAULT_PROMPT_PATTERN,
     pagerPattern: DEFAULT_PAGER_PATTERN,
+    dormantPattern: DEFAULT_DORMANT_PATTERN,
+    dormantAutoWake: true,
+    dormantProbeMs: 0,
     ...options,
   })
 }

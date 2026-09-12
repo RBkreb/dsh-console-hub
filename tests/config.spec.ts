@@ -98,6 +98,32 @@ describe('parseSettingsDocument', () => {
       expect(parseSettingsDocument({ pagingMode: mode }).pagingMode).toBe(mode)
     }
   })
+
+  it('compiles the dormant pattern against the SEARCH matcher it actually runs', () => {
+    // The dormancy marker is matched anywhere in the stream, not at the tail, so
+    // it is validated with `compileSearchPattern`. Validating it with the
+    // tail-anchored `compilePattern` would accept a source that then behaved
+    // differently at runtime -- the two matchers wrap the source differently.
+    expect(() => parseSettingsDocument({ dormantPattern: '(' })).toThrow(/dormantPattern/)
+    const bad = findBadPatterns(ConsoleHubSettingsSchema({ dormantPattern: '[unclosed' } as never))
+    expect(bad.map(entry => entry.field)).toEqual(['dormantPattern'])
+  })
+
+  it('defaults the dormancy controls to on, with a keepalive under the measured timeout', () => {
+    const resolved = parseSettingsDocument({})
+    expect(resolved.dormantAutoWake).toBe(true)
+    expect(resolved.dormantPattern).toContain('please')
+    // Measured: both lab devices half-close at exactly 300s
+    // (`scripts/probe-dormant.mjs`). The default keepalive must fire WELL inside
+    // that, or it would race the thing it exists to prevent.
+    expect(resolved.dormantProbeMs).toBeGreaterThan(0)
+    expect(resolved.dormantProbeMs).toBeLessThan(300_000)
+  })
+
+  it('allows disabling the keepalive, and refuses a negative window', () => {
+    expect(parseSettingsDocument({ dormantProbeMs: 0 }).dormantProbeMs).toBe(0)
+    expect(() => parseSettingsDocument({ dormantProbeMs: -1 })).toThrow(/dormantProbeMs/)
+  })
 })
 
 describe('resolveConsoleHubConfig', () => {

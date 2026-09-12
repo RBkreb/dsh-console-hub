@@ -60,6 +60,43 @@ export const DEFAULT_PAGER_PATTERN
   = '--\\s*more\\s*--|----\\s*more\\s*----|\\bmore:\\s*$|\\(q\\)uit|press any key|按任意键|continue\\?'
 
 /**
+ * What a device prints when it has torn down the console session on ITS side
+ * while leaving the TCP connection up.
+ *
+ * Measured on the lab hardware, not invented: after a long idle period the
+ * device announces
+ *
+ *     Vty connection is timed out.
+ *
+ *     Please press ENTER.
+ *
+ * and then prints nothing at all — no device events, no command output — until
+ * somebody presses a key. The socket never closes, so from the plugin's side the
+ * console still looks `open` while it is in fact dormant. That is the failure
+ * this pattern exists to name.
+ *
+ * Matched as an unanchored SEARCH, because it arrives in the middle of output
+ * rather than at the tail like a prompt, and case-insensitively so a device that
+ * shouts `ENTER` and one that whispers `Enter` both count. `press enter` is
+ * deliberately distinct from the pager's `press any key`.
+ *
+ * The bytes, verbatim from `scripts/probe-dormant.mjs`:
+ *
+ *     \r\nVty connection is timed out.\r\n\r\nPlease press ENTER.
+ *
+ * The first alternative spans the whole announcement, so the marker a caller is
+ * shown is the device's own sentence pair rather than whichever half happened to
+ * match first -- an alternation of the two halves alone reported only "Vty
+ * connection is timed out", which reads like a socket error instead of a request
+ * for a keystroke. The other two alternatives keep detection working for a
+ * device that prints only one of the halves.
+ */
+export const DEFAULT_DORMANT_PATTERN
+  = 'vty\\s+connection\\s+is\\s+timed\\s+out[\\s\\S]{0,120}?please\\s+press\\s+enter'
+  + '|vty\\s+connection\\s+is\\s+timed\\s+out'
+  + '|please\\s+press\\s+enter'
+
+/**
  * Command-line prefixes that must not reach a device without an explicit
  * human decision: entering configuration mode, and restarting the box. Split
  * into two sources because the fence matches each independently — a `show`
@@ -130,6 +167,30 @@ export interface ConsoleHubSettings {
   promptPattern: string
   /** Default pager pattern for views that do not override it. */
   pagerPattern: string
+  /** Marker text a device prints when it half-closed an idle console. */
+  dormantPattern: string
+  /**
+   * Answer that marker with one bare Enter, which is what the device is asking
+   * for. On by default because the alternative is a console that silently prints
+   * nothing: the marker exists precisely to request a keystroke.
+   */
+  dormantAutoWake: boolean
+  /**
+   * Idle milliseconds after which a bare Enter is sent to KEEP an idle console
+   * awake, before the device's own timeout can fire. `0` disables it.
+   *
+   * A keepalive rather than a recovery: it is cheaper than detecting the
+   * half-close and cleaning up after it, and it is the only thing that makes the
+   * device keep printing its events. It deliberately does NOT count as "someone
+   * is using this console", so the idle reaper can still reclaim a forgotten
+   * tab.
+   *
+   * MEASURED, not guessed: both lab devices tear the console session down after
+   * exactly 300s of silence (`scripts/probe-dormant.mjs`), and any real traffic
+   * resets that timer. The default sits well under that so the probe always wins
+   * the race; a deployment whose devices idle out faster lowers it.
+   */
+  dormantProbeMs: number
   /**
    * Send one bare Enter when a device says nothing on connect.
    *
@@ -176,6 +237,9 @@ export const DEFAULT_CONSOLE_HUB_SETTINGS: ConsoleHubSettings = {
   highRiskPatterns: [...DEFAULT_HIGH_RISK_PATTERNS],
   promptPattern: DEFAULT_PROMPT_PATTERN,
   pagerPattern: DEFAULT_PAGER_PATTERN,
+  dormantPattern: DEFAULT_DORMANT_PATTERN,
+  dormantAutoWake: true,
+  dormantProbeMs: 120_000,
   wakeOnConnect: true,
   agentInstructions: '',
   agentConsoleTools: true,

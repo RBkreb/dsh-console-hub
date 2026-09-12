@@ -45,6 +45,7 @@ export const CONSOLE_TOOL_NAMES = [
   'console_list_views',
   'console_connect',
   'console_send',
+  'console_wake',
   'console_read',
   'console_wait_for',
   'console_close',
@@ -175,6 +176,10 @@ interface ConsoleListRow {
   idleMs: number
   /** Present only when the console recorded a failure. */
   lastErrorCode?: string
+  /** Whether the device half-closed this idle console. */
+  dormant?: boolean
+  /** The marker text that proved it. */
+  dormantText?: string
 }
 
 /**
@@ -216,8 +221,12 @@ function handle(id: string): string {
 /** Render one console as a line. */
 function consoleRowLine(row: ConsoleListRow): string {
   const error = row.lastErrorCode === undefined ? '' : ` [${row.lastErrorCode}]`
+  // Dormancy is loud in the rendering, not a quiet extra field: a caller reading
+  // this list must understand that a `open` console here will answer nothing
+  // until Enter is pressed.
+  const dormant = row.dormant === true ? '  DORMANT (device half-closed it; console_wake to press Enter)' : ''
   return `${handle(row.consoleId)}  ${row.label}  ${row.host}:${String(row.port)}  ${row.kind}  `
-    + `${row.state}${error}  idle ${String(Math.round(row.idleMs / 1000))}s`
+    + `${row.state}${error}  idle ${String(Math.round(row.idleMs / 1000))}s${dormant}`
 }
 
 /** The calling agent's session id, or a throw that names the missing scope. */
@@ -351,6 +360,8 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
     description:
       'List the device consoles this session has CONNECTED (open right now). Each row carries the handle to pass to '
       + 'console_send / console_read / console_close, plus its label, address, transport, state and idle time. '
+      + 'A row marked `dormant: true` is still open but the DEVICE half-closed it after sitting idle: it will print '
+      + 'nothing until someone presses Enter, so wake it with console_wake before expecting any output. '
       + 'This does NOT list configured-but-unconnected devices -- call console_list_views for those, then '
       + 'console_connect with the viewId it returns.',
     parameters: parameterSchemaSpecToJsonSchema({}),
@@ -368,6 +379,8 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
             secure: { type: 'boolean' },
             idleMs: { type: 'number' },
             lastErrorCode: { type: 'string' },
+            dormant: { type: 'boolean' },
+            dormantText: { type: 'string' },
           }, ['consoleId', 'label', 'host', 'port', 'kind', 'state', 'secure', 'idleMs']),
         },
       }, ['consoles']),
@@ -392,6 +405,10 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
         // it. Omitted rather than null when there is none: the schema declares an
         // optional string, and an explicit null would violate it.
         ...entry.lastError === null ? {} : { lastErrorCode: entry.lastError.code },
+        // A dormant console is `open` and answers nothing until Enter is pressed,
+        // so a list that reported only the state would be actively misleading.
+        dormant: entry.dormant,
+        ...entry.dormantText === null ? {} : { dormantText: entry.dormantText },
       }))
       return { consoles }
     },
@@ -669,11 +686,16 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
     description:
       'Send one line of input to a device console. The host appends the submit key (Enter by default), so do NOT '
       + 'include a trailing newline. Set `submit: false` to write without pressing Enter, and `submitKey` to override '
-      + 'what Enter means for this device. High-risk commands (entering configuration mode, restarting) are refused '
-      + 'unless the user approves them.',
+      + 'what Enter means for this device. '
+      + 'An EMPTY `text` is allowed and presses Enter alone, which is how a console the device half-closed is woken; '
+      + 'whitespace is passed through byte for byte, because a single space is a pager\'s next-page key. '
+      + 'High-risk commands (entering configuration mode, restarting) are refused unless the user approves them.',
     parameters: parameterSchemaSpecToJsonSchema({
       consoleId: CONSOLE_ID,
-      text: { type: 'string', required: true, description: 'The line to send (no trailing newline).' },
+      text: {
+        type: 'string',
+        description: 'The line to send (no trailing newline). Omit or leave empty to press Enter alone.',
+      },
       submit: { type: 'boolean', description: 'Whether to append the submit key (default true).' },
       submitKey: { type: 'string', description: 'Submit key override; defaults to a carriage return.' },
       encoding: { type: 'string', description: 'Encoding override for this write.' },
@@ -684,9 +706,10 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
         state: { type: 'string' },
         written: { type: 'number' },
         pagingActive: { type: 'boolean' },
+        dormant: { type: 'boolean' },
       }, ['consoleId', 'state', 'written']),
       render: (_args: unknown, value: unknown) => {
-        const result = value as { consoleId: string, state: string, pagingActive?: boolean }
+        const result = value as { consoleId: string, state: string, pagingActive?: boolean, dormant?: boolean }
         const paging = result.pagingActive === true ? ' A pager prompt is waiting; read the output or send a page key.' : ''
         return text(`Sent to ${result.consoleId} (${result.state}).${paging}`)
       },
@@ -698,17 +721,23 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
       const consoleId = parsed.consoleId
       if (typeof consoleId !== 'string' || consoleId === '') throw new Error('"consoleId" is required')
       const command = parsed.text
-      if (typeof command !== 'string' || command === '') throw new Error('"text" is required')
+      // Deliberately allows `''` and any whitespace: an empty line presses Enter
+      // (the wake keystroke), and a single space is a pager's next-page key. Only
+      // a WRONG TYPE is refused.
+      if (command !== undefined && command !== null && typeof command !== 'string') {
+        throw new Error('"text" must be a string')
+      }
+      const line = typeof command === 'string' ? command : ''
 
       // The guard runs before anything reaches the wire, so a fenced command
       // cannot be written even by a direct tool call.
-      await deps.guard?.({ exec, sessionId, consoleId, text: command })
+      await deps.guard?.({ exec, sessionId, consoleId, text: line })
 
       const encoding = checkedEncoding(parsed.encoding)
       const submit = parsed.submit
       if (submit !== undefined && typeof submit !== 'boolean') throw new Error('"submit" must be a boolean')
       const submitKey = optionalText(parsed.submitKey, 'submitKey')
-      const entry = await deps.manager.send(sessionId, consoleId, command, {
+      const entry = await deps.manager.send(sessionId, consoleId, line, {
         ...encoding === undefined ? {} : { encoding },
         ...submit === undefined ? {} : { submit },
         ...submitKey === undefined ? {} : { submitKey },
@@ -720,6 +749,70 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
         state: entry.state,
         written: detail?.state.bytesWritten ?? 0,
         ...detail?.state.paging === undefined ? {} : { pagingActive: detail.state.paging.active },
+        // Reported because a send does not by itself wake a dormant console: the
+        // bytes go out, the device ignores them, and the next read is empty.
+        ...detail?.state.dormancy === undefined ? {} : { dormant: detail.state.dormancy.dormant },
+      }
+    },
+  })
+
+  register({
+    name: 'console_wake',
+    description:
+      'Press Enter once on a device console, to wake a console the DEVICE half-closed after sitting idle. '
+      + 'A remote console times out its own session after a long silence and announces it ("Vty connection is timed '
+      + 'out. Please press ENTER."), after which it prints no device events and answers no command until a key '
+      + 'arrives. The TCP connection stays up throughout, so nothing about the console looks broken from outside. '
+      + 'The plugin detects that marker and answers it automatically; call this when a console reports '
+      + '`dormant: true` (console_list, console_read) or `dormantBlocked: true` (console_wait_for), or after a long '
+      + 'pause when the console has gone quiet. It sends exactly one Enter, never a command, and reports whether the '
+      + 'device answered. `console_send` with an empty `text` does the same thing.',
+    parameters: parameterSchemaSpecToJsonSchema({
+      consoleId: CONSOLE_ID,
+    }),
+    output: {
+      schema: outputSchema({
+        consoleId: { type: 'string' },
+        answered: { type: 'boolean' },
+        dormant: { type: 'boolean' },
+        state: { type: 'string' },
+      }, ['consoleId', 'answered', 'dormant', 'state']),
+      render: (_args: unknown, value: unknown) => {
+        const result = value as { consoleId: string, answered: boolean, dormant: boolean, state: string }
+        if (result.answered) {
+          return text(
+            `Pressed Enter on ${result.consoleId}; the device answered, so the console is live again. `
+            + 'Read the output that arrived, then send the command you were trying.',
+          )
+        }
+        if (result.dormant) {
+          return text(
+            `Pressed Enter on ${result.consoleId} but the device still says nothing, so it is still dormant. `
+            + 'It may need longer, or the console server may be holding the port for another session.',
+          )
+        }
+        return text(
+          `Pressed Enter on ${result.consoleId}; no new output arrived inside the wake window `
+          + `(console state ${result.state}). A console that answers nothing to Enter may simply have nothing to say.`,
+        )
+      },
+    },
+    execute: async (args: unknown, exec: ConsoleToolRunContext) => {
+      assertLive(exec)
+      const sessionId = sessionIdOf(exec)
+      const parsed = (args ?? {}) as Record<string, unknown>
+      const consoleId = parsed.consoleId
+      if (typeof consoleId !== 'string' || consoleId === '') throw new Error('"consoleId" is required')
+      // Deliberately NOT behind the high-risk fence: a bare Enter runs no
+      // command. Putting the recovery keystroke behind an approval prompt would
+      // make an idle console harder to recover than it is to disturb.
+      const answered = await deps.manager.wake(sessionId, consoleId)
+      const detail = deps.manager.describe(sessionId, consoleId)
+      return {
+        consoleId,
+        answered,
+        dormant: detail?.entry.dormant ?? false,
+        state: detail?.entry.state ?? 'closed',
       }
     },
   })
@@ -730,7 +823,9 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
       'Read console output received since a cursor. Pass the `cursor` from the previous call as `after` so no output '
       + 'is read twice; the first call uses `after: 0`. Returns the decoded text, the next cursor, whether the answer '
       + 'was truncated at the output cap, and the device prompt if one is at the tail. '
-      + 'Use `stripEcho` to drop the command line the device echoed back.',
+      + 'Use `stripEcho` to drop the command line the device echoed back. '
+      + 'If `dormant` is true the device half-closed this console after sitting idle and will not print anything '
+      + 'until someone presses Enter: call console_wake, or console_send with an empty `text`.',
     parameters: parameterSchemaSpecToJsonSchema({
       consoleId: CONSOLE_ID,
       after: { type: 'number', description: 'Cursor to read from; omit or 0 for everything still buffered.' },
@@ -748,6 +843,7 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
         prompt: { type: 'string' },
         pager: { type: 'string' },
         pagingActive: { type: 'boolean' },
+        dormant: { type: 'boolean' },
       }, ['text', 'cursor', 'truncated', 'bytes', 'encoding', 'pagingActive']),
       render: (_args: unknown, value: unknown) => {
         const result = value as {
@@ -756,11 +852,15 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
           truncated: boolean
           prompt?: string
           pagingActive: boolean
+          dormant?: boolean
         }
         const notes: string[] = []
         if (result.truncated) notes.push('truncated at the output cap; read again from the returned cursor')
         if (result.prompt !== undefined) notes.push(`prompt ${result.prompt}`)
         if (result.pagingActive) notes.push('a pager prompt is waiting')
+        if (result.dormant === true) {
+          notes.push('the device half-closed this idle console; press Enter with console_wake to wake it')
+        }
         const suffix = notes.length === 0 ? '' : `\n[${notes.join('; ')}]`
         const body = result.text === '' ? '(no new output)' : result.text
         return text(`${body}\n[cursor ${String(result.cursor)}]${suffix}`)
@@ -794,6 +894,7 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
         ...read.prompt === undefined ? {} : { prompt: read.prompt },
         ...read.pager === undefined ? {} : { pager: read.pager },
         pagingActive: read.paging.active,
+        dormant: read.dormant,
       }
     },
   })
@@ -805,7 +906,9 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
       + 'wait until the CLI prompt comes back, `for: "pattern"` with a regular expression to wait for a specific line, '
       + 'or `for: "idle"` to wait until output stops arriving. This is the right way to wait for a command to finish — '
       + 'do not poll console_read in a loop. A timeout is a normal result (matched: false, reason: "timeout"), not an '
-      + 'error, so read the output that did arrive.',
+      + 'error, so read the output that did arrive. When the wait fails because the device half-closed an idle console '
+      + '(`dormantBlocked`), the console cannot answer until you press Enter with console_wake — waiting again will '
+      + 'change nothing.',
     parameters: parameterSchemaSpecToJsonSchema({
       consoleId: CONSOLE_ID,
       for: { type: 'string', enum: ['prompt', 'idle', 'pattern'], description: 'What to wait for (default prompt).' },
@@ -821,6 +924,8 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
         matchedText: { type: 'string' },
         cursor: { type: 'number' },
         elapsedMs: { type: 'number' },
+        dormant: { type: 'boolean' },
+        dormantBlocked: { type: 'boolean' },
       }, ['matched', 'reason', 'cursor', 'elapsedMs']),
       render: (_args: unknown, value: unknown) => {
         const result = value as {
@@ -828,12 +933,24 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
           reason: string
           matchedText?: string
           elapsedMs: number
+          dormant?: boolean
+          dormantBlocked?: boolean
         }
         if (result.matched) {
           const what = result.matchedText === undefined ? 'the output went quiet' : `saw ${result.matchedText}`
-          return text(`Waited ${String(result.elapsedMs)}ms and ${what}.`)
+          const dormantNote = result.dormant === true
+            ? ' The device then half-closed this idle console; wake it with console_wake before the next command.'
+            : ''
+          return text(`Waited ${String(result.elapsedMs)}ms and ${what}.${dormantNote}`)
         }
         if (result.reason === 'closed') return text('The console closed while waiting.')
+        if (result.dormantBlocked === true) {
+          return text(
+            `Waited ${String(result.elapsedMs)}ms and nothing matched: the device half-closed this idle console and `
+            + 'will print nothing until someone presses Enter. Wake it with console_wake (or console_send with an '
+            + 'empty text), then wait again.',
+          )
+        }
         return text(
           `Waited ${String(result.elapsedMs)}ms and nothing matched. The device may still be working; `
           + 'read the output, or wait again with a longer timeout.',
@@ -874,6 +991,8 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
         ...waited.matchedText === undefined ? {} : { matchedText: waited.matchedText },
         cursor: waited.cursor,
         elapsedMs: waited.elapsedMs,
+        dormant: waited.dormant,
+        ...waited.dormantBlocked === true ? { dormantBlocked: true } : {},
       }
     },
   })

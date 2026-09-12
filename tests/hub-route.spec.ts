@@ -12,7 +12,7 @@ import { buildHubRoute, HUB_API_PREFIX } from '../src/hub-route.ts'
 import type { ConsoleHubApi } from '../src/routes.ts'
 import type { ConsoleSessionApi } from '../src/console-routes.ts'
 import { PortManager } from '../src/port-manager.ts'
-import { DEFAULT_PAGER_PATTERN, DEFAULT_PROMPT_PATTERN, type ConsoleHubSettings } from '../src/config-shared.ts'
+import { DEFAULT_DORMANT_PATTERN, DEFAULT_PAGER_PATTERN, DEFAULT_PROMPT_PATTERN, type ConsoleHubSettings } from '../src/config-shared.ts'
 import { parseSettingsDocument } from '../src/config.ts'
 import type {
   ConsoleCredentialProvider,
@@ -157,6 +157,9 @@ function apiFor(device: Device): { hub: ConsoleHubApi, session: ConsoleSessionAp
     pagingQuietMs: 20,
     promptPattern: DEFAULT_PROMPT_PATTERN,
     pagerPattern: DEFAULT_PAGER_PATTERN,
+    dormantPattern: DEFAULT_DORMANT_PATTERN,
+    dormantAutoWake: true,
+    dormantProbeMs: 0,
   })
   const settings = fakeSettings({ views: {} })
   const credentials = fakeCredentials()

@@ -25,6 +25,7 @@ import {
   PAGING_MODES,
   compileCommandFence,
   compilePattern,
+  compileSearchPattern,
   type ConsoleHubSettings,
 } from './config-shared.ts'
 import { assertNoSecretsInViews } from './views.ts'
@@ -85,6 +86,11 @@ export const ConsoleHubSettingsSchema: z<ConsoleHubSettings> = z.object({
   highRiskPatterns: z.array(z.string()).default([...DEFAULT_HIGH_RISK_PATTERNS]),
   promptPattern: z.string().default(DEFAULT_CONSOLE_HUB_SETTINGS.promptPattern),
   pagerPattern: z.string().default(DEFAULT_CONSOLE_HUB_SETTINGS.pagerPattern),
+  dormantPattern: z.string().default(DEFAULT_CONSOLE_HUB_SETTINGS.dormantPattern),
+  dormantAutoWake: z.boolean().default(true),
+  // 0 disables the keepalive; the minimum is one second so a mis-set value
+  // cannot turn the probe into a keystroke flood on the device.
+  dormantProbeMs: z.number().step(1).min(0).max(86_400_000).default(120_000),
   // ON by default: without it a silent console eats the caller's first command
   // as the wake keystroke, which reads as a broken console rather than a
   // missing newline. See the field's docs in config-shared.ts.
@@ -102,6 +108,7 @@ export const ConsoleHubSettingsSchema: z<ConsoleHubSettings> = z.object({
 export interface PatternBearingFields {
   promptPattern: string
   pagerPattern: string
+  dormantPattern: string
   highRiskPatterns: readonly string[]
   views: Record<string, { promptPattern: string, pagerPattern: string }>
 }
@@ -132,6 +139,9 @@ export function findBadPatterns(settings: PatternBearingFields): PatternRejectio
   }
   check('promptPattern', settings.promptPattern, compilePattern)
   check('pagerPattern', settings.pagerPattern, compilePattern)
+  // SEARCH-compiled, not tail-anchored: the dormancy marker arrives mid-stream,
+  // so it is validated against the matcher that will actually run it.
+  check('dormantPattern', settings.dormantPattern, compileSearchPattern)
   settings.highRiskPatterns.forEach((source, index) => {
     check(`highRiskPatterns.${index}`, source, compileCommandFence)
   })

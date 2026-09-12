@@ -104,6 +104,12 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
   const [configOpen, setConfigOpen] = useState(false)
   const [pending, setPending] = useState<PendingConfirm | undefined>(undefined)
   const [paging, setPaging] = useState(false)
+  // Whether the device has half-closed the selected console. Mirrors the host's
+  // own belief rather than being inferred here: the host sees the marker text.
+  const [dormant, setDormant] = useState(false)
+  // The keepalive box's in-progress text, or `undefined` when it is showing the
+  // host's value. See the input's own note for why it is not fully controlled.
+  const [keepaliveDraft, setKeepaliveDraft] = useState<string | undefined>(undefined)
   const [prefs, setPrefs] = useState(() => uiPrefs.get())
 
   // One buffer per console, held in a ref: a read appends on every tick, and
@@ -115,6 +121,15 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
   // poll effect's dependencies would rebuild the interval after each one.
   const cursorRef = useRef(0)
   const buffersRef = useRef(new ConsoleBuffers())
+  /**
+   * The live console rows, mirrored into a ref.
+   *
+   * `select` must read a console's dormancy WITHOUT taking `consoles` as a
+   * dependency: it is memoized on `[]` and is a dependency of `connect` and of
+   * the selection effect, so rebuilding it on every poll would restart the poll
+   * loop each time the list came back.
+   */
+  const consolesRef = useRef<ConsoleRow[]>([])
   const outputRef = useRef<HTMLPreElement | null>(null)
   useEffect(() => uiPrefs.subscribe(setPrefs), [])
 
@@ -142,6 +157,12 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
     }
     if (live.status === 'fulfilled') {
       setConsoles(live.value.consoles)
+      // The list is authoritative for dormancy too: the host re-derives it from
+      // the device's own marker on every read. It reaches the banner through
+      // `select` (on a switch) and through the read loop (while selected) --
+      // deliberately NOT by reading `selected` here, because that would make
+      // `refresh` change identity on every switch and restart its own effect.
+      consolesRef.current = live.value.consoles
       // Forget consoles that ended elsewhere (closed from another surface, or
       // idle-reaped), so their output does not sit in memory for the life of
       // the tab. Safe to do unconditionally: the host's list is authoritative
@@ -176,6 +197,10 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
     const buffered = buffersRef.current.get(consoleId)
     setOutput(buffered.text)
     setPaging(buffered.paging)
+    // Taken from the host's row, not remembered from the last console: a
+    // dormancy belongs to ONE console, and carrying it across a switch would
+    // banner a healthy console as dormant.
+    setDormant(consolesRef.current.find(row => row.consoleId === consoleId)?.dormant === true)
     cursorRef.current = buffered.cursor
   }, [])
 
@@ -268,6 +293,11 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
         setOutput(next.text)
         setPaging(next.paging)
         cursorRef.current = next.cursor
+        // The host detects the half-close from the device's own marker, so the
+        // panel only has to reflect it. Reported rather than auto-woken here:
+        // the host ALREADY answers the marker when `dormantAutoWake` is on, so
+        // a second Enter from the panel would be an unsolicited keystroke.
+        if (typeof result.dormant === 'boolean') setDormant(result.dormant)
       }
       if (result.paging.active && result.paging.reason === 'max-pages') {
         setStatus('自动翻页达到页数上限，点击“继续翻页”接着读。')
@@ -332,7 +362,11 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
 
   /** Write one command, asking first when the fence says it is high-risk. */
   const write = useCallback(async (text: string, confirmationToken?: string) => {
-    if (selected === undefined || text === '') return
+    if (selected === undefined) return
+    // `''` is a legitimate write -- it is the bare Enter that wakes a dormant
+    // console -- so nothing is filtered here. Whitespace is deliberately NOT
+    // trimmed either: a single space is the pager's next-page key, and sending
+    // something other than what was asked for is worse than sending a blank.
     setBusy(true)
     setError(null)
     try {
@@ -352,8 +386,12 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
   /** Submit the draft: fence it first, then either write or ask. */
   const submit = useCallback(async () => {
     if (selected === undefined) return
-    const text = draft.trim()
-    if (text === '') return
+    // NOT trimmed and not required to be non-empty. An empty box means "press
+    // Enter", and a box holding only spaces means "send those spaces" -- which
+    // is what a `--More--` prompt wants. Trimming here silently rewrote the
+    // user's input, and refusing an empty draft made the panel unable to wake a
+    // dormant console at all.
+    const text = draft
     setBusy(true)
     setError(null)
     try {
@@ -387,6 +425,45 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
       setError(messageOf(failure))
     }
   }, [hub, sessionId, selected, readOnce])
+
+  /**
+   * Press Enter once on the selected console.
+   *
+   * The console server tears its session down after a long silence and then
+   * prints nothing at all, so this is the only thing that makes a dormant
+   * console speak again. It is a bare Enter, never a command: nothing is run.
+   *
+   * @param announce - whether to report the outcome in the status line. The
+   *   automatic path (a detected dormancy) stays quiet, because the panel
+   *   already shows the banner and the device's own output follows.
+   */
+  const wake = useCallback(async (announce = true) => {
+    if (selected === undefined) return
+    setBusy(true)
+    setError(null)
+    try {
+      const result = await hub.wake(sessionId, selected)
+      setDormant(false)
+      await readOnce(selected)
+      if (!announce) return
+      if (result.answered) {
+        setStatus('已发送回车，设备已响应。')
+      } else if (result.dormant) {
+        setStatus('已发送回车，但设备仍未响应；可能需要再试，或该端口被其它会话占用。')
+      } else {
+        setStatus('已发送回车；唤醒窗口内没有新输出。')
+      }
+    } catch (failure) {
+      if (isGone(failure)) {
+        setSelected(undefined)
+        await refresh()
+      } else {
+        setError(messageOf(failure))
+      }
+    } finally {
+      setBusy(false)
+    }
+  }, [hub, sessionId, selected, readOnce, refresh])
 
   /** Delete one saved view (and, on the host, its stored credential). */
   const removeView = useCallback(async (viewId: string) => {
@@ -515,6 +592,53 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
             连接后自动唤醒
           </label>
         )}
+        {defaults !== undefined && (
+          <label
+            title="设备在长时间没有收到按键后会半关闭这条会话（打印 “Vty connection is timed out. Please press ENTER.”）并从此不再输出。开启后检测到该提示会自动补一个回车；保活则在休眠发生之前就定时补回车。"
+            style={{ marginLeft: 12, opacity: busy ? 0.6 : 1, cursor: 'pointer', fontFamily: 'var(--dsw-font-family, inherit)' }}
+          >
+            <input
+              type="checkbox"
+              checked={defaults.dormantAutoWake}
+              disabled={busy}
+              onChange={event => { void updateEngineSetting('dormantAutoWake', event.target.checked) }}
+            />
+            {' '}
+            空闲休眠自动唤醒
+          </label>
+        )}
+        {defaults !== undefined && (
+          <label
+            title="设备实测在「300 秒没有收到按键」后半关闭会话（它自己发的事件不算）。小于该值时会定时补一个回车，让设备根本不会休眠；填 0 关闭保活。保活不会被计入「有人在使用」，所以遗忘的标签页仍会被回收。"
+            style={{ marginLeft: 12, opacity: busy ? 0.6 : 1, fontFamily: 'var(--dsw-font-family, inherit)' }}
+          >
+            {' '}
+            保活（秒）：
+            <input
+              type="number"
+              min={0}
+              step={10}
+              // Locally editable, committed on blur. A fully controlled input
+              // re-renders from the host's value on every poll, so a half-typed
+              // number would be overwritten mid-keystroke -- and writing each
+              // digit as typed would set 1ms, then 12ms, then 120ms, where a 1ms
+              // probe would flood the device with Enters.
+              value={keepaliveDraft ?? String(Math.round(defaults.dormantProbeMs / 1000))}
+              disabled={busy}
+              onChange={event => { setKeepaliveDraft(event.target.value) }}
+              onBlur={event => {
+                const seconds = Number(event.target.value)
+                setKeepaliveDraft(undefined)
+                // Seconds in the UI, milliseconds in the document: an operator
+                // thinks in seconds, and ignoring an unparseable entry leaves the
+                // stored value alone rather than writing NaN.
+                if (!Number.isFinite(seconds) || seconds < 0) return
+                void updateEngineSetting('dormantProbeMs', Math.round(seconds * 1000))
+              }}
+              style={{ width: 70, font: 'inherit', padding: '1px 3px' }}
+            />
+          </label>
+        )}
       </div>
 
       <div style={{ display: 'flex', minHeight: 0, flex: 1 }}>
@@ -555,6 +679,14 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
                 <strong>{row.label}</strong>
                 {' '}
                 <span style={{ opacity: 0.7 }}>{row.state}</span>
+                {row.dormant === true && (
+                  // Marked in the LIST, not just in the pane: a dormant console
+                  // answers nothing, so a user scanning several consoles must be
+                  // able to see which one needs an Enter without selecting it.
+                  <span style={{ marginLeft: 6, color: '#e6b800' }} title={row.dormantText ?? '设备已半关闭该空闲会话'}>
+                    ● 休眠
+                  </span>
+                )}
               </div>
               {row.lastError !== null && (
                 <div style={{ color: '#c0392b' }}>{row.lastError.code}: {row.lastError.message}</div>
@@ -606,6 +738,19 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
                     {output === '' ? '(暂无输出)' : output}
                   </pre>
 
+                  {dormant && (
+                    <div style={{ padding: 8, background: '#4a3c14', color: '#ffe9b0' }}>
+                      <div>
+                        设备已半关闭这条空闲会话（<code>Vty connection is timed out. Please press ENTER.</code>）。
+                        此后设备不再打印任何事件，需要按一次回车重新激活。
+                      </div>
+                      <div style={{ marginTop: 6, display: 'flex', gap: 6, alignItems: 'center' }}>
+                        {button('唤醒（发送回车）', () => void wake(), { disabled: busy })}
+                        <span style={{ opacity: 0.75 }}>提示：直接点「发送」并留空输入框，效果相同。</span>
+                      </div>
+                    </div>
+                  )}
+
                   {paging && (
                     <div style={{ padding: 4 }}>
                       {button('继续翻页', () => void resumePaging())}
@@ -639,17 +784,28 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
                       onKeyDown={event => {
                         if (event.key === 'Enter') void submit()
                       }}
-                      placeholder="输入命令后回车（不发换行前请留空）"
+                      placeholder="输入命令后回车；留空发送则只发一个回车（用于唤醒/翻页）"
                       readOnly={busy}
+                      // A stable handle for the tests. They used to find this
+                      // field by its placeholder text, which meant rewording the
+                      // hint broke a focus assertion that has nothing to do with
+                      // the hint.
+                      data-console-hub-input="command"
                       style={{ flex: 1, font: 'inherit', padding: '4px 6px' }}
                     />
                     {button('发送', () => void submit(), { disabled: busy })}
+                    {/*
+                      A dedicated Enter button, because "send an empty line" is
+                      the recovery gesture for a dormant console and asking the
+                      user to click into an empty box and press Enter hides that.
+                    */}
+                    {button('回车', () => void write(''), { disabled: busy, title: '只发送一个回车，不发送任何命令' })}
                     {button('读取', () => void readOnce())}
                     {button('清空', () => void clearOutput(), { title: '只清空本地显示，不断开连接' })}
                   </div>
                   <div style={{ padding: '0 8px 8px', opacity: 0.6 }}>
                     当前：{current?.label ?? selected} · cursor {cursorRef.current}
-                    {current !== undefined ? ` · 已收 ${String(current.idleMs)}ms 无活动` : ''}
+                    {current !== undefined ? ` · 空闲 ${String(Math.round(current.idleMs / 1000))}s` : ''}
                   </div>
                 </>
               )}

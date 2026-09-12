@@ -7,7 +7,7 @@ import { createServer, type Server, type Socket } from 'node:net'
 import { afterEach, describe, expect, it } from 'vitest'
 import { buildConsoleRoutes, type ConsoleSessionApi } from '../src/console-routes.ts'
 import { PortManager } from '../src/port-manager.ts'
-import { DEFAULT_PAGER_PATTERN, DEFAULT_PROMPT_PATTERN } from '../src/config-shared.ts'
+import { DEFAULT_DORMANT_PATTERN, DEFAULT_PAGER_PATTERN, DEFAULT_PROMPT_PATTERN } from '../src/config-shared.ts'
 import type { ConsoleHttpRequest, ConsoleHttpResponse } from '../src/context-types.ts'
 
 /** A device stub that echoes commands with a canned answer. */
@@ -19,7 +19,21 @@ interface Device {
 }
 
 /** Start a device that greets and answers each line. */
-async function startDevice(answer: (line: string) => string = line => `answer:${line}`): Promise<Device> {
+async function startDevice(
+  answer: (line: string) => string = line => `answer:${line}`,
+  options: {
+    /**
+     * Answer a bare Enter (a lone CR).
+     *
+     * Separate from `answer` because an empty line is skipped as "nothing was
+     * typed", and a bare Enter is a distinct keystroke a real device answers with
+     * its prompt. Without this hook a `console.wake` test would assert on a write
+     * no device ever acknowledged -- which is precisely the unverified claim the
+     * `answered` flag exists to prevent.
+     */
+    onBareEnter?: () => string | undefined
+  } = {},
+): Promise<Device> {
   const sockets: Socket[] = []
   const received: string[] = []
   const server: Server = createServer((socket) => {
@@ -32,6 +46,11 @@ async function startDevice(answer: (line: string) => string = line => `answer:${
     socket.on('data', (chunk: Buffer) => {
       const text = chunk.toString('utf8')
       received.push(text)
+      if (options.onBareEnter !== undefined && text === '\r') {
+        const reply = options.onBareEnter()
+        if (reply !== undefined) socket.write(reply)
+        return
+      }
       for (const line of text.split(/[\r\n]+/)) {
         if (line === '') continue
         socket.write(`\r\n${answer(line)}\r\n<DUT1>`)
@@ -70,6 +89,9 @@ function apiFor(): {
     pagingQuietMs: 20,
     promptPattern: DEFAULT_PROMPT_PATTERN,
     pagerPattern: DEFAULT_PAGER_PATTERN,
+    dormantPattern: DEFAULT_DORMANT_PATTERN,
+    dormantAutoWake: true,
+    dormantProbeMs: 0,
   })
   return {
     api: {
@@ -158,12 +180,15 @@ async function until(predicate: () => boolean, budgetMs = 2000): Promise<void> {
 }
 
 /** Build an API plus a device, tracked for teardown. */
-async function scene(answer?: (line: string) => string): Promise<{
+async function scene(
+  answer?: (line: string) => string,
+  options: { onBareEnter?: () => string | undefined } = {},
+): Promise<{
   api: ConsoleSessionApi
   manager: PortManager
   device: Device
 }> {
-  const device = await startDevice(answer)
+  const device = await startDevice(answer, options)
   const { api, manager } = apiFor()
   devices.push(device)
   managers.push(manager)
@@ -358,6 +383,87 @@ describe('console.send / console.read / console.waitFor', () => {
     const refused = await call(api, 'console.send', { sessionId: 'session-a', consoleId, text: 'x' })
     expect(refused.status).toBe(404)
     expect(refused.body).toMatchObject({ ok: false, error: { code: 'not-found' } })
+  })
+
+  it('accepts an EMPTY send: it presses Enter, which is the wake keystroke', async () => {
+    // The route used to answer `bad-request` for `text: ''`, which made the one
+    // action a dormant console needs the one action the API would not carry --
+    // while the model's own tool path allowed it.
+    const { api, device } = await scene()
+    const connected = await call(api, 'console.connect', { sessionId: 'session-a', viewId: 'v-known' })
+    const consoleId = (connected.body as { value: { consoleId: string } }).value.consoleId
+
+    const sent = await call(api, 'console.send', { sessionId: 'session-a', consoleId, text: '' })
+    expect(sent.status).toBe(200)
+    // The device receives exactly one CR (the host appends the submit key) and
+    // no command text at all.
+    await until(() => device.received.join('').includes('\r'))
+    expect(device.received.join('')).toContain('\r')
+  })
+
+  it('accepts an omitted text as an empty send', async () => {
+    const { api, device } = await scene()
+    const connected = await call(api, 'console.connect', { sessionId: 'session-a', viewId: 'v-known' })
+    const consoleId = (connected.body as { value: { consoleId: string } }).value.consoleId
+    const sent = await call(api, 'console.send', { sessionId: 'session-a', consoleId })
+    expect(sent.status).toBe(200)
+    await until(() => device.received.join('').includes('\r'))
+  })
+
+  it('sends whitespace byte for byte instead of trimming it', async () => {
+    // A single space is a pager's next-page key. Trimming it would send the
+    // NEWLINE instead and page nowhere -- a silent wrong action.
+    const { api, device } = await scene()
+    const connected = await call(api, 'console.connect', { sessionId: 'session-a', viewId: 'v-known' })
+    const consoleId = (connected.body as { value: { consoleId: string } }).value.consoleId
+    const sent = await call(api, 'console.send', { sessionId: 'session-a', consoleId, text: ' ' })
+    expect(sent.status).toBe(200)
+    await until(() => device.received.join('').includes(' \r'))
+    expect(device.received.join('')).toContain(' \r')
+  })
+
+  it('still refuses a non-string text', async () => {
+    const { api } = await scene()
+    const connected = await call(api, 'console.connect', { sessionId: 'session-a', viewId: 'v-known' })
+    const consoleId = (connected.body as { value: { consoleId: string } }).value.consoleId
+    const refused = await call(api, 'console.send', { sessionId: 'session-a', consoleId, text: 42 })
+    expect(refused.status).toBe(400)
+    expect(refused.body).toMatchObject({ ok: false, error: { code: 'bad-request' } })
+  })
+
+  it('wakes a console through console.wake and through the control action', async () => {
+    // The device answers a bare Enter with its prompt -- the lab behaviour -- so
+    // `answered: true` here means the device really acknowledged the keystroke,
+    // not merely that a write was issued.
+    const { api, device } = await scene(undefined, { onBareEnter: () => '\r\n<DUT1>' })
+    const connected = await call(api, 'console.connect', { sessionId: 'session-a', viewId: 'v-known' })
+    const consoleId = (connected.body as { value: { consoleId: string } }).value.consoleId
+
+    const before = device.received.length
+    const woken = await call(api, 'console.wake', { sessionId: 'session-a', consoleId })
+    expect(woken.status).toBe(200)
+    const value = (woken.body as { value: { answered: boolean, dormant: boolean } }).value
+    expect(value.answered).toBe(true)
+    expect(value.dormant).toBe(false)
+    // Exactly one CR reached the device: no command text rides along with a wake.
+    await until(() => device.received.slice(before).join('').includes('\r'))
+    expect(device.received.slice(before).join('')).toBe('\r')
+
+    const viaControl = await call(api, 'console.control', { sessionId: 'session-a', consoleId, action: 'wake' })
+    expect(viaControl.status).toBe(200)
+    expect((viaControl.body as { value: { answered: boolean } }).value.answered).toBe(true)
+  })
+
+  it('reports a wake nobody answered honestly', async () => {
+    // No `onBareEnter`: the device ignores the Enter, as one whose port is held
+    // by another session would. Claiming recovery here would leave a caller
+    // waiting on a console nobody is listening to.
+    const { api } = await scene()
+    const connected = await call(api, 'console.connect', { sessionId: 'session-a', viewId: 'v-known' })
+    const consoleId = (connected.body as { value: { consoleId: string } }).value.consoleId
+    const woken = await call(api, 'console.wake', { sessionId: 'session-a', consoleId })
+    expect(woken.status).toBe(200)
+    expect((woken.body as { value: { answered: boolean } }).value.answered).toBe(false)
   })
 
   it('decodes a read with a per-call encoding override', async () => {

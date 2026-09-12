@@ -7,7 +7,7 @@
 import { describe, expect, it } from 'vitest'
 import { buildRoutes, type ConsoleHubApi } from '../src/routes.ts'
 import { PortManager } from '../src/port-manager.ts'
-import { DEFAULT_PAGER_PATTERN, DEFAULT_PROMPT_PATTERN, type ConsoleHubSettings } from '../src/config-shared.ts'
+import { DEFAULT_DORMANT_PATTERN, DEFAULT_PAGER_PATTERN, DEFAULT_PROMPT_PATTERN, type ConsoleHubSettings } from '../src/config-shared.ts'
 import { parseSettingsDocument } from '../src/config.ts'
 import { writeSecret } from '../src/secrets.ts'
 import type {
@@ -155,6 +155,9 @@ function manager(): PortManager {
     pagingQuietMs: 20,
     promptPattern: DEFAULT_PROMPT_PATTERN,
     pagerPattern: DEFAULT_PAGER_PATTERN,
+    dormantPattern: DEFAULT_DORMANT_PATTERN,
+    dormantAutoWake: true,
+    dormantProbeMs: 0,
   })
 }
 

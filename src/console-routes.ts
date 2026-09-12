@@ -226,8 +226,14 @@ function consoleHandlers(api: ConsoleSessionApi): Record<string, Handler> {
     async 'console.send'(payload) {
       const sessionId = await requireSession(api, payload)
       const consoleId = requireConsoleId(payload)
+      // An EMPTY line is a valid send: it presses Enter, which is what wakes a
+      // console the device half-closed, what a `--More--` prompt accepts by
+      // hand, and what re-prompts a device that swallowed a keystroke. Refusing
+      // it here made the one action a stuck console needs the one action the API
+      // would not carry. Whitespace is likewise passed through untouched: a
+      // single space is the pager's next-page key, so trimming it would send
+      // something other than what was asked for.
       const text = optionalString(payload, 'text') ?? ''
-      if (text === '') throw new HubError('bad-request', 'missing or invalid "text"')
       const encoding = checkedEncoding(optionalString(payload, 'encoding'))
       const submit = optionalBoolean(payload, 'submit')
       const submitKey = optionalString(payload, 'submitKey')
@@ -282,7 +288,11 @@ function consoleHandlers(api: ConsoleSessionApi): Record<string, Handler> {
       const sessionId = await requireSession(api, payload)
       const consoleId = requireConsoleId(payload)
       const text = optionalString(payload, 'text') ?? ''
-      if (text === '') throw new HubError('bad-request', 'missing or invalid "text"')
+      // An empty line is fenced like any other: `classifyCommand('')` has no
+      // segment to match, so it comes back `safe`, which is correct -- pressing
+      // Enter runs no command. Refusing it here would have made the wake
+      // keystroke unsendable through the panel's own path while the tool path
+      // allowed it.
       const entry = api.manager.get(sessionId, consoleId)
       if (entry === undefined) {
         throw new HubError('not-found', `console "${consoleId}" not found for this session`, 404)
@@ -346,10 +356,46 @@ function consoleHandlers(api: ConsoleSessionApi): Record<string, Handler> {
       }
     },
 
+    async 'console.wake'(payload) {
+      const sessionId = await requireSession(api, payload)
+      const consoleId = requireConsoleId(payload)
+      try {
+        const answered = await api.manager.wake(sessionId, consoleId)
+        const detail = api.manager.describe(sessionId, consoleId)
+        return {
+          consoleId,
+          answered,
+          // The device may still be dormant if it did not answer: reporting
+          // `answered: true` without the state would invite a caller to assume a
+          // recovery that did not happen.
+          dormant: detail?.entry.dormant ?? false,
+          dormantText: detail?.entry.dormantText ?? null,
+          ...detail?.state.dormancy === undefined ? {} : { dormancy: detail.state.dormancy },
+        }
+      } catch (error) {
+        asHubError(error)
+      }
+    },
+
     async 'console.control'(payload) {
       const sessionId = await requireSession(api, payload)
       const consoleId = requireConsoleId(payload)
       const action = requireString(payload, 'action')
+      // `wake` is a control action rather than only its own method because the
+      // panel's pager button and its wake button are the same gesture to a user:
+      // "unstall this console". `drain` resumes automatic paging; `wake` presses
+      // Enter. Both leave the connection untouched.
+      if (action === 'wake') {
+        const answered = await api.manager.wake(sessionId, consoleId)
+        const after = api.manager.describe(sessionId, consoleId)
+        return {
+          consoleId,
+          state: after?.entry.state ?? 'closed',
+          answered,
+          dormant: after?.entry.dormant ?? false,
+          paging: after?.state.paging,
+        }
+      }
       if (action !== 'drain') {
         throw new HubError('bad-request', `unknown control action "${action}"`)
       }
