@@ -103,6 +103,7 @@ host 半改动需要重启 Host；client 半由 `/plugins` 通道下发，刷新
 | `dormantProbeMs` | `120000` | 空闲**输入**超过此时长就补一个回车保活；`0` 关闭。设备实测 300s 半关闭 |
 | `dormantPattern` | 见源码 | 半关闭标记的正则（**非锚定搜索**，不是尾锚定） |
 | `idleTimeoutMs` | `600000` | 本插件回收"没人用"的控制台；保活**不会**刷新这个时钟 |
+| `idleQuietMs` | `1500` | `wait_for({for:'idle'})` 的静默窗口；**必须大于实测的 ~1014ms 应答块间隔**，否则会在应答中途判定"说完了" |
 
 ## 开发
 
@@ -265,6 +266,36 @@ device" 断言的就是这一点：WRITER 发一条带时间戳的唯一标记�
 `matched: false` / `reason: 'timeout'`，**既不会挂住、也不会谎报匹配**，且之后控制台仍然可用
 （超时是结果，不是坏掉的连接）。
 
+### `for: "idle"` 到底以什么为准（曾被写成一句无信息量的话）
+
+工具描述原文是 "wait until output stops arriving"——**没有说停多久才算停**，也没说
+"必须先有输出"，更没说没有输出时会怎样。三件事都该有确切答案，而含糊的描述会让模型
+按一个它其实拿不到的等待去推理。
+
+现在的定义是：**先有输出到达，然后连续 `idleMs`（默认 1500ms）没有任何新字节**。两个推论：
+
+- **什么都没到达时它永远不成立**，会走到 `timeout`，而不是"匹配成功"。旧实现把静默计时器
+  一开始就启动，所以在一条**完全没说过话**的会话上第一次轮询就返回 `matched: true`——
+  等于"输出还没开始就已经停了"。
+- **它是启发式，不是完成信号**。设备在应答中途停顿超过静默窗口，它就会**提前**判定"说完了"。
+
+第二个推论是实测出来的，不是假设：两台设备的长应答都通过 console 服务器**每 ~1000ms 推一块
+约 960 字节**（`scripts/probe-output-gaps.mjs`），而默认窗口当时是 **250ms**。于是
+`scripts/probe-idle-falsedone.mjs` 量到了本该避免的失败：
+
+```
+idle wait (idleMs=250) matched=true in 250ms
+text read at match time: 0 chars          <- 什么都没读到就"匹配"了
+text that arrived AFTER the match: 5760 chars
+```
+
+匹配之后**又来了 5760 个字符**。窗口改为 1500ms 后，同一台设备读到 **7680 字符**、
+不再中途截断；交换机上则在真正安静时才匹配（`end` + `<SWITCH>`，之后无新输出）。
+
+因此：**`for: "prompt"` 才是"命令执行完了"的可靠信号**；只有在设备不打提示符时才用
+`idle`，并且把 `matched: true` 当作"大概完了"，再读一遍确认。这也写进了工具描述与参数说明
+（窗口数值取自**实际生效的设置**，所以调过 `idleQuietMs` 的部署不会看到一个过期的数字）。
+
 ### 空闲半关闭（休眠）与保活
 
 远端设备在**长时间没有收到按键**后会主动把这条 console 会话半关闭：TCP 连接还在、插件侧
@@ -327,6 +358,8 @@ node scripts/probe-console.mjs 10.133.6.253:10003 4   # 裸看字节
 node scripts/probe-wake.mjs 10.133.5.253:10015 3 600  # 量唤醒延时
 node scripts/probe-dormant.mjs 10.133.5.253:10015     # 等一次真实的半关闭（默认最多 25 分钟）
 node scripts/probe-idle-input.mjs 10.133.6.253:10003  # 判定设备计时依据（输入 or 双向）
+node --import ./scripts/test-preload.mjs scripts/probe-output-gaps.mjs 10.133.6.253:10003  # 量应答块间隔
+node --import ./scripts/test-preload.mjs scripts/probe-idle-falsedone.mjs 10.133.6.253:10003 250  # 复现 idle 误判
 node --import ./scripts/test-preload.mjs scripts/probe-keepalive.mjs 10.133.6.253:10003 3000 10000
 pnpm test:live                                        # 14 条真机用例
 node --import ./scripts/test-preload.mjs scripts/probe-live.mjs 10.133.6.253:10003 "show version"

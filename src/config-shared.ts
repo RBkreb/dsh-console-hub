@@ -159,6 +159,24 @@ export interface ConsoleHubSettings {
   pagingMaxPages: number
   /** Quiet window that must elapse before a pager hit counts as settled (ms). */
   pagingQuietMs: number
+  /**
+   * How long output must be silent before `for: "idle"` counts as "it stopped"
+   * (ms). Overridable per call with `idleMs`.
+   *
+   * This is the number that defines the idle wait, and the default is MEASURED
+   * rather than chosen for tidiness. Both lab devices pace their long answers
+   * through the console server in ~960-byte slabs roughly **1000ms** apart
+   * (`scripts/probe-output-gaps.mjs`), so any window shorter than that gap
+   * matches in the MIDDLE of an answer: at the old 250ms default an idle wait
+   * returned `matched: true` having read **0 characters**, with 5760 more
+   * arriving afterwards (`scripts/probe-idle-falsedone.mjs`).
+   *
+   * 1500ms clears the measured 1014ms worst-case gap with margin. On a chatty
+   * device it is a floor, not a promise: an idle wait can still match during a
+   * genuine lull, which is why `for: "prompt"` is the reliable way to know a
+   * command finished and idle is documented as a heuristic.
+   */
+  idleQuietMs: number
   /** `always` fences every command; `high-risk` only the listed patterns. */
   approvalMode: 'always' | 'high-risk'
   /** Command-line patterns that require an explicit human decision. */
@@ -233,6 +251,9 @@ export const DEFAULT_CONSOLE_HUB_SETTINGS: ConsoleHubSettings = {
   pagingMode: 'auto-more',
   pagingMaxPages: 50,
   pagingQuietMs: 120,
+  // Measured: both lab devices pause up to ~1014ms between output slabs, so
+  // anything at or below that reports "done" mid-answer. See the field's docs.
+  idleQuietMs: 1500,
   approvalMode: 'high-risk',
   highRiskPatterns: [...DEFAULT_HIGH_RISK_PATTERNS],
   promptPattern: DEFAULT_PROMPT_PATTERN,

@@ -82,6 +82,10 @@ export const ConsoleHubSettingsSchema: z<ConsoleHubSettings> = z.object({
   pagingMode: z.union(PAGING_MODES.map(value => z.const(value))).default('auto-more'),
   pagingMaxPages: z.number().step(1).min(1).max(10_000).default(50),
   pagingQuietMs: z.number().step(1).min(0).max(10_000).default(120),
+  // Above the measured ~1014ms inter-slab gap on the lab devices, so an idle
+  // wait cannot report "done" in the middle of a paced answer. The 50ms floor
+  // keeps a mis-set value from making `for: "idle"` match instantaneously.
+  idleQuietMs: z.number().step(1).min(50).max(600_000).default(1500),
   approvalMode: z.union([z.const('always'), z.const('high-risk')]).default('high-risk'),
   highRiskPatterns: z.array(z.string()).default([...DEFAULT_HIGH_RISK_PATTERNS]),
   promptPattern: z.string().default(DEFAULT_CONSOLE_HUB_SETTINGS.promptPattern),

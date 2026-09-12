@@ -71,6 +71,10 @@ function manager(): PortManager {
     dormantPattern: DEFAULT_DORMANT_PATTERN,
     dormantAutoWake: true,
     dormantProbeMs: 0,
+    // The SHIPPED default, not a test-friendly one. An idle wait is exactly what
+    // this suite must exercise faithfully: a smaller window would be a different
+    // engine, and the false-done failure only appears with the real value.
+    idleQuietMs: DEFAULT_CONSOLE_HUB_SETTINGS.idleQuietMs,
     // Both lab consoles are silent until a key is pressed.
     wakeOnConnect: true,
   })
@@ -658,4 +662,80 @@ describe.runIf(LIVE)('live console lab', () => {
       await ports.dispose()
     }
   }, 40_000)
+
+  it('does NOT let an idle wait call a paced answer finished', async () => {
+    // The reported confusion about `for: 'idle'`, driven against hardware. Both
+    // lab devices push a long answer through the console server in ~960-byte
+    // slabs roughly 1000ms apart (measured 5x in `scripts/probe-gap-spread.mjs`,
+    // worst gap 1015ms), so a quiet window at or below that gap matches BETWEEN
+    // two slabs of the same answer.
+    //
+    // This is an A/B on the REAL device, because the failure is a property of the
+    // hardware's pacing and nothing else can demonstrate it: the OLD 250ms window
+    // must truncate, and the SHIPPED default must not. Asserting only the second
+    // half would pass just as well if the device happened to answer in one slab.
+    const ports = manager()
+    try {
+      const entry = await ports.connect({
+        ownerSessionId: 'live',
+        label: 'FW1-idle-wait',
+        host: FW1.host,
+        port: FW1.port,
+        kind: 'telnet',
+        encoding: 'utf-8',
+        pagingMode: 'manual',
+      })
+      await ports.waitFor('live', entry.consoleId, { for: 'prompt', timeoutMs: 8000 })
+
+      /** Send the command and report what one idle wait saw, then what followed. */
+      const run = async (idleMs: number): Promise<{ matched: boolean, atMatch: number, after: number, complete: boolean }> => {
+        const start = ports.read('live', entry.consoleId, { after: 0 }).cursor
+        await ports.send('live', entry.consoleId, 'show running-config')
+        const waited = await ports.waitFor('live', entry.consoleId, { for: 'idle', timeoutMs: 25_000, idleMs })
+        const atMatch = ports.read('live', entry.consoleId, { after: start })
+        // Whatever arrives now is output the wait claimed had stopped.
+        let extra = ''
+        let cursor = atMatch.cursor
+        let lastGrowth = Date.now()
+        while (Date.now() - lastGrowth < 2500) {
+          const next = ports.read('live', entry.consoleId, { after: cursor })
+          if (next.cursor !== cursor) {
+            extra += next.text
+            cursor = next.cursor
+            lastGrowth = Date.now()
+          }
+          await sleep(50)
+        }
+        return {
+          matched: waited.matched,
+          atMatch: atMatch.text.length,
+          after: extra.length,
+          complete: /[<\[]\s*[\w.-]+\s*[>\]]\s*$/.test(atMatch.text),
+        }
+      }
+
+      // ── The old default: must truncate. ────────────────────────────────────
+      const old = await run(250)
+      expect(old.matched).toBe(true)
+      // It declared the output finished and then more of it arrived: the exact
+      // bug. (Measured before the fix: 0 chars read, 5760 to follow.)
+      expect(old.after).toBeGreaterThan(0)
+
+      // ── The shipped default: must not. ─────────────────────────────────────
+      const shipped = await run(DEFAULT_CONSOLE_HUB_SETTINGS.idleQuietMs)
+      if (shipped.matched) {
+        // If it matched, it matched on genuine quiet: nothing followed, and the
+        // answer really had reached the prompt.
+        expect(shipped.after).toBe(0)
+        expect(shipped.complete).toBe(true)
+        expect(shipped.atMatch).toBeGreaterThan(old.atMatch)
+      } else {
+        // A timeout is the honest alternative: the device never went quiet for
+        // long enough. Either way it did not claim a truncated answer was done.
+        expect(shipped.atMatch).toBeGreaterThan(old.atMatch)
+      }
+    } finally {
+      await ports.dispose()
+    }
+  }, 90_000)
 })

@@ -116,6 +116,8 @@ function defaultsFor(settings: ConsoleHubSettings): {
   scrollbackLimitBytes: number
   pagingMaxPages: number
   pagingQuietMs: number
+  /** Quiet window that satisfies `for: "idle"` (ms). */
+  idleQuietMs: number
   agentConsoleTools: boolean
 } {
   return {
@@ -138,6 +140,7 @@ function defaultsFor(settings: ConsoleHubSettings): {
     scrollbackLimitBytes: settings.scrollbackLimitBytes,
     pagingMaxPages: settings.pagingMaxPages,
     pagingQuietMs: settings.pagingQuietMs,
+    idleQuietMs: settings.idleQuietMs,
     agentConsoleTools: settings.agentConsoleTools,
   }
 }

@@ -99,6 +99,32 @@ describe('parseSettingsDocument', () => {
     }
   })
 
+  it('defaults idleQuietMs ABOVE the measured mid-answer pause', () => {
+    // The requirement, not the literal. Both lab devices pace long answers
+    // through the console server in ~960-byte slabs ~1000ms apart
+    // (`scripts/probe-output-gaps.mjs`), so a quiet window at or below that
+    // reports "the output stopped" BETWEEN two slabs of the same answer. At the
+    // old 250ms default an idle wait returned `matched: true` having read 0
+    // characters, with 5760 more arriving afterwards
+    // (`scripts/probe-idle-falsedone.mjs`).
+    //
+    // Asserting the RELATION rather than the number means a future tuning that
+    // drops it back under the measured pause fails here, whatever value it picks.
+    const measuredPauseMs = 1014
+    const resolved = parseSettingsDocument({})
+    expect(resolved.idleQuietMs).toBeGreaterThan(measuredPauseMs)
+    // And it must still be usable as a wait: a value near the read timeout would
+    // make `for: "idle"` useless.
+    expect(resolved.idleQuietMs).toBeLessThan(resolved.readTimeoutMs)
+  })
+
+  it('refuses an idleQuietMs so small it would match instantly', () => {
+    // A 1ms window would satisfy `for: "idle"` on the first poll after any byte,
+    // which is the same false-'done' failure in a different disguise.
+    expect(() => parseSettingsDocument({ idleQuietMs: 1 })).toThrow(/idleQuietMs/)
+    expect(parseSettingsDocument({ idleQuietMs: 50 }).idleQuietMs).toBe(50)
+  })
+
   it('compiles the dormant pattern against the SEARCH matcher it actually runs', () => {
     // The dormancy marker is matched anywhere in the stream, not at the tail, so
     // it is validated with `compileSearchPattern`. Validating it with the

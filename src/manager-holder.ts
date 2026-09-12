@@ -46,6 +46,7 @@ export function policyFromSettings(settings: ConsoleHubSettings, idleSweepMs: nu
     pagingMode: settings.pagingMode,
     pagingMaxPages: settings.pagingMaxPages,
     pagingQuietMs: settings.pagingQuietMs,
+    idleQuietMs: settings.idleQuietMs,
     promptPattern: settings.promptPattern,
     pagerPattern: settings.pagerPattern,
     dormantPattern: settings.dormantPattern,

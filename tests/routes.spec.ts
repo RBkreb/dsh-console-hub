@@ -158,6 +158,7 @@ function manager(): PortManager {
     dormantPattern: DEFAULT_DORMANT_PATTERN,
     dormantAutoWake: true,
     dormantProbeMs: 0,
+    idleQuietMs: 250,
   })
 }
 

@@ -63,6 +63,15 @@ export interface ConsoleToolDefaults {
   encoding: string
   kind: 'telnet' | 'raw'
   pagingMode: 'auto-more' | 'auto-quit' | 'auto-interrupt' | 'manual'
+  /**
+   * Quiet window that satisfies `for: "idle"` (ms), so the tool's DESCRIPTION
+   * can state the number that is actually in force rather than a hardcoded one.
+   *
+   * A deployment that tuned `idleQuietMs` would otherwise be described to the
+   * model by a stale figure, and the model would reason about a wait it is not
+   * getting.
+   */
+  idleQuietMs: number
 }
 
 /** Everything the tool family needs from the host. */
@@ -903,19 +912,30 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
     name: 'console_wait_for',
     description:
       'Wait until a device console produces what you are waiting for, then return. Use `for: "prompt"` (default) to '
-      + 'wait until the CLI prompt comes back, `for: "pattern"` with a regular expression to wait for a specific line, '
-      + 'or `for: "idle"` to wait until output stops arriving. This is the right way to wait for a command to finish — '
-      + 'do not poll console_read in a loop. A timeout is a normal result (matched: false, reason: "timeout"), not an '
-      + 'error, so read the output that did arrive. When the wait fails because the device half-closed an idle console '
-      + '(`dormantBlocked`), the console cannot answer until you press Enter with console_wake — waiting again will '
-      + 'change nothing.',
+      + 'wait until the CLI prompt comes back -- that is the reliable "the command finished" signal. Use '
+      + '`for: "pattern"` with a regular expression to wait for a specific line. '
+      + 'Use `for: "idle"` to wait for the output to STOP, which is a heuristic and NOT a completion signal. It means, '
+      + `exactly: some output arrived, and then no further bytes arrived for a whole quiet window (\`idleMs\`, default ${String(deps.defaults().idleQuietMs)}ms). `
+      + 'Two consequences: a console where NOTHING arrives never satisfies it and times out instead, and a device that '
+      + 'pauses longer than the quiet window mid-answer makes it match EARLY. The default sits above the measured pause '
+      + 'of the lab devices (~1000ms between output slabs); raise `idleMs` for a slower device. Prefer `for: "prompt"` '
+      + 'whenever the device prints a prompt, and treat an idle match as "probably done", then confirm by reading. '
+      + 'This is the right way to wait for a command to finish — do not poll console_read in a loop. A timeout is a '
+      + 'normal result (matched: false, reason: "timeout"), not an error, so read the output that did arrive. When the '
+      + 'wait fails because the device half-closed an idle console (`dormantBlocked`), the console cannot answer until '
+      + 'you press Enter with console_wake — waiting again will change nothing.',
     parameters: parameterSchemaSpecToJsonSchema({
       consoleId: CONSOLE_ID,
       for: { type: 'string', enum: ['prompt', 'idle', 'pattern'], description: 'What to wait for (default prompt).' },
       pattern: { type: 'string', description: 'Regular expression, required when `for` is "pattern".' },
       timeoutMs: { type: 'number', description: 'Budget in milliseconds; defaults to the plugin read timeout.' },
       after: { type: 'number', description: 'Cursor the wait starts from (your last read cursor).' },
-      idleMs: { type: 'number', description: 'Quiet window that satisfies `for: "idle"`.' },
+      idleMs: {
+        type: 'number',
+        description: 'How long output must be silent to satisfy `for: "idle"` (default '
+          + `${String(deps.defaults().idleQuietMs)}ms). Raise it for a device that paces long answers slowly, or an `
+          + 'idle wait will match between two slabs of the same answer.',
+      },
     }),
     output: {
       schema: outputSchema({
@@ -937,11 +957,19 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
           dormantBlocked?: boolean
         }
         if (result.matched) {
-          const what = result.matchedText === undefined ? 'the output went quiet' : `saw ${result.matchedText}`
+          const what = result.matchedText === undefined
+            // An idle match says the output went quiet, which is NOT proof the
+            // command finished. Saying "done" here would invite a caller to read
+            // a half-delivered answer; the wording keeps it a probability.
+            ? 'the output went quiet (an idle match is a heuristic, not proof the command finished)'
+            : `saw ${result.matchedText}`
           const dormantNote = result.dormant === true
             ? ' The device then half-closed this idle console; wake it with console_wake before the next command.'
             : ''
-          return text(`Waited ${String(result.elapsedMs)}ms and ${what}.${dormantNote}`)
+          const confirm = result.matchedText === undefined
+            ? ' Read the output to confirm it is complete, or wait for the prompt instead when the device prints one.'
+            : ''
+          return text(`Waited ${String(result.elapsedMs)}ms and ${what}.${confirm}${dormantNote}`)
         }
         if (result.reason === 'closed') return text('The console closed while waiting.')
         if (result.dormantBlocked === true) {

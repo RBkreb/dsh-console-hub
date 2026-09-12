@@ -181,6 +181,8 @@ interface Scene {
   manager: PortManager
   dispose: () => void
   view: { viewId: string, name: string, host: string, port: number, kind: 'raw', encoding: string, user: string, promptPattern: string, pagerPattern: string, pagingMode: string, tags: string[], notes: string }
+  /** The engine defaults the family was registered with. */
+  defaults: Record<string, unknown>
 }
 
 const devices: Device[] = []
@@ -266,6 +268,7 @@ async function scene(options: {
     dormantPattern: DEFAULT_DORMANT_PATTERN,
     dormantAutoWake: true,
     dormantProbeMs: 0,
+    idleQuietMs: 250,
     ...options.manager,
   })
   managers.push(manager)
@@ -289,10 +292,11 @@ async function scene(options: {
     registry,
     manager,
     views: () => store,
-    defaults: () => ({ encoding: 'utf-8', kind: 'raw', pagingMode: 'manual' }),
+    defaults: () => ({ encoding: 'utf-8', kind: 'raw', pagingMode: 'manual', idleQuietMs: 250 }),
     ...inventoryDeps(store, options.resolveSecret),
   })
-  return { registry, manager, dispose, view }
+  const engineDefaults = { encoding: 'utf-8', kind: 'raw', pagingMode: 'manual', idleQuietMs: 250 }
+  return { registry, manager, dispose, view, defaults: engineDefaults }
 }
 
 /**
@@ -323,16 +327,17 @@ function emptyScene(): Scene {
     dormantPattern: DEFAULT_DORMANT_PATTERN,
     dormantAutoWake: true,
     dormantProbeMs: 0,
+    idleQuietMs: 250,
   })
   managers.push(manager)
   const dispose = registerConsoleTools({
     registry,
     manager,
     views: () => store,
-    defaults: () => ({ encoding: 'utf-8', kind: 'raw', pagingMode: 'manual' }),
+    defaults: () => ({ encoding: 'utf-8', kind: 'raw', pagingMode: 'manual', idleQuietMs: 250 }),
     ...inventoryDeps(store),
   })
-  return { registry, manager, dispose, view: scene1View(0) }
+  return { registry, manager, dispose, view: scene1View(0), defaults: { encoding: 'utf-8', kind: 'raw', pagingMode: 'manual', idleQuietMs: 250 } }
 }
 
 /**
@@ -378,6 +383,78 @@ describe('console tool registration', () => {
     const scene1 = await scene()
     scene1.dispose()
     expect(scene1.registry.tools.size).toBe(0)
+  })
+
+  it('defines what `for: "idle"` means instead of saying "output stops arriving"', async () => {
+    // The reported confusion: the description said "wait until output stops
+    // arriving" and left the reader to guess how long "stopped" is, whether
+    // anything has to have arrived first, and what happens when nothing does.
+    // All three are answerable, and a model that has to guess reasons about a
+    // wait it is not actually getting.
+    const scene1 = await scene()
+    const tool = scene1.registry.tools.get('console_wait_for')
+    const description = tool?.description ?? ''
+
+    // 1. The window itself, and that it is a window AT ALL.
+    expect(description).toMatch(/no further bytes arrived for a whole quiet window/)
+    // 2. The default, stated concretely rather than left to the parameter docs.
+    expect(description).toContain(`${String(scene1.defaults.idleQuietMs)}ms`)
+    // 3. Output must have ARRIVED first -- the half that made an idle wait match
+    //    on an untouched, silent console.
+    expect(description).toMatch(/some output arrived/)
+    // 4. Nothing arriving is a timeout, not a match.
+    expect(description).toMatch(/NOTHING arrives never satisfies it and times out/)
+    // 5. It is a heuristic, not a completion signal, and `prompt` is the reliable
+    //    one -- so a caller knows which to reach for.
+    expect(description).toMatch(/heuristic and NOT a completion signal/)
+    expect(description).toMatch(/reliable "the command finished" signal/)
+  })
+
+  it('states the idle window that is ACTUALLY in force, not a hardcoded one', async () => {
+    // A deployment that tunes `idleQuietMs` would otherwise be described to the
+    // model by a stale figure, and the model would budget its waits against a
+    // window it is not getting.
+    const registry = fakeRegistry()
+    const manager = new PortManager({
+      maxConsoles: 1,
+      scrollbackLimitBytes: 8192,
+      outputLimitBytes: 4096,
+      connectTimeoutMs: 1000,
+      readTimeoutMs: 200,
+      idleTimeoutMs: 60_000,
+      idleSweepMs: 1000,
+      pagingMode: 'manual',
+      pagingMaxPages: 5,
+      pagingQuietMs: 20,
+      promptPattern: DEFAULT_PROMPT_PATTERN,
+      pagerPattern: DEFAULT_PAGER_PATTERN,
+      dormantPattern: DEFAULT_DORMANT_PATTERN,
+      dormantAutoWake: true,
+      dormantProbeMs: 0,
+      idleQuietMs: 250,
+    })
+    managers.push(manager)
+    const store: Record<string, ConsoleView> = {}
+    const dispose = registerConsoleTools({
+      registry,
+      manager,
+      views: () => store,
+      // The tuned value, which is what the description must report.
+      defaults: () => ({ encoding: 'utf-8', kind: 'raw', pagingMode: 'manual', idleQuietMs: 4321 }),
+      ...inventoryDeps(store),
+    })
+    try {
+      const description = registry.tools.get('console_wait_for')?.description ?? ''
+      expect(description).toContain('4321ms')
+      expect(description).not.toContain('1500ms')
+      // ...and the parameter docs agree, since the model may read either.
+      const idleParam = (registry.tools.get('console_wait_for')?.parameters as {
+        properties?: Record<string, { description?: string }>
+      })?.properties?.idleMs
+      expect(idleParam?.description).toContain('4321ms')
+    } finally {
+      dispose()
+    }
   })
 
   it('never exposes a sessionId parameter: the agent session is the scope', async () => {
@@ -643,6 +720,7 @@ describe('console_send / console_read / console_wait_for', () => {
       dormantPattern: DEFAULT_DORMANT_PATTERN,
       dormantAutoWake: true,
       dormantProbeMs: 0,
+      idleQuietMs: 250,
     })
     managers.push(manager)
     const registry = fakeRegistry()
@@ -651,10 +729,16 @@ describe('console_send / console_read / console_wait_for', () => {
       registry,
       manager,
       views: () => emptyStore,
-      defaults: () => ({ encoding: 'utf-8', kind: 'raw', pagingMode: 'manual' }),
+      defaults: () => ({ encoding: 'utf-8', kind: 'raw', pagingMode: 'manual', idleQuietMs: 250 }),
       ...inventoryDeps(emptyStore),
     })
-    const local: Scene = { registry, manager, dispose: () => {}, view: scene1View(device.port) }
+    const local: Scene = {
+      registry,
+      manager,
+      dispose: () => {},
+      view: scene1View(device.port),
+      defaults: { encoding: 'utf-8', kind: 'raw', pagingMode: 'manual', idleQuietMs: 250 },
+    }
     const opened = await callTool(local, 'console_connect', {
       host: '127.0.0.1',
       port: device.port,
@@ -1086,6 +1170,7 @@ describe('a stored credential reaches the connect', () => {
       dormantPattern: DEFAULT_DORMANT_PATTERN,
       dormantAutoWake: true,
       dormantProbeMs: 0,
+      idleQuietMs: 250,
     })
     managers.push(manager)
     const registry = fakeRegistry()
@@ -1094,10 +1179,19 @@ describe('a stored credential reaches the connect', () => {
       registry,
       manager,
       views: () => store,
-      defaults: () => ({ encoding: 'utf-8', kind: 'raw', pagingMode: 'manual' }),
+      defaults: () => ({ encoding: 'utf-8', kind: 'raw', pagingMode: 'manual', idleQuietMs: 250 }),
       ...inventoryDeps(store, options.resolveSecret),
     })
-    return { scene: { registry, manager, dispose, view: scene1View(device.port) }, device }
+    return {
+      scene: {
+        registry,
+        manager,
+        dispose,
+        view: scene1View(device.port),
+        defaults: { encoding: 'utf-8', kind: 'raw', pagingMode: 'manual', idleQuietMs: 250 },
+      },
+      device,
+    }
   }
 
   it('authenticates with the stored password when the caller names a view', async () => {

@@ -92,6 +92,7 @@ function apiFor(): {
     dormantPattern: DEFAULT_DORMANT_PATTERN,
     dormantAutoWake: true,
     dormantProbeMs: 0,
+    idleQuietMs: 250,
   })
   return {
     api: {

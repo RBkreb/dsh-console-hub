@@ -160,6 +160,7 @@ function apiFor(device: Device): { hub: ConsoleHubApi, session: ConsoleSessionAp
     dormantPattern: DEFAULT_DORMANT_PATTERN,
     dormantAutoWake: true,
     dormantProbeMs: 0,
+    idleQuietMs: 250,
   })
   const settings = fakeSettings({ views: {} })
   const credentials = fakeCredentials()

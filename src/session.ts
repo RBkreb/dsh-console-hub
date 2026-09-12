@@ -141,6 +141,25 @@ export interface ConsoleWaitOptions {
   idleMs?: number
 }
 
+/**
+ * What `for: "idle"` means, precisely.
+ *
+ * The condition is satisfied when output ARRIVED and then stopped arriving for a
+ * whole quiet window (`idleQuietMs`, 1500ms by default, overridable per call).
+ * Two consequences a caller has to know, because both have bitten:
+ *
+ * 1. It is a WAIT: a console that has already been quiet for longer than the
+ *    window satisfies it as soon as any output arrives. A console with NOTHING
+ *    arriving never satisfies it at all -- it times out instead. So read
+ *    `matched` rather than assuming silence is success.
+ * 2. It is a HEURISTIC, and the quiet window is the whole of it. A device that
+ *    pauses longer than the window mid-answer makes this report "done" early --
+ *    measured on the lab hardware at ~1014ms between slabs, which is why the
+ *    default sits above that. `for: "prompt"` is the reliable "the command
+ *    finished" signal; use idle only for output that does not end in a prompt.
+ */
+export type ConsoleIdleSemantics = 'output-arrived-then-stopped-for-idleMs'
+
 /** The outcome of one `waitFor`. */
 export interface ConsoleWaitResult {
   /** Whether the condition was met inside the budget. */
@@ -227,6 +246,14 @@ export interface ConsoleSessionOptions {
   pagingMode: PagingMode
   pagingMaxPages: number
   pagingQuietMs: number
+  /**
+   * Quiet window that satisfies `waitFor({for:'idle'})`, in milliseconds.
+   *
+   * A per-session default so the value is a deployment setting rather than a
+   * literal buried in the wait loop; a call may still override it. See
+   * {@link ConsoleIdleSemantics} for what it means and why 1500 is the default.
+   */
+  idleQuietMs: number
   /** Compiled, tail-anchored prompt matcher. */
   promptPattern: RegExp
   /** Compiled, tail-anchored pager matcher. */
@@ -915,9 +942,15 @@ export class ConsoleSession {
     // A caller's pattern is a SEARCH over the window; the session's own prompt
     // and pager matchers are the tail-anchored ones.
     const matcher = condition === 'pattern' ? compileSearchPattern(options.pattern ?? '') : undefined
-    const idleMs = options.idleMs ?? 250
+    const idleMs = options.idleMs ?? this.options.idleQuietMs
 
-    let lastGrowthAt = Date.now()
+    // `quietSince` starts as null on purpose. An idle wait means "wait until the
+    // output STOPS", which is not a property of a console that has not started:
+    // a session with nothing new at the cursor is already quiet, so arming the
+    // clock at `started` made the call return `matched` on its FIRST poll, having
+    // read nothing at all. The clock starts at the first byte ARRIVED, so the
+    // condition can only be satisfied by output that really did go quiet.
+    let quietSince: number | null = null
     let lastWritten = this.ring.written
     // A wait that begins on a dormant console is waiting for output the device
     // will not send until someone presses a key. Recorded so the caller can tell
@@ -935,11 +968,12 @@ export class ConsoleSession {
         const found = matcher.exec(tail)
         if (found !== null) return this.waitResult(true, found[0], after, started, 'matched')
       } else if (condition === 'idle') {
-        // Quiet means: bytes have stopped arriving for the idle window.
+        // Quiet means: bytes ARRIVED, and then none arrived for the whole
+        // window. Both halves are required -- see `quietSince`.
         if (this.ring.written !== lastWritten) {
           lastWritten = this.ring.written
-          lastGrowthAt = Date.now()
-        } else if (Date.now() - lastGrowthAt >= idleMs) {
+          quietSince = Date.now()
+        } else if (quietSince !== null && Date.now() - quietSince >= idleMs) {
           return this.waitResult(true, undefined, after, started, 'matched')
         }
       }

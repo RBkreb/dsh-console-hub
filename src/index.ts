@@ -526,7 +526,14 @@ function installTools(
       views: () => readSettings().views as Record<string, ConsoleView>,
       defaults: () => {
         const value = readSettings()
-        return { encoding: value.defaultEncoding, kind: value.defaultKind, pagingMode: value.pagingMode }
+        return {
+          encoding: value.defaultEncoding,
+          kind: value.defaultKind,
+          pagingMode: value.pagingMode,
+          // Stated in the wait tool's own description, so the model reasons about
+          // the window actually in force rather than a stale constant.
+          idleQuietMs: value.idleQuietMs,
+        }
       },
       // The inventory surface the model sees, built from the SAME reader the
       // panel uses, so the two can never disagree about what is configured.
@@ -625,6 +632,9 @@ function installPrompt(ctx: Context, readSettings: () => ConsoleHubSettings): ()
           'console_remove_view deletes one. A password passed to console_upsert_view is write-only.',
           'Then console_send, then console_read, passing the `cursor` from each read back as `after` so no output is read',
           'twice. Use console_wait_for to wait for the device prompt instead of sleeping, and console_close when finished.',
+          'Prefer `for: "prompt"` in console_wait_for: it is the reliable "the command finished" signal. `for: "idle"`',
+          'only means "output arrived and then stopped for the quiet window" -- it is a heuristic, not proof the command',
+          'finished, and a device that pauses mid-answer can satisfy it early.',
           'Device consoles half-close themselves: after a long silence a device announces "Vty connection is timed out."',
           'and then prints NOTHING -- no events, no command output -- until a key arrives, while the connection stays up.',
           'The plugin answers that marker automatically and also sends a keepalive Enter before it can happen, but a',

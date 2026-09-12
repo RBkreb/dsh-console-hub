@@ -57,6 +57,7 @@ function managerFor(options: Partial<ConstructorParameters<typeof PortManager>[0
     dormantPattern: DEFAULT_DORMANT_PATTERN,
     dormantAutoWake: true,
     dormantProbeMs: 0,
+    idleQuietMs: 250,
     ...options,
   })
 }

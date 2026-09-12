@@ -90,6 +90,8 @@ export interface PortManagerOptions {
   pagingMode: PagingMode
   pagingMaxPages: number
   pagingQuietMs: number
+  /** Quiet window that satisfies `waitFor({for:'idle'})` (ms). */
+  idleQuietMs: number
   /** Prompt pattern source, compiled per console (a view may override it). */
   promptPattern: string
   /** Marker source for a device that half-closed an idle console. */
@@ -217,6 +219,7 @@ export class PortManager {
       pagingMode: descriptor.pagingMode ?? this.options.pagingMode,
       pagingMaxPages: this.options.pagingMaxPages,
       pagingQuietMs: this.options.pagingQuietMs,
+      idleQuietMs: this.options.idleQuietMs,
       promptPattern: descriptor.promptPattern ?? compilePattern(this.options.promptPattern),
       pagerPattern: descriptor.pagerPattern ?? compilePattern(this.options.pagerPattern),
       // SEARCH-compiled: the half-close marker is printed mid-stream, so the

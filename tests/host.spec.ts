@@ -369,6 +369,10 @@ describe('capability gating', () => {
     expect(text).toMatch(/Vty connection is timed out/)
     // An empty send is legal, and whitespace is not trimmed.
     expect(text).toMatch(/empty or/)
+    // And the guidance that answers "what counts as output stopping": prompt is
+    // the reliable completion signal, idle is a heuristic.
+    expect(text).toMatch(/for: "prompt"/)
+    expect(text).toMatch(/heuristic, not proof/)
   })
 
   it('withdraws the tool family when the setting turns it off, and restores it', async () => {

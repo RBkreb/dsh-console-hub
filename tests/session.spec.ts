@@ -125,6 +125,7 @@ function sessionFor(
     // whether some unrelated test ran long enough to fire it. The tests that
     // exercise the keepalive set a small value explicitly.
     dormantProbeMs: 0,
+    idleQuietMs: 250,
     scrollbackLimitBytes: 64 * 1024,
     ...overrides,
   })
@@ -535,6 +536,86 @@ describe('ConsoleSession lifecycle', () => {
     expect(byIdle.reason).toBe('matched')
   })
 
+  it('does NOT match `idle` on a console where nothing has arrived', async () => {
+    // The condition is "output ARRIVED and then stopped" -- not "the console is
+    // quiet". Arming the quiet clock at `started` made the old implementation
+    // return `matched` on its FIRST poll against a session that had said nothing,
+    // which is the opposite of useful: it reported that output had stopped
+    // before any output had started.
+    //
+    // Asserted as a timeout, because that is the honest answer: nothing arrived,
+    // so the wait can never be satisfied and the budget is what ends it.
+    const server = await startFakeConsole({ greeting: '<DUT1>' })
+    const session = track(sessionFor(server), server)
+    await session.open()
+    // Drain the greeting so the wait is not handed bytes from the connect.
+    session.read({ after: 0 })
+
+    const waited = await session.waitFor({ for: 'idle', idleMs: 120, timeoutMs: 600 })
+    expect(waited.matched).toBe(false)
+    expect(waited.reason).toBe('timeout')
+    // It really waited out the budget rather than short-circuiting.
+    expect(waited.elapsedMs).toBeGreaterThanOrEqual(500)
+  })
+
+  it('matches `idle` only after output arrives AND then stops', async () => {
+    // The positive half, and the timing that distinguishes it from the old
+    // behaviour: the wait must not return before the quiet window has elapsed
+    // SINCE THE LAST BYTE, so a device that is still talking cannot satisfy it.
+    const server = await startFakeConsole({ greeting: '<DUT1>' })
+    const session = track(sessionFor(server), server)
+    await session.open()
+    session.read({ after: 0 })
+
+    // A slab every 100ms, stopping after four -- the paced cadence the lab devices
+    // use, scaled down. The window is 300ms, so nothing can match while the slabs
+    // are still coming: each arrival restarts the clock.
+    let sent = 0
+    const timer = setInterval(() => {
+      sent += 1
+      server.push(`\r\nslab ${String(sent)}`)
+      if (sent >= 4) clearInterval(timer)
+    }, 100)
+
+    const waited = await session.waitFor({ for: 'idle', idleMs: 300, timeoutMs: 3000 })
+    clearInterval(timer)
+    expect(waited.matched).toBe(true)
+    // All four slabs arrived BEFORE the match, so the clock was reset by each
+    // arrival rather than firing on a stale start.
+    expect(sent).toBe(4)
+    // And it could not have matched until the window elapsed after the LAST one,
+    // so the total is at least the four intervals plus the quiet window.
+    expect(waited.elapsedMs).toBeGreaterThan(600)
+  })
+
+  it('uses the configured idle window when the call states none', async () => {
+    // The default was a literal 250 buried in the wait loop, which no deployment
+    // could change and no test could see. It is a setting now, and a session must
+    // honour it: 250ms would match between two slabs of a paced answer.
+    const server = await startFakeConsole({ greeting: '<DUT1>' })
+    const session = track(sessionFor(server, { idleQuietMs: 400 }), server)
+    await session.open()
+    session.read({ after: 0 })
+    // One slab, then silence. With a 400ms window the match cannot come sooner.
+    server.push('\r\none slab')
+    const waited = await session.waitFor({ for: 'idle', timeoutMs: 2000 })
+    expect(waited.matched).toBe(true)
+    expect(waited.elapsedMs).toBeGreaterThanOrEqual(380)
+  })
+
+  it('lets a call override the configured idle window', async () => {
+    const server = await startFakeConsole({ greeting: '<DUT1>' })
+    const session = track(sessionFor(server, { idleQuietMs: 5000 }), server)
+    await session.open()
+    session.read({ after: 0 })
+    server.push('\r\none slab')
+    // The session default would take 5s; the call asks for 100ms.
+    const started = Date.now()
+    const waited = await session.waitFor({ for: 'idle', idleMs: 100, timeoutMs: 2000 })
+    expect(waited.matched).toBe(true)
+    expect(Date.now() - started).toBeLessThan(1500)
+  })
+
   it('reports a timeout rather than hanging when nothing arrives', async () => {
     const server = await startFakeConsole({ greeting: '<DUT1>' })
     const session = track(sessionFor(server), server)
@@ -639,6 +720,7 @@ describe('ConsoleSession lifecycle', () => {
       dormantPattern: compileSearchPattern(DEFAULT_DORMANT_PATTERN),
       dormantAutoWake: true,
       dormantProbeMs: 0,
+      idleQuietMs: 250,
       scrollbackLimitBytes: 4096,
       bannerWindowMs: 100,
     })
@@ -672,6 +754,7 @@ describe('ConsoleSession lifecycle', () => {
       dormantPattern: compileSearchPattern(DEFAULT_DORMANT_PATTERN),
       dormantAutoWake: true,
       dormantProbeMs: 0,
+      idleQuietMs: 250,
       scrollbackLimitBytes: 4096,
     })
     open.push(session)
