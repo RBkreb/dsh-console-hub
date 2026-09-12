@@ -26,12 +26,23 @@
 import { parameterSchemaSpecToJsonSchema } from '@deepseek-ai/dsh-tools'
 import type { ConsoleToolRegistry, ConsoleToolRunContext } from './context-types.ts'
 import type { ConsoleView } from './config-shared.ts'
+import type { ConsoleViewRedacted } from './views.ts'
 import { isConsoleEncoding } from './config-shared.ts'
 import type { ConsoleEntry, PortManager } from './port-manager.ts'
 
-/** The tool names this plugin contributes, in registration order. */
+/**
+ * The tool names this plugin contributes, in registration order.
+ *
+ * The two listing tools are separate on purpose. `console_list` answers "what am
+ * I connected to right now" and `console_list_views` answers "what is
+ * configured"; one tool that returned both would leave the model guessing which
+ * half applied to a given handle, and an id from the wrong half fails on the
+ * next call. A stored view is not a console: it has no state, no idle time, and
+ * cannot be read from until it is connected.
+ */
 export const CONSOLE_TOOL_NAMES = [
   'console_list',
+  'console_list_views',
   'console_connect',
   'console_send',
   'console_read',
@@ -39,6 +50,8 @@ export const CONSOLE_TOOL_NAMES = [
   'console_close',
   'console_describe',
   'console_clear',
+  'console_upsert_view',
+  'console_remove_view',
 ] as const
 
 /** One model-facing tool name. */
@@ -59,6 +72,29 @@ export interface ConsoleToolDeps {
   views(): Record<string, ConsoleView>
   /** The plugin's engine defaults. */
   defaults(): ConsoleToolDefaults
+  /**
+   * The stored views as a configuration surface reads them: redacted, sorted,
+   * and carrying their credential facts.
+   */
+  listViews(): Promise<Array<{ viewId: string, view: ConsoleViewRedacted }>>
+  /**
+   * Create or update one stored device.
+   *
+   * Supplied by the host rather than reached through `views()`, because a write
+   * has to go through the settings seam's `replace` (a merge cannot delete a
+   * key) and has to run the schema, pattern, and secret guards.
+   */
+  upsertView(input: Record<string, unknown>): Promise<{ viewId: string, view: ConsoleViewRedacted }>
+  /** Remove one stored device and its credential. */
+  removeView(viewId: string): Promise<{ removed: boolean, secretRemoved: boolean }>
+  /**
+   * The credential to use for a stored view, when one is configured.
+   *
+   * Separate from `views()` because a VALUE is involved: the view carries only
+   * the fact that a credential exists. The host resolves it at connect time, so
+   * the secret reaches the socket and nowhere else.
+   */
+  resolveSecret?(viewId: string): Promise<{ password: string, user?: string } | undefined>
   /**
    * Inspect one outgoing command before it is written.
    *
@@ -141,6 +177,34 @@ interface ConsoleListRow {
   lastErrorCode?: string
 }
 
+/**
+ * One stored view as `console_list_views` reports it.
+ *
+ * Declared separately from `ConsoleView` for the same reason `ConsoleListRow` is:
+ * the tool returns a PROJECTION, and typing the renderer against the projection
+ * is what turns a field mismatch into a compile error instead of a crash.
+ */
+interface ViewListRow {
+  viewId: string
+  name: string
+  host: string
+  port: number
+  kind: string
+  encoding: string
+  user: string
+  tags: string[]
+  notes: string
+  secretConfigured: boolean
+}
+
+/** Render one stored view as a line. */
+function viewRowLine(row: ViewListRow): string {
+  const secret = row.secretConfigured ? ' key' : ''
+  const user = row.user === '' ? '' : ` user=${row.user}`
+  const tags = row.tags.length === 0 ? '' : ` #${row.tags.join(' #')}`
+  return `${handle(row.viewId)}  ${row.name}  ${row.host}:${String(row.port)}  ${row.kind}${user}${secret}${tags}`
+}
+
 /** The handle, quoted so its boundary is unambiguous in rendered text. */
 function handle(id: string): string {
   // A bare handle at the end of a sentence invites copying the punctuation with
@@ -202,6 +266,8 @@ function connectTarget(
   kind: 'telnet' | 'raw'
   encoding: string
   user?: string
+  /** Set when the caller named a stored view, so its credential can be resolved. */
+  viewId?: string
 } {
   const defaults = deps.defaults()
   const viewId = optionalText(args.viewId, 'viewId')
@@ -215,6 +281,7 @@ function connectTarget(
     const view = deps.views()[viewId]
     if (view === undefined) throw new Error(`no stored view "${viewId}"`)
     return {
+      viewId,
       label: view.name,
       host: view.host,
       port: view.port,
@@ -238,6 +305,33 @@ function connectTarget(
 }
 
 /**
+ * The stored credential for a view, when the deployment resolves one.
+ *
+ * Returns `undefined` for an ad-hoc endpoint (there is nothing stored to look
+ * up) and for a view with no credential. A resolution failure is treated as "no
+ * credential" rather than as a connect failure: a device needing no login must
+ * still connect, and a login prompt is what would reveal the credential was
+ * actually needed.
+ *
+ * @param deps - the tool dependencies.
+ * @param viewId - the stored view, or `undefined` for an ad-hoc connect.
+ * @returns the credential to use, or `undefined`.
+ */
+async function storedSecret(
+  deps: ConsoleToolDeps,
+  viewId: string | undefined,
+): Promise<{ password: string, user?: string } | undefined> {
+  if (viewId === undefined || deps.resolveSecret === undefined) return undefined
+  try {
+    return await deps.resolveSecret(viewId)
+  } catch {
+    // Fail closed to "no credential": the connect proceeds unauthenticated
+    // rather than the whole call failing on a store that could not be read.
+    return undefined
+  }
+}
+
+/**
  * Register the console tool family.
  *
  * The caller decides WHEN these are registered (a setting gates the family), so
@@ -255,9 +349,10 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
   register({
     name: 'console_list',
     description:
-      'List every device console this session has open. Returns each console\'s handle, label, device address, '
-      + 'transport, state, and how long it has been idle. Use it to recover state after a long sequence of calls, '
-      + 'or to find a console you forgot to close.',
+      'List the device consoles this session has CONNECTED (open right now). Each row carries the handle to pass to '
+      + 'console_send / console_read / console_close, plus its label, address, transport, state and idle time. '
+      + 'This does NOT list configured-but-unconnected devices -- call console_list_views for those, then '
+      + 'console_connect with the viewId it returns.',
     parameters: parameterSchemaSpecToJsonSchema({}),
     output: {
       schema: outputSchema({
@@ -299,6 +394,166 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
         ...entry.lastError === null ? {} : { lastErrorCode: entry.lastError.code },
       }))
       return { consoles }
+    },
+  })
+
+  register({
+    name: 'console_list_views',
+    description:
+      'List the SAVED device configurations (the inventory), whether or not they are connected. Each row carries the '
+      + 'viewId to pass to console_connect, the device address and transport, and whether a login credential is '
+      + 'stored for it. Use this to find a device you were told to work on, then console_connect by viewId -- do not '
+      + 'connect by host and port when a saved view exists, because only the view carries its credential and its '
+      + 'prompt/paging rules.',
+    parameters: parameterSchemaSpecToJsonSchema({}),
+    output: {
+      schema: outputSchema({
+        views: {
+          type: 'array',
+          items: outputSchema({
+            viewId: { type: 'string' },
+            name: { type: 'string' },
+            host: { type: 'string' },
+            port: { type: 'number' },
+            kind: { type: 'string' },
+            encoding: { type: 'string' },
+            user: { type: 'string' },
+            tags: { type: 'array', items: { type: 'string' } },
+            notes: { type: 'string' },
+            secretConfigured: { type: 'boolean' },
+          }, ['viewId', 'name', 'host', 'port', 'kind', 'secretConfigured']),
+        },
+      }, ['views']),
+      render: (_args: unknown, value: unknown) => {
+        const views = (value as { views: ViewListRow[] }).views
+        if (views.length === 0) {
+          return text('No saved device configurations. Create one with console_upsert_view (name, host, port).')
+        }
+        return text(views.map(viewRowLine).join('\n'))
+      },
+    },
+    execute: async (args: unknown, exec: ConsoleToolRunContext) => {
+      assertLive(exec)
+      const rows = await deps.listViews()
+      const views: ViewListRow[] = rows.map(({ viewId, view }) => ({
+        viewId,
+        name: view.name,
+        host: view.host,
+        port: view.port,
+        kind: view.kind,
+        encoding: view.encoding,
+        user: view.user,
+        tags: [...view.tags],
+        notes: view.notes,
+        secretConfigured: view.secretConfigured,
+      }))
+      return { views }
+    },
+  })
+
+  register({
+    name: 'console_upsert_view',
+    description:
+      'Create or update a saved device configuration. Omit `viewId` to create one (the new id is returned), or pass '
+      + 'an existing `viewId` to change that device. Only the fields you supply change on an update; on a create, '
+      + '`name`, `host` and `port` are required. '
+      + 'A `password` is written to the credential store, never to the configuration document, and is never read '
+      + 'back. Connecting the view later resolves it automatically.',
+    parameters: parameterSchemaSpecToJsonSchema({
+      viewId: { type: 'string', description: 'Existing view to update; omit to create a new one.' },
+      name: { type: 'string', description: 'Short human-readable device name (required on create).' },
+      host: { type: 'string', description: 'Console-server address (required on create).' },
+      port: { type: 'number', description: 'Mapped console port 1-65535 (required on create).' },
+      kind: { type: 'string', enum: ['telnet', 'raw'], description: 'Transport; telnet strips option negotiation.' },
+      encoding: { type: 'string', description: 'Device encoding override; empty uses the plugin default.' },
+      user: { type: 'string', description: 'Login user, when the device wants one.' },
+      promptPattern: { type: 'string', description: 'Per-device prompt regex override; empty uses the plugin default.' },
+      pagerPattern: { type: 'string', description: 'Per-device pager regex override; empty uses the plugin default.' },
+      pagingMode: { type: 'string', enum: ['auto-more', 'auto-quit', 'auto-interrupt', 'manual'], description: 'Per-device paging mode override.' },
+      tags: { type: 'array', items: { type: 'string' }, description: 'Free-form labels, for finding devices later.' },
+      notes: { type: 'string', description: 'Free-form note (never a credential).' },
+      password: {
+        type: 'string',
+        description: 'Login password, stored in the credential store. Write-only: it can never be read back.',
+      },
+    }),
+    output: {
+      schema: outputSchema({
+        viewId: { type: 'string' },
+        created: { type: 'boolean' },
+        name: { type: 'string' },
+        host: { type: 'string' },
+        port: { type: 'number' },
+        kind: { type: 'string' },
+        secretConfigured: { type: 'boolean' },
+      }, ['viewId', 'created', 'name', 'host', 'port', 'kind', 'secretConfigured']),
+      render: (_args: unknown, value: unknown) => {
+        const result = value as {
+          viewId: string
+          created: boolean
+          name: string
+          host: string
+          port: number
+          secretConfigured: boolean
+        }
+        return text(
+          `${result.created ? 'Created' : 'Updated'} ${handle(result.viewId)} "${result.name}" `
+          + `${result.host}:${String(result.port)}`
+          + `${result.secretConfigured ? ' (credential stored)' : ' (no credential stored)'}. `
+          + `Connect it with console_connect viewId=${handle(result.viewId)}.`,
+        )
+      },
+    },
+    execute: async (args: unknown, exec: ConsoleToolRunContext) => {
+      assertLive(exec)
+      const parsed = (args ?? {}) as Record<string, unknown>
+      const viewId = optionalText(parsed.viewId, 'viewId')
+      // `created` is decided from the inventory BEFORE the write, because an
+      // upsert with a supplied id cannot tell creation from update afterwards.
+      const known = viewId !== undefined && deps.views()[viewId] !== undefined
+      const result = await deps.upsertView(parsed)
+      return {
+        viewId: result.viewId,
+        created: !known,
+        name: result.view.name,
+        host: result.view.host,
+        port: result.view.port,
+        kind: result.view.kind,
+        secretConfigured: result.view.secretConfigured,
+      }
+    },
+  })
+
+  register({
+    name: 'console_remove_view',
+    description:
+      'Delete a saved device configuration, along with any credential stored for it. This is the configuration, not '
+      + 'a live console: use console_close for a connection that is open. Removing a device that is currently '
+      + 'connected does NOT close that console, so close it first when you mean to disconnect as well.',
+    parameters: parameterSchemaSpecToJsonSchema({
+      viewId: { type: 'string', required: true, description: 'The stored view to delete.' },
+    }),
+    output: {
+      schema: outputSchema({
+        viewId: { type: 'string' },
+        removed: { type: 'boolean' },
+        secretRemoved: { type: 'boolean' },
+      }, ['viewId', 'removed', 'secretRemoved']),
+      render: (_args: unknown, value: unknown) => {
+        const result = value as { viewId: string, removed: boolean, secretRemoved: boolean }
+        return text(
+          `Removed the saved configuration ${handle(result.viewId)}`
+          + `${result.secretRemoved ? ' and its stored credential' : ''}.`,
+        )
+      },
+    },
+    execute: async (args: unknown, exec: ConsoleToolRunContext) => {
+      assertLive(exec)
+      const parsed = (args ?? {}) as Record<string, unknown>
+      const viewId = optionalText(parsed.viewId, 'viewId')
+      if (viewId === undefined) throw new Error('"viewId" is required')
+      const result = await deps.removeView(viewId)
+      return { viewId, removed: result.removed, secretRemoved: result.secretRemoved }
     },
   })
 
@@ -373,11 +628,23 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
       const sessionId = sessionIdOf(exec)
       const parsed = (args ?? {}) as Record<string, unknown>
       const target = connectTarget(deps, parsed)
-      const password = optionalText(parsed.password, 'password')
+      const explicit = optionalText(parsed.password, 'password')
+      // A stored credential is what makes connecting by `viewId` worth doing, so
+      // it is resolved HERE rather than left to the caller. An explicit password
+      // wins: it is the ad-hoc override for a device whose stored value is stale.
+      //
+      // This path was documented ("Prefer a stored credential on the view") long
+      // before it existed -- `resolveSecret` was written and never called, so a
+      // device with a saved password still needed the password passed in. The
+      // value reaches the socket and is never returned.
+      const stored = explicit === undefined || explicit === '' ? await storedSecret(deps, target.viewId) : undefined
+      const password = explicit === undefined || explicit === '' ? stored?.password : explicit
 
       const entry = await deps.manager.connect({
         ownerSessionId: sessionId,
         ...target,
+        // A view with a stored user supplies it when no explicit password came
+        // with one; an explicit password always pairs with the caller's user.
         ...password === undefined || password === '' ? {} : { password },
       })
       const detail = deps.manager.describe(sessionId, entry.consoleId)

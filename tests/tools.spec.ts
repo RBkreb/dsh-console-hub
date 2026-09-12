@@ -7,9 +7,10 @@
  */
 import { createServer, type Server, type Socket } from 'node:net'
 import { afterEach, describe, expect, it } from 'vitest'
-import { CONSOLE_TOOL_NAMES, registerConsoleTools } from '../src/tools.ts'
+import { CONSOLE_TOOL_NAMES, registerConsoleTools, type ConsoleToolDeps } from '../src/tools.ts'
 import { PortManager } from '../src/port-manager.ts'
 import { DEFAULT_PAGER_PATTERN, DEFAULT_PROMPT_PATTERN } from '../src/config-shared.ts'
+import { normalizeView } from '../src/views.ts'
 import type { ConsoleToolRegistry, ConsoleToolRunContext } from '../src/context-types.ts'
 import type { ConsoleView } from '../src/config-shared.ts'
 import { assertObjectJsonSchema, assertSupportedJsonSchema } from '@deepseek-ai/dsh-tools'
@@ -95,6 +96,59 @@ async function startDevice(
   }
 }
 
+/**
+ * A device that demands a password before it answers anything.
+ *
+ * Needed to make a credential test mean something: a device that answers
+ * regardless cannot distinguish "the stored password was used" from "no password
+ * was needed". This one refuses every command until `password:<value>` arrives,
+ * so a successful round trip proves a credential was actually sent.
+ *
+ * @param password - the value it accepts.
+ * @returns the device handle.
+ */
+async function startPasswordDevice(password: string): Promise<Device> {
+  const sockets: Socket[] = []
+  let authenticated = false
+  const server: Server = createServer((socket) => {
+    sockets.push(socket)
+    socket.on('close', () => {
+      const index = sockets.indexOf(socket)
+      if (index >= 0) sockets.splice(index, 1)
+    })
+    // The prompt the engine's auth hook looks for: `password:` at the tail.
+    socket.write('\r\npassword:')
+    socket.on('data', (chunk: Buffer) => {
+      for (const line of chunk.toString('utf8').split(/[\r\n]+/)) {
+        if (line === '') continue
+        if (!authenticated) {
+          // The engine answers the prompt with `<password>\r\n`, so the line it
+          // sends IS the password.
+          if (line === password) {
+            authenticated = true
+            socket.write('\r\n<DUT1>')
+          } else {
+            socket.write('\r\npassword:')
+          }
+          continue
+        }
+        socket.write(`\r\nanswer:${line}\r\n<DUT1>`)
+      }
+    })
+  })
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  if (address === null || typeof address === 'string') throw new Error('no port')
+  return {
+    port: address.port,
+    sockets,
+    async close() {
+      for (const socket of sockets.splice(0)) socket.destroy()
+      await new Promise<void>(resolve => server.close(() => resolve()))
+    },
+  }
+}
+
 /** Exec context for one call, scoped to a session. */
 function execFor(sessionId = 'session-a'): ConsoleToolRunContext {
   return {
@@ -120,8 +174,55 @@ afterEach(async () => {
   for (const device of devices.splice(0)) await device.close()
 })
 
+/**
+ * The inventory side of the tool dependencies, over an in-memory map.
+ *
+ * Kept as one builder rather than repeated inline, because the fakes here have
+ * twice been more permissive than the real thing and let a bug through. All
+ * three of these are deliberately faithful where it matters:
+ *
+ * - `upsertView` runs the REAL `normalizeView`, so a bad port or an unknown kind
+ *   is refused exactly as in production rather than being accepted by a stub.
+ * - `removeView` really deletes the key, so a tool that reported success while
+ *   leaving the row behind would fail here.
+ * - `resolveSecret` is absent by default, matching a deployment with no stored
+ *   credential; a case that wants one supplies it.
+ *
+ * @param store - the mutable view map, shared with the case so it can inspect it.
+ * @param resolveSecret - the credential resolution, when the case needs one.
+ * @returns the inventory slice of the tool dependencies.
+ */
+function inventoryDeps(
+  store: Record<string, ConsoleView>,
+  resolveSecret?: (viewId: string) => Promise<{ password: string, user?: string } | undefined>,
+): Pick<ConsoleToolDeps, 'listViews' | 'upsertView' | 'removeView' | 'resolveSecret'> {
+  return {
+    listViews: async () => Object.entries(store).map(([viewId, view]) => ({
+      viewId,
+      view: { ...view, secretConfigured: false },
+    })),
+    upsertView: async (input: Record<string, unknown>) => {
+      // The real normalizer, so this cannot accept what production refuses.
+      const view = normalizeView(input as never)
+      const viewId = typeof input.viewId === 'string' && input.viewId !== '' ? input.viewId : 'v-created'
+      store[viewId] = view
+      return { viewId, view: { ...view, secretConfigured: false } }
+    },
+    removeView: async (viewId: string) => {
+      if (store[viewId] === undefined) throw new Error(`no view "${viewId}"`)
+      const had = false
+      delete store[viewId]
+      return { removed: true, secretRemoved: had }
+    },
+    ...resolveSecret === undefined ? {} : { resolveSecret },
+  }
+}
+
 /** Build a registered tool set pointed at one device. */
-async function scene(): Promise<Scene> {
+async function scene(options: {
+  /** Credential resolution, when the case needs a stored secret. */
+  resolveSecret?: (viewId: string) => Promise<{ password: string, user?: string } | undefined>
+} = {}): Promise<Scene> {
   const device = await startDevice()
   devices.push(device)
   const manager = new PortManager({
@@ -154,13 +255,52 @@ async function scene(): Promise<Scene> {
     tags: [],
     notes: '',
   }
+  const store: Record<string, ConsoleView> = { 'v-known': view as ConsoleView }
   const dispose = registerConsoleTools({
     registry,
     manager,
-    views: () => ({ 'v-known': view as ConsoleView }),
+    views: () => store,
     defaults: () => ({ encoding: 'utf-8', kind: 'raw', pagingMode: 'manual' }),
+    ...inventoryDeps(store, options.resolveSecret),
   })
   return { registry, manager, dispose, view }
+}
+
+/**
+ * A registered tool set over an EMPTY inventory, with no device behind it.
+ *
+ * Separate from {@link scene} because the interesting cases here are about the
+ * inventory itself: the device list must be empty, and nothing should need a
+ * live socket.
+ *
+ * @returns the wired family with nothing configured.
+ */
+function emptyScene(): Scene {
+  const registry = fakeRegistry()
+  const store: Record<string, ConsoleView> = {}
+  const manager = new PortManager({
+    maxConsoles: 1,
+    scrollbackLimitBytes: 8192,
+    outputLimitBytes: 4096,
+    connectTimeoutMs: 1000,
+    readTimeoutMs: 200,
+    idleTimeoutMs: 60_000,
+    idleSweepMs: 1000,
+    pagingMode: 'manual',
+    pagingMaxPages: 5,
+    pagingQuietMs: 20,
+    promptPattern: DEFAULT_PROMPT_PATTERN,
+    pagerPattern: DEFAULT_PAGER_PATTERN,
+  })
+  managers.push(manager)
+  const dispose = registerConsoleTools({
+    registry,
+    manager,
+    views: () => store,
+    defaults: () => ({ encoding: 'utf-8', kind: 'raw', pagingMode: 'manual' }),
+    ...inventoryDeps(store),
+  })
+  return { registry, manager, dispose, view: scene1View(0) }
 }
 
 /**
@@ -425,11 +565,13 @@ describe('console_send / console_read / console_wait_for', () => {
     })
     managers.push(manager)
     const registry = fakeRegistry()
+    const emptyStore: Record<string, ConsoleView> = {}
     registerConsoleTools({
       registry,
       manager,
-      views: () => ({}),
+      views: () => emptyStore,
       defaults: () => ({ encoding: 'utf-8', kind: 'raw', pagingMode: 'manual' }),
+      ...inventoryDeps(emptyStore),
     })
     const local: Scene = { registry, manager, dispose: () => {}, view: scene1View(device.port) }
     const opened = await callTool(local, 'console_connect', {
@@ -468,6 +610,21 @@ function scene1View(port: number): Scene['view'] {
     tags: [],
     notes: '',
   }
+}
+
+/**
+ * The bare `ConsoleView` for an id, without the wrapper's `viewId`.
+ *
+ * A `ConsoleView` is the stored record; `Scene['view']` is that record plus the
+ * key it lives under, which is how the API returns it. Stripping the key here
+ * keeps each type honest rather than widening the store to accept both.
+ *
+ * @param port - the device port to point at.
+ * @returns the stored view record.
+ */
+function viewRecord(port: number): ConsoleView {
+  const { viewId: _viewId, ...view } = scene1View(port)
+  return view as ConsoleView
 }
 
 describe('console_close', () => {
@@ -582,5 +739,251 @@ describe('the rendered text is usable as-is', () => {
     const value = await callTool(scene1, 'console_list', {})
     const rendered = renderOf(scene1, 'console_list', value)
     expect(rendered).toMatch(/error|closed/)
+  })
+})
+
+describe('listing configured devices versus connected ones', () => {
+  it('console_list_views lists a configured device that is NOT connected', async () => {
+    // The reported gap: `console_list` only showed connected consoles, so a
+    // configured-but-idle device was invisible and the model had to hunt through
+    // the settings document and connect by hand. The two are separate tools with
+    // separate meanings.
+    const scene1 = await scene()
+    const views = await callTool(scene1, 'console_list_views', {}) as { views: Array<{ viewId: string, name: string }> }
+    expect(views.views).toHaveLength(1)
+    expect(views.views[0]?.viewId).toBe('v-known')
+    expect(views.views[0]?.name).toBe('FW1')
+
+    // Nothing is connected, so the console list is empty -- which is exactly why
+    // one tool could not answer both questions.
+    const consoles = await callTool(scene1, 'console_list', {}) as { consoles: unknown[] }
+    expect(consoles.consoles).toHaveLength(0)
+  })
+
+  it('does not count a configured device as a connected console', async () => {
+    const scene1 = await scene()
+    await callTool(scene1, 'console_connect', { viewId: 'v-known' })
+    const consoles = await callTool(scene1, 'console_list', {}) as { consoles: unknown[] }
+    // One connected console, and STILL one configured view: connecting does not
+    // duplicate the inventory.
+    expect(consoles.consoles).toHaveLength(1)
+    const views = await callTool(scene1, 'console_list_views', {}) as { views: unknown[] }
+    expect(views.views).toHaveLength(1)
+  })
+
+  it('renders the viewId quoted, so it can be passed straight to console_connect', async () => {
+    const scene1 = await scene()
+    const value = await callTool(scene1, 'console_list_views', {})
+    const tool = scene1.registry.tools.get('console_list_views')
+    const rendered = tool?.output.render({}, value).map(block => block.text).join('\n') ?? ''
+    expect(rendered).toContain('"v-known"')
+    expect(rendered).toContain('FW1')
+  })
+
+  it('says how to create one when the inventory is empty', async () => {
+    // An empty list must be actionable, not just empty: the model needs to know
+    // it can add a device rather than concluding the feature is unavailable.
+    const scene1 = await scene()
+    const store = (scene1 as unknown as { store?: Record<string, unknown> })
+    void store
+    const empty = emptyScene()
+    const value = await callTool(empty, 'console_list_views', {})
+    const tool = empty.registry.tools.get('console_list_views')
+    const rendered = tool?.output.render({}, value).map(block => block.text).join('\n') ?? ''
+    expect(rendered).toMatch(/console_upsert_view/)
+  })
+})
+
+describe('editing the inventory from the model', () => {
+  it('creates a device and returns the id to connect with', async () => {
+    const scene1 = await scene()
+    const created = await callTool(scene1, 'console_upsert_view', {
+      name: 'SW9',
+      host: '10.9.9.9',
+      port: 10015,
+      kind: 'telnet',
+    }) as { viewId: string, created: boolean, name: string, host: string, port: number }
+
+    expect(created.created).toBe(true)
+    expect(created.name).toBe('SW9')
+    expect(created.host).toBe('10.9.9.9')
+
+    // The write is real: it shows up in the inventory, which is what makes it
+    // useful rather than a no-op that reported success.
+    const views = await callTool(scene1, 'console_list_views', {}) as { views: Array<{ viewId: string }> }
+    expect(views.views.map(row => row.viewId)).toContain(created.viewId)
+  })
+
+  it('updates an existing device without creating a second one', async () => {
+    const scene1 = await scene()
+    const updated = await callTool(scene1, 'console_upsert_view', {
+      viewId: 'v-known',
+      name: 'FW1-renamed',
+      host: '127.0.0.1',
+      port: 10003,
+    }) as { viewId: string, created: boolean, name: string }
+    expect(updated.viewId).toBe('v-known')
+    expect(updated.created).toBe(false)
+    expect(updated.name).toBe('FW1-renamed')
+
+    const views = await callTool(scene1, 'console_list_views', {}) as { views: unknown[] }
+    expect(views.views).toHaveLength(1)
+  })
+
+  it('refuses an invalid device with the normalizer’s own message', async () => {
+    // The fake runs the REAL `normalizeView`, so what production refuses is what
+    // this refuses -- a stub that accepted anything would make the test lie.
+    const scene1 = await scene()
+    await expect(callTool(scene1, 'console_upsert_view', {
+      name: 'bad', host: 'h', port: 70000,
+    })).rejects.toThrow(/port/)
+    await expect(callTool(scene1, 'console_upsert_view', {
+      name: 'bad', host: 'h', port: 23, kind: 'ssh',
+    })).rejects.toThrow(/kind/)
+  })
+
+  it('removes a configured device', async () => {
+    const scene1 = await scene()
+    const removed = await callTool(scene1, 'console_remove_view', { viewId: 'v-known' }) as { removed: boolean }
+    expect(removed.removed).toBe(true)
+    const views = await callTool(scene1, 'console_list_views', {}) as { views: unknown[] }
+    expect(views.views).toHaveLength(0)
+  })
+
+  it('refuses to remove a device that is not configured', async () => {
+    const scene1 = await scene()
+    await expect(callTool(scene1, 'console_remove_view', { viewId: 'v-nope' })).rejects.toThrow(/v-nope/)
+  })
+
+  it('never returns a password it was given', async () => {
+    // A write-only field. The tool's canonical value and its render are both
+    // checked, because either one leaking the value would put it in the
+    // transcript.
+    const scene1 = await scene()
+    const value = await callTool(scene1, 'console_upsert_view', {
+      name: 'SEC', host: 'h', port: 22, password: 'never-echo-this',
+    })
+    expect(JSON.stringify(value)).not.toContain('never-echo-this')
+    const tool = scene1.registry.tools.get('console_upsert_view')
+    const rendered = tool?.output.render({}, value).map(block => block.text).join('\n') ?? ''
+    expect(rendered).not.toContain('never-echo-this')
+  })
+})
+
+describe('a stored credential reaches the connect', () => {
+  /**
+   * A tool family pointing at a password-gated device.
+   *
+   * The device answers NOTHING until it hears the right password, so a command
+   * that succeeds proves a credential was sent -- a device that replied anyway
+   * could not tell "the stored password was used" from "no password was needed".
+   *
+   * @param password - the password the device accepts.
+   * @param options.resolveSecret - what the deployment resolves for `v-known`.
+   * @returns the wired family and the device.
+   */
+  async function passwordScene(password: string, options: {
+    resolveSecret?: (viewId: string) => Promise<{ password: string, user?: string } | undefined>
+  } = {}): Promise<{ scene: Scene, device: Device }> {
+    const device = await startPasswordDevice(password)
+    devices.push(device)
+    const manager = new PortManager({
+      maxConsoles: 2,
+      scrollbackLimitBytes: 8192,
+      outputLimitBytes: 4096,
+      connectTimeoutMs: 1000,
+      readTimeoutMs: 400,
+      idleTimeoutMs: 60_000,
+      idleSweepMs: 1000,
+      pagingMode: 'manual',
+      pagingMaxPages: 5,
+      pagingQuietMs: 20,
+      promptPattern: DEFAULT_PROMPT_PATTERN,
+      pagerPattern: DEFAULT_PAGER_PATTERN,
+    })
+    managers.push(manager)
+    const registry = fakeRegistry()
+    const store: Record<string, ConsoleView> = { 'v-known': viewRecord(device.port) }
+    const dispose = registerConsoleTools({
+      registry,
+      manager,
+      views: () => store,
+      defaults: () => ({ encoding: 'utf-8', kind: 'raw', pagingMode: 'manual' }),
+      ...inventoryDeps(store, options.resolveSecret),
+    })
+    return { scene: { registry, manager, dispose, view: scene1View(device.port) }, device }
+  }
+
+  it('authenticates with the stored password when the caller names a view', async () => {
+    // The documented-but-missing behaviour: `console_connect` said "Prefer a
+    // stored credential on the view" while `resolveSecret` was never called, so
+    // connecting by viewId silently ignored it and the login prompt went
+    // unanswered.
+    const { scene: scene1 } = await passwordScene('stored-secret', {
+      resolveSecret: async viewId => (viewId === 'v-known' ? { password: 'stored-secret' } : undefined),
+    })
+    const opened = await callTool(scene1, 'console_connect', { viewId: 'v-known' }) as { consoleId: string }
+
+    // A command only answers once the device has accepted the password.
+    await callTool(scene1, 'console_send', { consoleId: opened.consoleId, text: 'show version' })
+    const deadline = Date.now() + 3000
+    let text = ''
+    while (!text.includes('answer:show version') && Date.now() < deadline) {
+      text += ((await callTool(scene1, 'console_read', { consoleId: opened.consoleId })) as { text: string }).text
+      await new Promise(resolve => setTimeout(resolve, 20))
+    }
+    expect(text).toContain('answer:show version')
+  })
+
+  it('does NOT authenticate when no credential resolves', async () => {
+    // The control for the case above: without a credential the device keeps
+    // asking, so the assertion there really is testing the resolution.
+    const { scene: scene1 } = await passwordScene('stored-secret')
+    const opened = await callTool(scene1, 'console_connect', { viewId: 'v-known' }) as { consoleId: string }
+    await callTool(scene1, 'console_send', { consoleId: opened.consoleId, text: 'show version' })
+    const text = ((await callTool(scene1, 'console_read', { consoleId: opened.consoleId })) as { text: string }).text
+    expect(text).not.toContain('answer:show version')
+  })
+
+  it('lets an explicit password win over the stored one', async () => {
+    // The device accepts the EXPLICIT value, so a connect that used the stored
+    // one instead would never authenticate.
+    const used: string[] = []
+    const { scene: scene1 } = await passwordScene('explicit-value', {
+      resolveSecret: async () => { used.push('stored'); return { password: 'stored-secret' } },
+    })
+    const opened = await callTool(scene1, 'console_connect', {
+      viewId: 'v-known',
+      password: 'explicit-value',
+    }) as { consoleId: string }
+    await callTool(scene1, 'console_send', { consoleId: opened.consoleId, text: 'ping' })
+
+    const deadline = Date.now() + 3000
+    let text = ''
+    while (!text.includes('answer:ping') && Date.now() < deadline) {
+      text += ((await callTool(scene1, 'console_read', { consoleId: opened.consoleId })) as { text: string }).text
+      await new Promise(resolve => setTimeout(resolve, 20))
+    }
+    expect(text).toContain('answer:ping')
+    // An explicit password is the ad-hoc override, so the stored value must not
+    // even be consulted.
+    expect(used).toHaveLength(0)
+  })
+
+  it('connects an ad-hoc endpoint without looking for a credential', async () => {
+    // Nothing is stored for a host/port pair, and a device needing no login must
+    // still connect.
+    const scene1 = await scene()
+    const opened = await callTool(scene1, 'console_connect', { host: '127.0.0.1', port: 1, kind: 'raw' })
+    expect(opened).toBeDefined()
+  })
+
+  it('never puts the resolved password in the result or its render', async () => {
+    const scene1 = await scene({ resolveSecret: async () => ({ password: 'top-secret-value' }) })
+    const opened = await callTool(scene1, 'console_connect', { viewId: 'v-known' })
+    expect(JSON.stringify(opened)).not.toContain('top-secret-value')
+    const tool = scene1.registry.tools.get('console_connect')
+    const rendered = tool?.output.render({}, opened).map(block => block.text).join('\n') ?? ''
+    expect(rendered).not.toContain('top-secret-value')
   })
 })

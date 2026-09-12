@@ -46,6 +46,8 @@ import {
 import { approveConsoleCommand, classifyCommand, type ConsoleFenceSettings } from './guard.ts'
 import { buildHubRoute } from './hub-route.ts'
 import { ManagerHolder, policyFromSettings } from './manager-holder.ts'
+import { listViews, removeView, upsertView, type InventoryApi } from './inventory.ts'
+import { resolveSecret } from './secrets.ts'
 import { registerConsoleTools } from './tools.ts'
 import type { ConsoleHubApi, HubSettingsFace } from './routes.ts'
 import type { ConsoleSessionApi } from './console-routes.ts'
@@ -226,7 +228,7 @@ export function apply(ctx: Context, config?: ConsoleHubConfig): void {
     // and must flip together, so one subscription drives them. The renderers are
     // built ONCE — each closes over the disposer of what it registered, so
     // rebuilding them per commit would lose that handle and register twice.
-    const renderers = [installTools(ctx, holder, readSettings), installPrompt(ctx, readSettings)]
+    const renderers = [installTools(ctx, holder, binding, readSettings), installPrompt(ctx, readSettings)]
     for (const render of renderers) render()
     const gateWatch = binding.scope.watch(() => {
       for (const render of renderers) render()
@@ -480,10 +482,28 @@ function installApi(
 function installTools(
   ctx: Context,
   holder: ManagerHolder,
+  binding: SettingsBinding,
   readSettings: () => ConsoleHubSettings,
 ): () => void {
   let dispose: (() => void) | undefined
   let registry: { register(tool: unknown): () => void } | undefined
+
+  /**
+   * The inventory view of this plugin's own dependencies.
+   *
+   * Built from the SAME pieces the HTTP API uses, so an edit from the model and
+   * an edit from the panel go through one write path -- with one schema check,
+   * one secret guard, and the one `replace`-not-`update` rule a removal depends
+   * on. Reading the seam lazily keeps a credential provider that activates later
+   * reachable, which a captured reference would miss.
+   *
+   * @returns the inventory dependencies.
+   */
+  const inventory = (): InventoryApi => ({
+    current: readSettings,
+    scope: binding.scope,
+    credentials: ctx.get<ConsoleCredentialProvider>('credentials'),
+  })
 
   /** Bring the registration in line with the current setting. */
   const sync = (): void => {
@@ -507,6 +527,24 @@ function installTools(
       defaults: () => {
         const value = readSettings()
         return { encoding: value.defaultEncoding, kind: value.defaultKind, pagingMode: value.pagingMode }
+      },
+      // The inventory surface the model sees, built from the SAME reader the
+      // panel uses, so the two can never disagree about what is configured.
+      listViews: () => listViews(inventory()),
+      upsertView: input => upsertView(inventory(), input),
+      removeView: async (viewId: string) => {
+        const result = await removeView(inventory(), { viewId })
+        return { removed: result.removed, secretRemoved: result.secretRemoved }
+      },
+      // A stored credential reaches the socket and nowhere else: resolved at
+      // connect time, never carried on the view the model reads.
+      resolveSecret: async (viewId: string) => {
+        const resolved = await resolveSecret(ctx.get<ConsoleCredentialProvider>('credentials'), viewId)
+        if (resolved === undefined) return undefined
+        return {
+          password: resolved.password,
+          ...resolved.user === undefined ? {} : { user: resolved.user },
+        }
       },
       guard: async ({ exec, sessionId, consoleId, text }) => {
         const decision = await approveConsoleCommand(
@@ -576,10 +614,17 @@ function installPrompt(ctx: Context, readSettings: () => ConsoleHubSettings): ()
         const extra = settings.agentInstructions.trim()
         return [
           'Network device consoles are available through the console_* tools.',
-          'A console is scoped to YOUR session: console_connect and console_list only ever see consoles this session opened.',
-          'Workflow: console_connect (by viewId, or by host+port), then console_send, then console_read, passing the `cursor`',
-          'from each read back as `after` so no output is read twice. Use console_wait_for to wait for the device prompt',
-          'instead of sleeping, and console_close when finished.',
+          'A console is scoped to YOUR session: console_list and console_connect only ever see consoles this session opened.',
+          'Two different questions have two different tools, and mixing them up wastes a round trip:',
+          '- console_list answers "what am I connected to right now". Its handles are what console_send / console_read /',
+          '  console_close accept. A configured-but-unconnected device does NOT appear here.',
+          '- console_list_views answers "what devices are configured". Its viewIds are what console_connect accepts.',
+          'To work on a named device: console_list_views to find its viewId, then console_connect with that viewId. Prefer',
+          'the view over host+port, because only the view carries its stored credential and its prompt/paging rules.',
+          'You can manage the inventory yourself: console_upsert_view creates or updates a device (name, host, port), and',
+          'console_remove_view deletes one. A password passed to console_upsert_view is write-only.',
+          'Then console_send, then console_read, passing the `cursor` from each read back as `after` so no output is read',
+          'twice. Use console_wait_for to wait for the device prompt instead of sleeping, and console_close when finished.',
           'High-risk commands (entering configuration mode, restarting) require user approval; a refusal is a decision to',
           'report, not an error to retry.',
           ...extra === '' ? [] : ['', extra],

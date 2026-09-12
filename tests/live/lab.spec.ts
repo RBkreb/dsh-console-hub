@@ -233,6 +233,111 @@ describe.runIf(LIVE)('live console lab', () => {
     }
   }, 30_000)
 
+  it('sees on one console what another console writes to the same device', async () => {
+    // The requested measurement, and the one thing a fake cannot show: TWO
+    // consoles against ONE physical device, where a command typed into the first
+    // appears on the SECOND. A serial console mapping means both connections
+    // share the device's one console line, so the device echoes the command to
+    // every attached session.
+    //
+    // The two halves assert different mechanisms, which is why both are here:
+    //   - console A's own read sees its answer (the ordinary path).
+    //   - console B's `waitFor` sees the command text A typed, with B having
+    //     sent nothing. That is the real wait_for contract: it observes output
+    //     arriving from elsewhere, not merely its own round trip.
+    const ports = manager()
+    try {
+      const open = async (label: string): Promise<string> => {
+        const entry = await ports.connect({
+          ownerSessionId: 'live',
+          label,
+          host: SW1.host,
+          port: SW1.port,
+          kind: 'telnet',
+          encoding: 'utf-8',
+          pagingMode: 'manual',
+        })
+        await ports.waitFor('live', entry.consoleId, { for: 'prompt', timeoutMs: 8000 })
+        return entry.consoleId
+      }
+      const writer = await open('WRITER')
+      const watcher = await open('WATCHER')
+      expect(ports.list('live')).toHaveLength(2)
+
+      // Both consoles are positioned at a clean cursor before the command, so
+      // anything either reads afterward arrived because of this command.
+      const writerAt = ports.read('live', writer, { after: 0 }).cursor
+      const watcherAt = ports.read('live', watcher, { after: 0 }).cursor
+
+      // A distinctive marker, so a match cannot come from unrelated device
+      // output that happened to contain generic text.
+      const marker = `echo live-sync-${String(Date.now())}`
+      await ports.send('live', writer, marker)
+
+      // The WATCHER waits for text it never sent. `waitFor` here is the real
+      // one: it polls the session's own scrollback, so a match means the device
+      // forwarded the writer's line to this connection.
+      const seen = await ports.waitFor('live', watcher, {
+        for: 'pattern',
+        pattern: marker,
+        after: watcherAt,
+        timeoutMs: 8000,
+      })
+      expect(seen.matched).toBe(true)
+      expect(seen.reason).toBe('matched')
+
+      // And the watcher can READ what it matched -- `matched: true` with nothing
+      // readable would make the wait useless to a caller.
+      const watcherText = ports.read('live', watcher, { after: watcherAt }).text
+      expect(watcherText).toContain(marker)
+
+      // The writer sees its own echo too, so the two views agree about what was
+      // typed while remaining separate sessions.
+      const writerText = ports.read('live', writer, { after: writerAt }).text
+      expect(writerText).toContain(marker)
+    } finally {
+      await ports.dispose()
+    }
+  }, 60_000)
+
+  it('times out on a pattern the device never prints', async () => {
+    // The other half of the contract: a wait must REPORT a timeout rather than
+    // hanging or claiming a false match. A live console makes this the real
+    // question, because the device is emitting prompts the whole time.
+    const ports = manager()
+    try {
+      const entry = await ports.connect({
+        ownerSessionId: 'live',
+        label: SW1.label,
+        host: SW1.host,
+        port: SW1.port,
+        kind: 'telnet',
+        encoding: 'utf-8',
+        pagingMode: 'manual',
+      })
+      await ports.waitFor('live', entry.consoleId, { for: 'prompt', timeoutMs: 8000 })
+      const at = ports.read('live', entry.consoleId, { after: 0 }).cursor
+
+      const started = Date.now()
+      const missed = await ports.waitFor('live', entry.consoleId, {
+        for: 'pattern',
+        pattern: `never-printed-${String(Date.now())}`,
+        after: at,
+        timeoutMs: 1500,
+      })
+      expect(missed.matched).toBe(false)
+      expect(missed.reason).toBe('timeout')
+      // It waited about as long as it was told, and returned within a sane
+      // multiple of that rather than hanging.
+      expect(Date.now() - started).toBeGreaterThanOrEqual(1000)
+      expect(Date.now() - started).toBeLessThan(8000)
+      // Still usable afterward: a timeout is a result, not a broken console.
+      expect(ports.describe('live', entry.consoleId)?.state.state).toBe('open')
+    } finally {
+      await ports.dispose()
+    }
+  }, 40_000)
+
   it('classifies the high-risk commands these devices really accept', () => {
     // The engine's own connect path is exercised above; this asserts the
     // GUARD's behaviour on the real strings a device CLI accepts.

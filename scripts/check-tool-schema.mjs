@@ -10,7 +10,7 @@
  * Usage: node --import ./scripts/test-preload.mjs scripts/check-tool-schema.mjs
  */
 import { assertObjectJsonSchema, assertSupportedJsonSchema } from '@deepseek-ai/dsh-tools'
-import { registerConsoleTools } from '../src/tools.ts'
+import { CONSOLE_TOOL_NAMES, registerConsoleTools } from '../src/tools.ts'
 
 /** Collect every definition the registrar tries to register. */
 const captured = []
@@ -40,9 +40,34 @@ const dispose = registerConsoleTools({
   },
   views: () => ({}),
   defaults: () => ({ encoding: 'utf-8', kind: 'telnet', pagingMode: 'auto-more' }),
+  // The inventory surface. Present so registration runs to the end: a missing
+  // dependency here used to abort `registerConsoleTools` part-way, and the gate
+  // then reported on a PREFIX of the family while claiming to have checked it.
+  listViews: async () => [],
+  upsertView: async () => ({ viewId: 'v-check', view: { name: 'x', host: 'h', port: 1, kind: 'raw' } }),
+  removeView: async () => ({ removed: true, secretRemoved: false }),
+  resolveSecret: async () => undefined,
 })
 
 console.log(`[check] definitions handed to the registry: ${captured.length}`)
+// Registration is a loop over the whole family, so a count that disagrees with
+// the declared names means it stopped early -- and every check below would then
+// be reporting on a prefix. Compared here so that cannot pass silently.
+if (captured.length !== CONSOLE_TOOL_NAMES.length) {
+  console.error(
+    `[check] FAILED: ${String(captured.length)} definition(s) captured but `
+    + `${String(CONSOLE_TOOL_NAMES.length)} name(s) declared; registration did not complete`,
+  )
+  console.error(`[check] declared: ${CONSOLE_TOOL_NAMES.join(', ')}`)
+  console.error(`[check] captured: ${captured.map(entry => entry.name).join(', ')}`)
+  process.exit(1)
+}
+const missing = CONSOLE_TOOL_NAMES.filter(name => !captured.some(entry => entry.name === name))
+if (missing.length > 0) {
+  console.error(`[check] FAILED: declared but never registered: ${missing.join(', ')}`)
+  process.exit(1)
+}
+
 let failures = 0
 
 for (const definition of captured) {

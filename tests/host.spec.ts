@@ -17,6 +17,7 @@
  */
 import { describe, expect, it, vi } from 'vitest'
 import { apply, inject, name } from '../src/index.ts'
+import { CONSOLE_TOOL_NAMES } from '../src/tools.ts'
 import { parseSettingsDocument } from '../src/config.ts'
 import type { ConsoleHubSettings } from '../src/config-shared.ts'
 import type { Context, ConsoleWebRoute } from '../src/context-types.ts'
@@ -124,6 +125,40 @@ function toolRegistry(): { service: unknown, names: () => string[] } {
       },
     },
     names: () => [...registered.keys()].sort(),
+  }
+}
+
+/**
+ * A system-prompt registry stub recording the sections it is given.
+ *
+ * The section's `text` may be a supplier, which the real registry evaluates per
+ * assembly; this resolves it the same way so a test reads what the model would.
+ *
+ * @returns the service plus a reader for the registered text.
+ */
+function promptRegistry(): {
+  service: unknown
+  sections: () => Array<{ name: string, text: string }>
+} {
+  const registered = new Map<string, () => void>()
+  const sections: Array<{ name: string, text: string }> = []
+  return {
+    service: {
+      section(section: { name: string, text: string | ((context: unknown) => string) }) {
+        const entry = {
+          name: section.name,
+          text: typeof section.text === 'function' ? section.text(undefined) : section.text,
+        }
+        sections.push(entry)
+        const dispose = (): void => {
+          const index = sections.indexOf(entry)
+          if (index >= 0) sections.splice(index, 1)
+        }
+        registered.set(section.name, dispose)
+        return dispose
+      },
+    },
+    sections: () => sections.map(entry => ({ ...entry })),
   }
 }
 
@@ -287,6 +322,34 @@ describe('capability gating', () => {
     expect(tools.names()).toContain('console_list')
     expect(tools.names()).toContain('console_send')
     expect(tools.names()).toContain('console_connect')
+    // The inventory tools must reach the model through the REAL host wiring, not
+    // merely through a unit test's fake deps: this is where the settings binding
+    // and the credential seam are threaded in, and a missing dependency there
+    // aborts registration part-way -- which no fake-driven suite would notice.
+    expect(tools.names()).toContain('console_list_views')
+    expect(tools.names()).toContain('console_upsert_view')
+    expect(tools.names()).toContain('console_remove_view')
+    // Every declared name, so a tool added to the family but never wired fails
+    // here rather than being discovered by a model that cannot find it.
+    expect(tools.names().sort()).toEqual([...CONSOLE_TOOL_NAMES].sort())
+  })
+
+  it('registers the prompt section that explains the two listing tools', async () => {
+    // The model reads this before choosing a tool. It said only `console_list`,
+    // which is what led a caller to search the settings document by hand.
+    const settings = settingsService()
+    const prompt = promptRegistry()
+    const { ctx, flush } = fakeContext({ settings: settings.service, systemPrompt: prompt.service })
+    apply(ctx)
+    await flush()
+    const text = prompt.sections().map(entry => entry.text).join('\n')
+    expect(text).toContain('console_list_views')
+    expect(text).toContain('console_upsert_view')
+    expect(text).toContain('console_remove_view')
+    // ...and it must say which question each listing tool answers, which is the
+    // distinction the report was about.
+    expect(text).toMatch(/connected to right now/)
+    expect(text).toMatch(/devices are configured/)
   })
 
   it('withdraws the tool family when the setting turns it off, and restores it', async () => {

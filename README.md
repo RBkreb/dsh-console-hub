@@ -16,8 +16,16 @@
   / 等待提示符 / 清空本地回显，分页输出（`--More--` 之类）自动持续翻页或自动退出。
 - **安全管理**：`config` / `restart` 等高危指令拦截；模型路径经 DSH approval（fail-closed），
   界面路径为面板内二次确认 + 会话审计。
-- **模型工具**：`console_list` / `console_connect` / `console_send` / `console_read` /
-  `console_wait_for` / `console_close` / `console_describe` / `console_clear`。
+- **模型工具**：`console_list`（**已连接**）/ `console_list_views`（**已配置**）/ `console_connect` /
+  `console_send` / `console_read` / `console_wait_for` / `console_close` / `console_describe` /
+  `console_clear` / `console_upsert_view` / `console_remove_view`。
+
+> **两个 list 回答两个不同的问题**，不要混用：
+> `console_list` 返回**当前已连接**的控制台（它的 handle 供 send/read/close 使用）；
+> `console_list_views` 返回**已配置**的设备（它的 viewId 供 connect 使用）。
+> 模型要操作某台设备时，先 `console_list_views` 找到 viewId，再 `console_connect` ——
+> **优先用 view 而不是 host+port**，因为只有 view 携带它存储的凭据和提示符/分页规则。
+> 模型也能直接管理清单：`console_upsert_view` 新建/修改，`console_remove_view` 删除。
 
 > `console_clear` 只丢弃**本进程**已读回显，不向设备发送任何东西、不断开连接。
 > 面板上的「清空」按钮走同一条路径。
@@ -220,11 +228,24 @@ pnpm test settings-seam                  # 用真实 settings 服务跑整条 co
 若你的场景中回车有破坏性（比如任何键都会生效的启动菜单），可以关掉唤醒；
 界面「设备配置」栏有开关，写的是宿主设置文档（不是客户端偏好）。
 
+**`console_wait_for` 的跨会话实测**（同一台交换机上开两个会话，一端输入、一端等待）：
+
+串口 console 映射意味着**多个连接共享设备那一条 console 线**，所以一端键入的命令会被设备
+回显给**所有**已连接会话。用例 "sees on one console what another console writes to the same
+device" 断言的就是这一点：WRITER 发一条带时间戳的唯一标记，**什么都没发的 WATCHER** 用
+`waitFor({for:'pattern'})` 在 **~845ms** 内匹配到它，并且匹配到的文本能被 `read` 真正读到
+（只 `matched: true` 却读不到内容，对调用者毫无意义）。
+
+同一组用例还覆盖了超时那一半：等待一个设备永远不会打印的模式时，`waitFor` 在约 1.5s 后返回
+`matched: false` / `reason: 'timeout'`，**既不会挂住、也不会谎报匹配**，且之后控制台仍然可用
+（超时是结果，不是坏掉的连接）。
+
 排查同类设备时可用：
 
 ```sh
 node scripts/probe-console.mjs 10.133.6.253:10003 4   # 裸看字节
 node scripts/probe-wake.mjs 10.133.5.253:10015 3 600  # 量唤醒延时
+pnpm test:live                                        # 11 条真机用例（含跨会话 wait_for）
 node --import ./scripts/test-preload.mjs scripts/probe-live.mjs 10.133.6.253:10003 "show version"
 ```
 

@@ -22,8 +22,14 @@ import {
 import { parseSettingsDocument } from './config.ts'
 import { isTrustedApiRequest } from './trust-fence.ts'
 import { HubError, optionalNumber, optionalString, readJsonBody, requireString, writeError, writeOk, writeJson } from './wire.ts'
-import { assertNoSecretsInViews, newViewId, normalizeView, redactView, type ConsoleViewRedacted } from './views.ts'
 import { clearSecret, describeSecret, secretKeyOfView, writeSecret } from './secrets.ts'
+import {
+  applySettingsPatch,
+  listViews,
+  removeView,
+  upsertView,
+  type InventoryApi,
+} from './inventory.ts'
 import type {
   ConsoleCredentialProvider,
   ConsoleHttpRequest,
@@ -127,109 +133,24 @@ function defaultsFor(settings: ConsoleHubSettings): {
   }
 }
 
-/** One view, redacted, with its credential facts loaded. */
-async function redactedView(
-  api: ConsoleHubApi,
-  viewId: string,
-  view: ConsoleHubSettings['views'][string],
-): Promise<ConsoleViewRedacted> {
-  const secret = await describeSecret(api.credentials, viewId)
-  return redactView(view, {
-    secretConfigured: secret.configured,
-    ...secret.source === undefined ? {} : { secretSource: secret.source },
-    secretWritable: secret.writable,
-  })
-}
-
 /** The `config.*` methods. */
 function configHandlers(api: ConsoleHubApi): Record<string, Handler> {
   return {
     async 'config.list'(payload) {
       await requireSession(api, payload)
-      const settings = api.settings.current()
-      const views = await Promise.all(
-        Object.entries(settings.views).map(async ([viewId, view]) =>
-          ({ viewId, view: await redactedView(api, viewId, view) })),
-      )
-      views.sort((left, right) => left.view.name.localeCompare(right.view.name))
-      return { views, defaults: defaultsFor(settings) }
+      // The inventory read is shared with the model's `console_list_views`, so
+      // the panel and the model can never disagree about what is configured.
+      return { views: await listViews(inventoryOf(api)), defaults: defaultsFor(api.settings.current()) }
     },
 
     async 'config.upsert'(payload) {
       await requireSession(api, payload)
-      const settings = api.settings.current()
-      const requestedId = optionalString(payload, 'viewId')
-      const viewId = requestedId ?? newViewId()
-      // Upsert means create-or-update: a supplied id that does not exist yet is a
-      // creation, so the only thing to check is that the id is usable as both a
-      // settings key and a credential record id.
-      if (requestedId !== undefined && !/^[a-z][a-z0-9-]*$/.test(requestedId)) {
-        throw new HubError('bad-request', `"viewId" must match [a-z][a-z0-9-]* (got "${requestedId}")`)
-      }
-
-      // The view document is built from the fields the view owns, so a flat
-      // payload's `sessionId` (or a caller's stray key) can never be mistaken
-      // for a view field, and a secret-shaped key inside `view` is still caught.
-      const record = payload as Record<string, unknown>
-      const nested = record.view
-      if (nested !== undefined && (nested === null || typeof nested !== 'object' || Array.isArray(nested))) {
-        throw new HubError('bad-request', '"view" must be a JSON object')
-      }
-      if (nested !== undefined) {
-        // A caller who nested a credential inside the view document gets a
-        // named refusal rather than a silent drop.
-        try {
-          assertNoSecretsInViews(nested)
-        } catch (error) {
-          throw new HubError('bad-request', error instanceof Error ? error.message : String(error))
-        }
-      }
-      const source = nested ?? {
-        name: record.name,
-        host: record.host,
-        port: record.port,
-        kind: record.kind,
-        encoding: record.encoding,
-        user: record.user,
-        promptPattern: record.promptPattern,
-        pagerPattern: record.pagerPattern,
-        pagingMode: record.pagingMode,
-        tags: record.tags,
-        notes: record.notes,
-      }
-      let view
-      try {
-        view = normalizeView(source as never)
-      } catch (error) {
-        throw new HubError('bad-request', error instanceof Error ? error.message : String(error))
-      }
-
-      // The password travels beside the view, never inside it; a secret-shaped
-      // key in the document is refused by name.
-      const password = optionalString(record, 'password')
-      if (password !== undefined && password !== '') {
-        await writeSecretOrReject(api, viewId, { password, ...optionalString(record, 'user') === undefined ? {} : { user: optionalString(record, 'user') as string } })
-      }
-
-      const nextViews = { ...settings.views, [viewId]: view }
-      await applySettingsPatch(api, { views: nextViews })
-      return { viewId, view: await redactedView(api, viewId, view) }
+      return upsertView(inventoryOf(api), payload)
     },
 
     async 'config.remove'(payload) {
       await requireSession(api, payload)
-      const settings = api.settings.current()
-      const viewId = requireString(payload, 'viewId')
-      requireView(settings, viewId)
-
-      const nextViews = { ...settings.views }
-      const secretWasConfigured = (await describeSecret(api.credentials, viewId)).configured
-      delete nextViews[viewId]
-      await applySettingsPatch(api, { views: nextViews })
-      // Dropping a view drops its credential with it: a record left behind by a
-      // deleted view would be unreachable and would keep a secret on disk.
-      await clearSecret(api.credentials, viewId)
-      return { removed: true, secretRemoved: secretWasConfigured }
+      return removeView(inventoryOf(api), payload)
     },
   }
 }
@@ -258,7 +179,11 @@ function secretHandlers(api: ConsoleHubApi): Record<string, Handler> {
       requireView(settings, viewId)
       const password = requireString(payload, 'password')
       const user = optionalString(payload, 'user')
-      await writeSecretOrReject(api, viewId, { password, ...user === undefined || user === '' ? {} : { user } })
+      try {
+        await writeSecret(api.credentials, viewId, { password, ...user === undefined || user === '' ? {} : { user } })
+      } catch (error) {
+        throw new HubError('credential-rejected', error instanceof Error ? error.message : String(error))
+      }
       const info = await describeSecret(api.credentials, viewId)
       return { configured: info.configured, writable: info.writable, viewId }
     },
@@ -268,72 +193,37 @@ function secretHandlers(api: ConsoleHubApi): Record<string, Handler> {
       const settings = api.settings.current()
       const viewId = requireString(payload, 'viewId')
       requireView(settings, viewId)
-      await clearSecretOrReject(api, viewId)
+      // Clearing an absent credential is a no-op, so only a store REFUSAL is an
+      // error worth reporting.
+      try {
+        await clearSecret(api.credentials, viewId)
+      } catch (error) {
+        throw new HubError('credential-rejected', error instanceof Error ? error.message : String(error))
+      }
       return { configured: false, viewId }
     },
   }
 }
 
-/** Write a credential, mapping any store refusal onto the wire code. */
-async function writeSecretOrReject(
-  api: ConsoleHubApi,
-  viewId: string,
-  secret: { password: string, user?: string },
-): Promise<void> {
-  try {
-    await writeSecret(api.credentials, viewId, secret)
-  } catch (error) {
-    throw new HubError('credential-rejected', error instanceof Error ? error.message : String(error))
-  }
-}
-
-/** Clear a credential, mapping any store refusal onto the wire code. */
-async function clearSecretOrReject(api: ConsoleHubApi, viewId: string): Promise<void> {
-  try {
-    await clearSecret(api.credentials, viewId)
-  } catch (error) {
-    throw new HubError('credential-rejected', error instanceof Error ? error.message : String(error))
-  }
-}
-
 /**
- * Replace this plugin's whole settings section after validating it.
+ * View the API's dependency table through the shared inventory interface.
  *
- * This goes through `replace`, NOT `update`, and that distinction is the whole
- * point of the function. The settings seam's `update` is a RECURSIVE MERGE:
- * plain objects merge key by key and no merge can remove a key, because the
- * keys it would have to remove are exactly the ones it does not carry. Merging
- * a view map that is missing a deleted entry therefore reinstates that entry,
- * the write reports success, and the device stays on disk.
- *
- * The section is replaced WHOLESALE rather than patched per key, so a removal
- * is expressible at all. Absent keys fall back to the schema defaults, which is
- * what this section's author expects: the patch is built from the live document
- * plus one change, so nothing is being reset by accident.
+ * The two differ in one direction only: this table always has a settings face,
+ * while the interface tolerates one that cannot be written. The adapter also
+ * passes the OWNER SCOPE through, which is what lets the shared write path reach
+ * `scope.replace` rather than falling back to the merge.
  *
  * @param api - the API dependencies.
- * @param patch - fields to change; anything absent reverts to its default.
- * @returns the resolved settings after the write.
- * @throws {HubError} `settings-rejected` when the resulting document is invalid.
+ * @returns the inventory view of them.
  */
-async function applySettingsPatch(api: ConsoleHubApi, patch: object): Promise<ConsoleHubSettings> {
-  const merged = { ...api.settings.current(), ...patch }
-  try {
-    // Validating the MERGED document refuses the write before it commits.
-    parseSettingsDocument(merged)
-  } catch (error) {
-    throw new HubError('settings-rejected', error instanceof Error ? error.message : String(error))
-  }
+function inventoryOf(api: ConsoleHubApi): InventoryApi {
   const scope = api.settings as HubSettingsFace & { scope?: ConsoleSettingsScope<ConsoleHubSettings> }
-  // Prefer the owner scope's `replace`. Fall back to the service-level
-  // `replace` when the face carries one, and only then to `update` -- which
-  // cannot remove anything and is therefore the one path a deletion must NOT
-  // take. The fallback exists so the plugin still loads against a settings
-  // face that offers nothing else.
-  if (scope.scope !== undefined) await scope.scope.replace(merged)
-  else if (scope.replace !== undefined) await scope.replace(merged)
-  else await api.settings.service.update('dsh-console-hub', merged)
-  return api.settings.current()
+  return {
+    current: () => api.settings.current(),
+    ...api.settings.replace === undefined ? {} : { replace: (patch: object) => api.settings.replace?.(patch) as Promise<void> },
+    ...scope.scope === undefined ? {} : { scope: scope.scope },
+    credentials: api.credentials,
+  }
 }
 
 /** The `settings.*` methods. */
@@ -364,7 +254,7 @@ function settingsHandlers(api: ConsoleHubApi): Record<string, Handler> {
           409,
         )
       }
-      const settings = await applySettingsPatch(api, patch)
+      const settings = await applySettingsPatch(inventoryOf(api), patch)
       // The SAME shape `settings.get` answers, so a caller can refresh its view
       // from either reply. Answering the raw section here while the client
       // declared `defaults` is what made a settings control vanish after a
