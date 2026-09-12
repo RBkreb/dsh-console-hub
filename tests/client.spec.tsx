@@ -19,6 +19,14 @@ import {
   type ClientContextLike,
 } from '../src/client/hub.ts'
 import { createApiClient, type FetchLike } from '../src/client/api.ts'
+import {
+  createPrefsStore,
+  DEFAULT_UI_PREFS,
+  MAX_LIST_WIDTH_PX,
+  MIN_LIST_WIDTH_PX,
+  normalizeListWidth,
+  prefsFromSettings,
+} from '../src/client/prefs.ts'
 
 /** A fake better-sidebar service that records registrations. */
 function fakeSidebar(): BetterSidebarLike & { descriptors: unknown[], disposers: number } {
@@ -242,5 +250,37 @@ describe('component identity', () => {
     const spy = vi.fn(shouldPoll)
     spy({ visible: true, consoleId: 'c1' })
     expect(spy).toHaveBeenCalledOnce()
+  })
+})
+
+describe('the console-list width preference', () => {
+  it('clamps a stored value into the supported range', () => {
+    // A width can arrive from a stored preference written by an older build, so
+    // the store is the guard that keeps a stale value from producing an unusable
+    // layout. The bounds are asserted from both sides.
+    expect(normalizeListWidth(10)).toBe(MIN_LIST_WIDTH_PX)
+    expect(normalizeListWidth(99999)).toBe(MAX_LIST_WIDTH_PX)
+    expect(normalizeListWidth(300)).toBe(300)
+    expect(normalizeListWidth(300.6)).toBe(301)
+  })
+
+  it('falls back to the default for a value that is not a number', () => {
+    expect(normalizeListWidth(undefined)).toBe(DEFAULT_UI_PREFS.listWidthPx)
+    expect(normalizeListWidth('wide')).toBe(DEFAULT_UI_PREFS.listWidthPx)
+    expect(normalizeListWidth(Number.NaN)).toBe(DEFAULT_UI_PREFS.listWidthPx)
+    expect(normalizeListWidth(Number.POSITIVE_INFINITY)).toBe(DEFAULT_UI_PREFS.listWidthPx)
+  })
+
+  it('survives the settings round trip, so a drag is not lost on reload', () => {
+    // The shell persists prefs as opaque JSON, so the value must come back out
+    // of `prefsFromSettings` unchanged -- a width that did not round-trip would
+    // silently reset on every reload.
+    const stored = prefsFromSettings({ listWidthPx: 321 })
+    expect(stored.listWidthPx).toBe(321)
+    const store = createPrefsStore(stored)
+    expect(store.get().listWidthPx).toBe(321)
+    // ...and a write through the store is clamped too.
+    store.set({ listWidthPx: 5 })
+    expect(store.get().listWidthPx).toBe(MIN_LIST_WIDTH_PX)
   })
 })

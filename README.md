@@ -30,7 +30,28 @@
 因此不受 `node-pty` 原生依赖降级的影响。
 
 两个半边**不互相 import**：它们只在 `/dsh-console-hub/api` 这个路由上汇合
-（见 `src/hub-route.ts`）。浏览器包只允许 `require` `react` 与 `react/jsx-runtime`。
+（见 `src/hub-route.ts`）。浏览器包只允许 `require` 平台模块表里的那几个
+（`react`、`react/jsx-runtime`、`react-dom`、`react-dom/client`），其余一律内联；
+`@deepseek-ai/*` 的值导入会被构建期 purity 闸门直接拒绝（类型导入会被擦除，不受影响）。
+
+### 界面构成
+
+标签页的左侧栏**只放已连接的控制台**。设备配置是**弹窗**（`ConfigModal.tsx`），
+由一个「设备配置」按钮打开——配置是低频操作，已连接的工作设备才是主体，
+设备一多就不该挤占左栏。
+
+弹窗通过 `react-dom` 的 `createPortal` 挂到 `document.body`：
+标签页本身位于侧边栏自己的层叠上下文里，绝对定位的面板会被侧边栏的
+`overflow` 裁掉，而不是盖在它上面。
+
+左栏与右侧控制台之间的分隔条**可拖动**（`Splitter.tsx`），宽度存进共享 prefs
+（`listWidthPx`），所以切换会话后仍然保持。拖动用 pointer capture，
+光标跑出那条细线也不会中断；同时支持方向键（`Shift` 加速）——
+纯指针控件对键盘用户不可达。
+
+字体**跟随 harness**：控制台区域用 `--ds-font-family-code`（等宽，由
+`dsh-client-ui-theme` 定义），界面文字用 `--dsw-font-family`。
+写死 `ui-monospace` 会让插件无视用户的字体设置，与整个应用不一致。
 
 ## 安装
 

@@ -23,6 +23,8 @@ export interface ConsoleUiPrefs {
   pollIntervalMs: number
   /** Ask for a second confirmation before any command is written. */
   confirmHighRisk: boolean
+  /** Width of the connected-console list column, in pixels. */
+  listWidthPx: number
 }
 
 /** The prefs used until the settings panel states otherwise. */
@@ -31,11 +33,33 @@ export const DEFAULT_UI_PREFS: ConsoleUiPrefs = {
   wrapOutput: true,
   pollIntervalMs: 500,
   confirmHighRisk: true,
+  listWidthPx: 260,
 }
 
 /** Bounds the settings row and the view agree on. */
 export const MIN_POLL_INTERVAL_MS = 200
 export const MAX_POLL_INTERVAL_MS = 5000
+
+/**
+ * Bounds on the console-list column, in pixels.
+ *
+ * The minimum keeps a device label and its buttons legible; the maximum leaves
+ * the console itself usable in a narrow panel. Both are enforced by the splitter
+ * and by {@link normalizeListWidth}, so a stored value from an older build can
+ * never produce an unusable layout.
+ */
+export const MIN_LIST_WIDTH_PX = 160
+export const MAX_LIST_WIDTH_PX = 640
+
+/**
+ * Clamp a list width into the supported range.
+ * @param value - the requested width in pixels.
+ * @returns the clamped integer width.
+ */
+export function normalizeListWidth(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return DEFAULT_UI_PREFS.listWidthPx
+  return Math.min(MAX_LIST_WIDTH_PX, Math.max(MIN_LIST_WIDTH_PX, Math.round(value)))
+}
 
 /** A read/write handle on the live prefs. */
 export interface PrefsStore {
@@ -70,6 +94,9 @@ export function createPrefsStore(initial: Partial<ConsoleUiPrefs> = {}): PrefsSt
     wrapOutput: booleanOf(initial.wrapOutput, DEFAULT_UI_PREFS.wrapOutput),
     pollIntervalMs: normalizePollInterval(initial.pollIntervalMs),
     confirmHighRisk: booleanOf(initial.confirmHighRisk, DEFAULT_UI_PREFS.confirmHighRisk),
+    listWidthPx: initial.listWidthPx === undefined
+      ? DEFAULT_UI_PREFS.listWidthPx
+      : normalizeListWidth(initial.listWidthPx),
   }
   const listeners = new Set<(prefs: ConsoleUiPrefs) => void>()
   return {
@@ -82,13 +109,19 @@ export function createPrefsStore(initial: Partial<ConsoleUiPrefs> = {}): PrefsSt
           ? current.pollIntervalMs
           : normalizePollInterval(patch.pollIntervalMs),
         confirmHighRisk: booleanOf(patch.confirmHighRisk, current.confirmHighRisk),
+        listWidthPx: patch.listWidthPx === undefined
+          ? current.listWidthPx
+          : normalizeListWidth(patch.listWidthPx),
       }
-      // An unchanged write must not wake every subscriber: the settings row
-      // writes on each keystroke of the number input.
+      // An unchanged write must not wake every subscriber. This matters most for
+      // `listWidthPx`: a drag calls `set` on every pointer move, and re-rendering
+      // the whole tab for a width that did not change would make the drag
+      // stutter.
       if (next.openOnConnect === current.openOnConnect
         && next.wrapOutput === current.wrapOutput
         && next.pollIntervalMs === current.pollIntervalMs
-        && next.confirmHighRisk === current.confirmHighRisk) return
+        && next.confirmHighRisk === current.confirmHighRisk
+        && next.listWidthPx === current.listWidthPx) return
       current = next
       for (const listener of listeners) listener(current)
     },
@@ -108,6 +141,7 @@ export function prefsFromSettings(settings: Record<string, unknown>): Partial<Co
   if (typeof settings.wrapOutput === 'boolean') patch.wrapOutput = settings.wrapOutput
   if (typeof settings.pollIntervalMs === 'number') patch.pollIntervalMs = settings.pollIntervalMs
   if (typeof settings.confirmHighRisk === 'boolean') patch.confirmHighRisk = settings.confirmHighRisk
+  if (typeof settings.listWidthPx === 'number') patch.listWidthPx = settings.listWidthPx
   return patch
 }
 

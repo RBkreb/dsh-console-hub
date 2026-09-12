@@ -18,16 +18,14 @@
 import { useCallback, useEffect, useRef, useState, type ReactElement } from 'react'
 import { HubApiError } from './api.ts'
 import { ConsoleBuffers } from './buffer.ts'
+import { ConfigModal } from './ConfigModal.tsx'
 import type { ClientTabPropsLike, ConsoleHub, ConsoleRow, EngineDefaults, ViewRow } from './hub.ts'
 import { shouldPoll } from './poll.ts'
 import { uiPrefs } from './prefs.ts'
-import { ViewForm } from './ViewForm.tsx'
+import { Splitter } from './Splitter.tsx'
 
 /** Props the descriptor's component receives (the hub is bound by the factory). */
 export type ConsoleHubViewProps = ClientTabPropsLike & { hub: ConsoleHub }
-
-/** The editor's target: a saved view, a fresh one, or nothing (closed). */
-type Editing = { kind: 'new' } | { kind: 'edit', viewId: string } | undefined
 
 /** A pending high-risk confirmation, with the token the replay must carry. */
 interface PendingConfirm {
@@ -101,7 +99,9 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
   const [error, setError] = useState<string | null>(null)
   const [status, setStatus] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
-  const [editing, setEditing] = useState<Editing>(undefined)
+  // Whether the device-configuration dialog is open. The inventory itself lives
+  // there now, so this tab's column is free for live consoles.
+  const [configOpen, setConfigOpen] = useState(false)
   const [pending, setPending] = useState<PendingConfirm | undefined>(undefined)
   const [paging, setPaging] = useState(false)
   const [prefs, setPrefs] = useState(() => uiPrefs.get())
@@ -479,16 +479,31 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
   const current = consoles.find(row => row.consoleId === selected)
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', font: '13px/1.5 ui-monospace, monospace' }}>
+    <div
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        height: '100%',
+        // The HARNESS code font, not a hardcoded stack: the console shows
+        // command output, so it should follow the same code face the rest of the
+        // app uses -- and change with it when the user changes theme or the
+        // terminal font. `--ds-font-family-code` is the token
+        // `dsh-client-ui-theme` defines for exactly this.
+        fontFamily: 'var(--ds-font-family-code, ui-monospace, monospace)',
+        fontSize: 13,
+        lineHeight: 1.5,
+      }}
+    >
       <div style={{ padding: 8, borderBottom: '1px solid rgba(127,127,127,0.3)' }}>
-        <strong>设备配置</strong>
-        {' '}
-        {button('新建', () => setEditing({ kind: 'new' }))}
+        {/* The inventory lives in a dialog now: with many devices the inline
+            list filled this column and squeezed the live consoles, which are the
+            thing being worked with. */}
+        {button('设备配置', () => setConfigOpen(true))}
         {button('刷新', () => void refresh())}
         {defaults !== undefined && (
           <label
             title="连接后先发一次回车再等待提示符。某些 console 服务器在收到按键前完全静默，开启后连接即可看到提示符。"
-            style={{ marginLeft: 12, opacity: busy ? 0.6 : 1, cursor: 'pointer' }}
+            style={{ marginLeft: 12, opacity: busy ? 0.6 : 1, cursor: 'pointer', fontFamily: 'var(--dsw-font-family, inherit)' }}
           >
             <input
               type="checkbox"
@@ -503,27 +518,17 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
       </div>
 
       <div style={{ display: 'flex', minHeight: 0, flex: 1 }}>
-        <div style={{ width: '38%', minWidth: 220, overflow: 'auto', borderRight: '1px solid rgba(127,127,127,0.3)' }}>
-          {views.length === 0 && <p style={{ padding: 8, opacity: 0.6 }}>还没有保存的设备，先「新建」一个。</p>}
-          {views.map(row => (
-            <div key={row.viewId} style={{ padding: '6px 8px', borderBottom: '1px solid rgba(127,127,127,0.2)' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                <strong style={{ flex: 1 }}>{row.view.name}</strong>
-                {row.view.secretConfigured ? '🔑' : '—'}
-              </div>
-              <div style={{ opacity: 0.7 }}>
-                {row.view.kind} · {row.view.host}:{row.view.port} · {row.view.encoding}
-              </div>
-              {row.view.tags.length > 0 && <div style={{ opacity: 0.6 }}>#{row.view.tags.join(' #')}</div>}
-              <div style={{ marginTop: 4 }}>
-                {button('连接', () => void connect({ viewId: row.viewId }), { disabled: busy })}
-                {button('编辑', () => setEditing({ kind: 'edit', viewId: row.viewId }))}
-                {button('删除', () => void removeView(row.viewId), { danger: true, disabled: busy })}
-              </div>
-            </div>
-          ))}
-
-          <div style={{ padding: 8, borderTop: '1px solid rgba(127,127,127,0.3)' }}>
+        <div
+          style={{
+            width: prefs.listWidthPx,
+            flex: 'none',
+            overflow: 'auto',
+            // The width is a pixel preference now, so it must never be squeezed
+            // by a long label inside it; the splitter owns the size.
+            boxSizing: 'border-box',
+          }}
+        >
+          <div style={{ padding: 8, borderBottom: '1px solid rgba(127,127,127,0.3)' }}>
             <strong>已连接 ({consoles.length})</strong>
             {consoles.length > 1 && (
               <div style={{ marginTop: 4 }}>
@@ -531,6 +536,11 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
               </div>
             )}
           </div>
+          {consoles.length === 0 && (
+            <p style={{ padding: 8, opacity: 0.6, fontFamily: 'var(--dsw-font-family, inherit)' }}>
+              还没有已连接的控制台，先在「设备配置」里连接一台。
+            </p>
+          )}
           {consoles.map(row => (
             <div
               key={row.consoleId}
@@ -557,6 +567,13 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
           ))}
         </div>
 
+        {/* The divider is draggable: 38% was wrong for both a long label and a
+            wide answer, and the split is the user's to set. */}
+        <Splitter
+          width={prefs.listWidthPx}
+          onResize={width => { uiPrefs.set({ listWidthPx: width }) }}
+        />
+
         <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
           {error !== null && (
             <div style={{ padding: '4px 8px', background: '#5a1d1d', color: '#ffd9d9' }}>
@@ -567,29 +584,13 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
           )}
           {status !== null && <div style={{ padding: '4px 8px', opacity: 0.75 }}>{status}</div>}
 
-          {editing !== undefined
+          {selected === undefined
             ? (
-              <ViewForm
-                hub={hub}
-                sessionId={sessionId}
-                viewId={editing.kind === 'edit' ? editing.viewId : undefined}
-                initial={editing.kind === 'edit'
-                  ? views.find(row => row.viewId === editing.viewId)?.view
-                  : undefined}
-                onDone={async () => {
-                  setEditing(undefined)
-                  await refresh()
-                }}
-                onCancel={() => { setEditing(undefined) }}
-              />
+              <p style={{ padding: 12, opacity: 0.7, fontFamily: 'var(--dsw-font-family, inherit)' }}>
+                选择一个已连接的控制台，或从「设备配置」连接一台设备。
+              </p>
             )
-            : selected === undefined
-              ? (
-                <p style={{ padding: 12, opacity: 0.7 }}>
-                  选择一个已连接的控制台，或在上方连接一台设备。
-                </p>
-              )
-              : (
+            : (
                 <>
                   <pre
                     ref={outputRef}
@@ -654,6 +655,24 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
               )}
         </div>
       </div>
+
+      {configOpen && (
+        <ConfigModal
+          views={views}
+          busy={busy}
+          hub={hub}
+          sessionId={sessionId}
+          onClose={() => setConfigOpen(false)}
+          onConnect={viewId => {
+            // Close first: the console is what the user came for, and leaving
+            // the dialog over it would hide the very output they just asked for.
+            setConfigOpen(false)
+            void connect({ viewId })
+          }}
+          onRemove={rowId => removeView(rowId)}
+          onChanged={refresh}
+        />
+      )}
     </div>
   )
 }

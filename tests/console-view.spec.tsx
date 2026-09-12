@@ -20,6 +20,7 @@ import { createElement } from 'react'
 import { ConsoleHubView } from '../src/client/ConsoleHubView.tsx'
 import type { ConsoleHub, ViewRow } from '../src/client/hub.ts'
 import { HubApiError } from '../src/client/api.ts'
+import { MIN_LIST_WIDTH_PX } from '../src/client/prefs.ts'
 
 // The console view shares a module-level prefs singleton and mounts real DOM, so
 // each case must start from a clean document; without this, one case's rendered
@@ -101,13 +102,48 @@ function renderView(hub: ConsoleHub, visible = true): ReturnType<typeof render> 
   }))
 }
 
+/**
+ * Open the device-configuration dialog.
+ *
+ * The inventory moved into a modal, so a test that inspects saved devices has to
+ * open it first. Kept as one helper so a future change to how the dialog opens
+ * touches one line rather than every case.
+ *
+ * @param view - the rendered console tab.
+ */
+function openConfig(view: ReturnType<typeof renderView>): void {
+  fireEvent.click(view.getByText('设备配置'))
+}
+
 describe('the console tab renders what it fetched', () => {
-  it('lists a saved device', async () => {
+  it('lists a saved device inside the configuration dialog', async () => {
+    // The inventory is NOT in the column any more -- that is the point of the
+    // change: with many devices the inline list squeezed the live consoles. It
+    // is reachable behind one button instead.
     const { hub } = hubWith({ views: [viewRow('FW1')] })
     const view = renderView(hub)
     await waitFor(() => {
+      expect(view.getByText('设备配置')).toBeTruthy()
+    })
+    // ...and the column does not render the device before the dialog is opened.
+    expect(view.queryByText('FW1')).toBeNull()
+
+    openConfig(view)
+    await waitFor(() => {
       expect(view.getByText('FW1')).toBeTruthy()
     })
+  })
+
+  it('keeps the saved devices out of the console column', async () => {
+    // Many devices must not consume the column: the count is reported, and the
+    // device rows themselves are not rendered until asked for.
+    const many = ['FW1', 'FW2', 'FW3', 'FW4', 'FW5', 'FW6', 'FW7', 'FW8'].map(name => viewRow(name))
+    const { hub } = hubWith({ views: many })
+    const view = renderView(hub)
+    await waitFor(() => {
+      expect(view.getByText(/已连接 \(0\)/)).toBeTruthy()
+    })
+    for (const row of many) expect(view.queryByText(row.view.name)).toBeNull()
   })
 
   it('still lists the saved devices when the live-console read fails', async () => {
@@ -123,6 +159,7 @@ describe('the console tab renders what it fetched', () => {
       expect(calls).toContain('listConsoles')
     })
     // The saved view must appear even though the OTHER read failed.
+    openConfig(view)
     await waitFor(() => {
       expect(view.getByText('FW1')).toBeTruthy()
     })
@@ -134,12 +171,14 @@ describe('the console tab renders what it fetched', () => {
       consolesFail: new Error('console registry unavailable'),
     })
     const view = renderView(hub)
-    await waitFor(() => {
-      expect(view.getByText('FW1')).toBeTruthy()
-    })
-    // The failure is still surfaced, so it is not silently swallowed.
+    // The failure is surfaced, so it is not silently swallowed.
     await waitFor(() => {
       expect(view.getByText(/console registry unavailable/)).toBeTruthy()
+    })
+    // ...and the inventory is still reachable.
+    openConfig(view)
+    await waitFor(() => {
+      expect(view.getByText('FW1')).toBeTruthy()
     })
   })
 
@@ -445,9 +484,13 @@ describe('switching between two consoles', () => {
 
     const connection = renderView(hub)
     await waitFor(() => {
-      expect(connection.getByText('FW1-new')).toBeTruthy()
+      expect(connection.getByText('设备配置')).toBeTruthy()
     })
-    // Connect through the real button on a saved view.
+    // The saved view and its 连接 button live in the dialog now.
+    openConfig(connection)
+    await waitFor(() => {
+      expect(connection.getByText('FW1-saved')).toBeTruthy()
+    })
     fireEvent.click(connection.getByText('连接'))
 
     // Wait until the read has delivered its copy, then count the occurrences.
@@ -705,5 +748,260 @@ describe('the clear button', () => {
     await waitFor(() => {
       expect(view.queryByText(/NOISE-TO-CLEAR/)).toBeNull()
     })
+  })
+})
+
+describe('the device configuration dialog', () => {
+  /** A hub with one saved device, recording every call it receives. */
+  function configHub(): { hub: ConsoleHub, calls: string[] } {
+    const calls: string[] = []
+    const hub = {
+      listViews: async () => ({ views: [viewRow('FW1')], defaults: {} }),
+      listConsoles: async () => ({ consoles: [] }),
+      removeView: async (_sessionId: string, viewId: string) => {
+        calls.push(`remove:${viewId}`)
+        return { removed: true, secretRemoved: false }
+      },
+      connect: async (_sessionId: string, input: { viewId?: string }) => {
+        calls.push(`connect:${String(input.viewId)}`)
+        return {
+          consoleId: 'c0ddddddddddddddddddddddddddddddd',
+          state: 'open',
+          label: 'FW1',
+          host: '10.133.6.253',
+          port: 10003,
+          secure: false,
+          banner: '',
+          prompt: null,
+          lastError: null,
+        }
+      },
+      closeAll: async () => ({ closed: 0 }),
+      fence: async () => ({ risk: 'safe' as const }),
+      read: async () => ({
+        text: '',
+        cursor: 0,
+        truncated: false,
+        bytes: 0,
+        encoding: 'utf-8',
+        paging: { active: false, pagesConsumed: 0, reason: null },
+      }),
+    } as unknown as ConsoleHub
+    return { hub, calls }
+  }
+
+  it('opens from the button and renders through a portal, not inside the column', async () => {
+    const { hub } = configHub()
+    const view = renderView(hub)
+    await waitFor(() => { expect(view.getByText('设备配置')).toBeTruthy() })
+    openConfig(view)
+
+    // The dialog is portalled onto document.body: the tab is mounted inside the
+    // sidebar's own stacking context, where an absolutely positioned panel would
+    // be clipped by the sidebar's overflow instead of covering it.
+    await waitFor(() => {
+      expect(document.body.querySelector('[data-console-hub-modal="config"]')).not.toBeNull()
+    })
+    const dialog = document.body.querySelector('[role="dialog"]')
+    expect(dialog?.getAttribute('aria-modal')).toBe('true')
+    // It is NOT inside the tab's own container.
+    expect(view.container.querySelector('[data-console-hub-modal="config"]')).toBeNull()
+  })
+
+  it('closes on Escape and on a click outside the panel', async () => {
+    const { hub } = configHub()
+    const view = renderView(hub)
+    await waitFor(() => { expect(view.getByText('设备配置')).toBeTruthy() })
+
+    openConfig(view)
+    await waitFor(() => {
+      expect(document.body.querySelector('[data-console-hub-modal="config"]')).not.toBeNull()
+    })
+    fireEvent.keyDown(document, { key: 'Escape' })
+    await waitFor(() => {
+      expect(document.body.querySelector('[data-console-hub-modal="config"]')).toBeNull()
+    })
+
+    // Re-open and dismiss by clicking the backdrop itself.
+    openConfig(view)
+    await waitFor(() => {
+      expect(document.body.querySelector('[data-console-hub-modal="config"]')).not.toBeNull()
+    })
+    // Re-queried rather than reused: closing unmounted the old node, so the
+    // element captured before is no longer the one on screen.
+    fireEvent.click(document.body.querySelector('[data-console-hub-modal="config"]') as HTMLElement)
+    await waitFor(() => {
+      expect(document.body.querySelector('[data-console-hub-modal="config"]')).toBeNull()
+    })
+  })
+
+  it('does not dismiss when the click is inside the panel', async () => {
+    // The panel stops propagation, so working in the dialog cannot close it.
+    const { hub } = configHub()
+    const view = renderView(hub)
+    await waitFor(() => { expect(view.getByText('设备配置')).toBeTruthy() })
+    openConfig(view)
+    const dialog = await waitFor(() => {
+      const found = document.body.querySelector('[role="dialog"]')
+      expect(found).not.toBeNull()
+      return found as HTMLElement
+    })
+    fireEvent.click(dialog)
+    expect(document.body.querySelector('[data-console-hub-modal="config"]')).not.toBeNull()
+  })
+
+  it('deletes a device and keeps the dialog open', async () => {
+    const { hub, calls } = configHub()
+    const view = renderView(hub)
+    await waitFor(() => { expect(view.getByText('设备配置')).toBeTruthy() })
+    openConfig(view)
+    await waitFor(() => { expect(view.getByText('FW1')).toBeTruthy() })
+
+    fireEvent.click(view.getByText('删除'))
+    await waitFor(() => {
+      expect(calls.some(entry => entry.startsWith('remove:'))).toBe(true)
+    })
+    // Configuration is a multi-step activity; deleting one device must not
+    // dismiss the dialog the user is still working in.
+    expect(document.body.querySelector('[data-console-hub-modal="config"]')).not.toBeNull()
+  })
+
+  it('swaps to the form on 新建 and returns to the list on cancel', async () => {
+    const { hub } = configHub()
+    const view = renderView(hub)
+    await waitFor(() => { expect(view.getByText('设备配置')).toBeTruthy() })
+    openConfig(view)
+    await waitFor(() => { expect(view.getByText('FW1')).toBeTruthy() })
+
+    fireEvent.click(view.getByText('新建'))
+    // The form replaces the list in place, so the dialog stays open across an
+    // edit rather than closing and reopening.
+    await waitFor(() => {
+      expect(view.queryByText('FW1')).toBeNull()
+    })
+    await waitFor(() => {
+      expect(view.getByText('取消')).toBeTruthy()
+    })
+    fireEvent.click(view.getByText('取消'))
+    await waitFor(() => {
+      expect(view.getByText('FW1')).toBeTruthy()
+    })
+    expect(document.body.querySelector('[data-console-hub-modal="config"]')).not.toBeNull()
+  })
+
+  it('closes the dialog when connecting, so the console is not covered', async () => {
+    const { hub, calls } = configHub()
+    const view = renderView(hub)
+    await waitFor(() => { expect(view.getByText('设备配置')).toBeTruthy() })
+    openConfig(view)
+    await waitFor(() => { expect(view.getByText('FW1')).toBeTruthy() })
+
+    fireEvent.click(view.getByText('连接'))
+    await waitFor(() => {
+      expect(calls.some(entry => entry.startsWith('connect:'))).toBe(true)
+    })
+    // The output is what the user asked for; leaving the dialog over it would
+    // hide the very thing the connect produced.
+    await waitFor(() => {
+      expect(document.body.querySelector('[data-console-hub-modal="config"]')).toBeNull()
+    })
+  })
+})
+
+describe('the console tab follows the harness typography', () => {
+  it('takes its font from the harness token rather than a hardcoded stack', async () => {
+    // The reported request: the console should follow the harness font setting.
+    // A literal `ui-monospace, monospace` stack ignores the user's choice, so
+    // the root reads the token `dsh-client-ui-theme` defines for code surfaces.
+    const { hub } = hubWith({})
+    const view = renderView(hub)
+    const root = await waitFor(() => {
+      const found = view.container.firstElementChild as HTMLElement
+      expect(found).toBeTruthy()
+      return found
+    })
+    expect(root.style.fontFamily).toContain('--ds-font-family-code')
+  })
+
+  it('uses the harness UI font, not the code font, for chrome text', async () => {
+    // Command output is code; labels and buttons are UI. Mixing them is what
+    // makes a panel look foreign next to the rest of the app.
+    const { hub } = hubWith({})
+    const view = renderView(hub)
+    await waitFor(() => { expect(view.getByText('设备配置')).toBeTruthy() })
+    openConfig(view)
+    const dialog = await waitFor(() => {
+      const found = document.body.querySelector('[role="dialog"]') as HTMLElement
+      expect(found).not.toBeNull()
+      return found
+    })
+    expect(dialog.style.fontFamily).toContain('--dsw-font-family')
+  })
+})
+
+describe('the resizable divider', () => {
+  it('exposes an accessible separator with the current width', async () => {
+    const { hub } = hubWith({})
+    const view = renderView(hub)
+    const separator = await waitFor(() => {
+      const found = view.getByRole('separator')
+      expect(found).toBeTruthy()
+      return found
+    })
+    expect(separator.getAttribute('aria-orientation')).toBe('vertical')
+    // A pointer-only control is unreachable, so it is focusable and resizable
+    // from the keyboard.
+    expect(separator.getAttribute('tabindex')).toBe('0')
+    expect(Number(separator.getAttribute('aria-valuenow'))).toBeGreaterThan(0)
+  })
+
+  it('resizes with the arrow keys, clamped to the supported range', async () => {
+    const { hub } = hubWith({})
+    const view = renderView(hub)
+    const separator = await waitFor(() => view.getByRole('separator'))
+    const start = Number(separator.getAttribute('aria-valuenow'))
+
+    fireEvent.keyDown(separator, { key: 'ArrowRight' })
+    await waitFor(() => {
+      expect(Number(view.getByRole('separator').getAttribute('aria-valuenow'))).toBeGreaterThan(start)
+    })
+    fireEvent.keyDown(view.getByRole('separator'), { key: 'ArrowLeft' })
+    await waitFor(() => {
+      expect(Number(view.getByRole('separator').getAttribute('aria-valuenow'))).toBe(start)
+    })
+
+    // The clamp is what keeps a stored or dragged width from producing an
+    // unusable layout, so pushing past the minimum must stop there.
+    for (let index = 0; index < 40; index += 1) {
+      fireEvent.keyDown(view.getByRole('separator'), { key: 'ArrowLeft', shiftKey: true })
+    }
+    await waitFor(() => {
+      expect(Number(view.getByRole('separator').getAttribute('aria-valuenow'))).toBe(MIN_LIST_WIDTH_PX)
+    })
+  })
+
+  it('follows a pointer drag, so the split is the user to set', async () => {
+    const { hub } = hubWith({})
+    const view = renderView(hub)
+    const separator = await waitFor(() => view.getByRole('separator'))
+    const start = Number(separator.getAttribute('aria-valuenow'))
+
+    // jsdom has no layout, so the element has no real geometry to read. Pointer
+    // capture is what keeps the drag alive past the handle, and jsdom does not
+    // implement it either -- so both are stubbed rather than assumed.
+    const captured: number[] = []
+    separator.setPointerCapture = (id: number) => { captured.push(id) }
+    separator.releasePointerCapture = () => {}
+
+    fireEvent.pointerDown(separator, { button: 0, pointerId: 1, clientX: 100 })
+    expect(captured).toEqual([1])
+    fireEvent.pointerMove(separator, { pointerId: 1, clientX: 160 })
+    await waitFor(() => {
+      expect(Number(view.getByRole('separator').getAttribute('aria-valuenow'))).toBe(start + 60)
+    })
+    fireEvent.pointerUp(separator, { pointerId: 1 })
+    // After release the drag is over: a further move must not keep resizing.
+    fireEvent.pointerMove(separator, { pointerId: 1, clientX: 400 })
+    expect(Number(view.getByRole('separator').getAttribute('aria-valuenow'))).toBe(start + 60)
   })
 })
