@@ -154,7 +154,6 @@ export function FenceRulesEditor(props: FenceRulesEditorProps): ReactElement {
       <div style={{ opacity: 0.7, fontSize: '0.9em', margin: '2px 0 6px' }}>
         自上而下第一条命中生效；未命中任何规则时
         {stored.approvalMode === 'always' ? '每条命令都要确认' : '直接放行'}。
-        规则保存在宿主的插件设置里（<strong>不是</strong>本面板的浏览器偏好），因为拦截由宿主进程执行。
       </div>
 
       {loadError !== null && (
@@ -215,20 +214,6 @@ export function FenceRulesEditor(props: FenceRulesEditorProps): ReactElement {
           <span style={{ opacity: 0.7 }}>当前没有活动会话，无法读写宿主设置。</span>
         )}
       </div>
-
-      {stored.legacy.length > 0 && (
-        // Shown because it changes what is ACTUALLY enforced and is invisible in
-        // the box above: the legacy field is a separate setting, honoured as
-        // extra `ask` rules after these. Without this notice, an operator who
-        // cannot find a rule for a command that still prompts has no way to
-        // discover why.
-        <div style={{ marginTop: 8, opacity: 0.75, fontSize: '0.9em' }}>
-          另有 {stored.legacy.length} 条<b>遗留</b> pattern 仍然生效（在上面的规则之后依次判定）：
-          {' '}
-          <code>{stored.legacy.join('  ')}</code>
-          <div>它们来自旧版字段 <code>highRiskPatterns</code>；要停用请把它在设置文档里清空。</div>
-        </div>
-      )}
     </div>
   )
 }
