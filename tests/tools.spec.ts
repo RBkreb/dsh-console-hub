@@ -13,21 +13,59 @@ import { DEFAULT_DORMANT_PATTERN, DEFAULT_PAGER_PATTERN, DEFAULT_PROMPT_PATTERN 
 import { normalizeView } from '../src/views.ts'
 import type { ConsoleToolRegistry, ConsoleToolRunContext } from '../src/context-types.ts'
 import type { ConsoleView } from '../src/config-shared.ts'
-import { assertObjectJsonSchema, assertSupportedJsonSchema } from '@deepseek-ai/dsh-tools'
+import {
+  assertObjectJsonSchema,
+  assertSupportedJsonSchema,
+  validateJsonSchemaValue,
+} from '@deepseek-ai/dsh-tools'
+import type { ObjectJsonSchema } from '@deepseek-ai/dsh-tools'
 
 /** A minimal tool definition as the fake registry sees it. */
 interface FrozenTool {
   name: string
   description: string
   parameters: Record<string, unknown>
-  output: { schema: unknown, render: (args: unknown, value: unknown) => { type: string, text: string }[] }
+  // `schema` is typed, not `unknown`, because the returned VALUE is validated
+  // against it: the validator takes a `JsonSchemaNode`, and every tool's output
+  // is object-rooted by construction (`outputSchema`).
+  output: {
+    schema: ObjectJsonSchema
+    render: (args: unknown, value: unknown) => { type: string, text: string }[]
+  }
   execute: (args: unknown, exec: ConsoleToolRunContext) => Promise<unknown>
 }
 
 /**
- * A registry stub that validates every definition the way the model sees it.
+ * Assert a returned value against the tool's own declared `output.schema`.
  *
- * The validation is the point, and it must cover BOTH schemas:
+ * This is the half the fake did not check, and the miss was expensive:
+ * `console_connect` and `console_describe` grew `reused` / `openedBy` in their
+ * bodies while their schemas stayed as they were, so `register()` accepted the
+ * definition, the suite stayed green, and every real call failed at runtime with
+ * `"value.reused" is not a declared property` -- a connect that HAD succeeded,
+ * reported to the model as an error.
+ *
+ * The check runs the runtime's OWN validator rather than a hand-written one, so
+ * the enforced subset cannot drift from what the harness enforces.
+ *
+ * @param tool - the definition whose contract is being checked.
+ * @param value - the canonical value `execute` produced.
+ * @throws {Error} naming the tool and every violation.
+ */
+function assertOutputContract(tool: FrozenTool, value: unknown): void {
+  const violations = validateJsonSchemaValue(tool.output.schema, value, 'value')
+  if (violations.length > 0) {
+    throw new Error(
+      `${tool.name} returned a value its own output.schema rejects: ${violations.join('; ')}`,
+    )
+  }
+}
+
+/**
+ * A registry stub that validates every definition the way the model sees it,
+ * and every RETURNED VALUE the way the runtime does.
+ *
+ * The validation is the point, and it must cover all three:
  *
  * - `output.schema`, which `register()` checks. An earlier fake read only
  *   `definition.name`, so all seven tools passed here while the real registry
@@ -38,11 +76,20 @@ interface FrozenTool {
  *   rejects the entire tool list -- "got 'type: null'" -- and no conversation can
  *   start at all. Nothing in the harness catches that before the request leaves,
  *   so this fake is the only place it can be caught.
+ * - the VALUE an execution returns against `output.schema`. Neither of the two
+ *   checks above looks at a value, and the schema's `additionalProperties:
+ *   false` makes an undeclared field fatal, so a body may not gain one the
+ *   schema did not. `execute` is wrapped rather than the call sites being
+ *   changed, so no test can opt out of this by calling the tool its own way.
  */
-function fakeRegistry(): ConsoleToolRegistry & { tools: Map<string, FrozenTool> } {
+function fakeRegistry(): ConsoleToolRegistry & { tools: Map<string, FrozenTool>, validated: Set<string> } {
   const tools = new Map<string, FrozenTool>()
+  // Which tools have had at least one value checked. A tool no test ever calls
+  // is unchecked by construction, which is how `console_clear` went unnoticed.
+  const validated = new Set<string>()
   return {
     tools,
+    validated,
     register(tool) {
       const frozen = tool as FrozenTool
       // What the runtime enforces at registration...
@@ -50,6 +97,13 @@ function fakeRegistry(): ConsoleToolRegistry & { tools: Map<string, FrozenTool> 
       // ...and what the PROVIDER enforces on the way to the model, which the
       // runtime does not check at all.
       assertObjectJsonSchema(frozen.parameters)
+      const execute = frozen.execute
+      frozen.execute = async (args, exec) => {
+        const value = await execute(args, exec)
+        assertOutputContract(frozen, value)
+        validated.add(frozen.name)
+        return value
+      }
       tools.set(frozen.name, frozen)
       return () => tools.delete(frozen.name)
     },
@@ -477,6 +531,47 @@ describe('console tool registration', () => {
   })
 })
 
+describe('console tool output contracts', () => {
+  it('checks a returned value against its own output.schema for EVERY tool', async () => {
+    // The fake registry validates each value as it is returned (see
+    // `assertOutputContract`), so what this test adds is coverage of the CHECK,
+    // not of the schema: the assertion is over the set of tools that actually had
+    // a value validated, never over the set that merely exists. `console_clear`
+    // was registered for several rounds without a single call from any test, so
+    // its contract had not been looked at even once -- a tool no test calls is
+    // exactly the tool whose schema drifts unnoticed.
+    const scene1 = await scene()
+    try {
+      const opened = await callTool(scene1, 'console_connect', { viewId: 'v-known' }) as { consoleId: string }
+      await callTool(scene1, 'console_list', {})
+      await callTool(scene1, 'console_describe', { consoleId: opened.consoleId })
+      await callTool(scene1, 'console_send', { consoleId: opened.consoleId, text: 'show version' })
+      await callTool(scene1, 'console_wait_for', {
+        consoleId: opened.consoleId,
+        for: 'pattern',
+        pattern: 'answer:show version',
+        timeoutMs: 2000,
+      })
+      await callTool(scene1, 'console_read', { consoleId: opened.consoleId, after: 0 })
+      await callTool(scene1, 'console_wake', { consoleId: opened.consoleId })
+      await callTool(scene1, 'console_clear', { consoleId: opened.consoleId })
+      await callTool(scene1, 'console_close', { consoleId: opened.consoleId })
+
+      const created = await callTool(scene1, 'console_upsert_view', {
+        name: 'SW9',
+        host: '127.0.0.1',
+        port: 10015,
+      }) as { viewId: string }
+      await callTool(scene1, 'console_list_views', {})
+      await callTool(scene1, 'console_remove_view', { viewId: created.viewId })
+
+      expect([...scene1.registry.validated].sort()).toEqual([...CONSOLE_TOOL_NAMES].sort())
+    } finally {
+      scene1.dispose()
+    }
+  })
+})
+
 describe('console_connect / console_list / console_describe', () => {
   it('connects to a stored view and reports where it landed', async () => {
     const scene1 = await scene()
@@ -511,6 +606,31 @@ describe('console_connect / console_list / console_describe', () => {
     }
     expect(theirs.consoles).toHaveLength(1)
     expect(theirs.consoles[0]?.openedBy).toBe('session-a')
+  })
+
+  it('reports an ATTACH to a console another session already has open', async () => {
+    // The reported failure, pinned end to end: the second connect SUCCEEDED and
+    // attached, and returned `reused` / `openedBy` -- two fields the declared
+    // `output.schema` did not carry. With `additionalProperties: false` the
+    // harness rejected the value, so the model was told that a connect which had
+    // in fact worked had errored.
+    const scene1 = await scene()
+    const first = await callTool(scene1, 'console_connect', { viewId: 'v-known' }) as { consoleId: string }
+    const second = await callTool(
+      scene1, 'console_connect', { viewId: 'v-known' }, execFor('session-b'),
+    ) as { consoleId: string, reused: boolean, openedBy: string }
+    expect(second.reused).toBe(true)
+    expect(second.openedBy).toBe('session-a')
+    // Attaching means the SAME device link, not a second one: a second TCP
+    // connection to one console port makes the device tear the first one down.
+    expect(second.consoleId).toBe(first.consoleId)
+
+    // The rendered text is what the model reads, so the sharing has to be said
+    // there too -- closing someone else's console is the destructive next move.
+    const tool = scene1.registry.tools.get('console_connect')
+    const rendered = tool?.output.render({}, second).map(block => block.text).join('\n') ?? ''
+    expect(rendered).toContain('ATTACHED')
+    expect(rendered).toContain('session-a')
   })
 
   it('connects to an explicit endpoint when no view is named', async () => {

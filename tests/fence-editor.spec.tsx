@@ -207,13 +207,15 @@ describe('the fence rule editor', () => {
     expect(view.container.textContent).toContain('直接放行')
   })
 
-  it('warns about legacy patterns that still apply but are not in the box', async () => {
-    // The live-document case: `highRiskPatterns` is a separate setting, honoured
-    // as extra rules after these. An operator who cannot find a rule for a
-    // command that still prompts has no other way to discover why.
-    const s = scene()
+  it('scopes the box to `fenceRules` and does not surface the legacy pattern field', async () => {
+    // The legacy `highRiskPatterns` field is still honoured by the HOST (pinned
+    // in `tests/guard.spec.ts`), but it is not what this box edits, so the panel
+    // shows the rule list and nothing else.
+    //
+    // Two facts worth pinning: nothing is invented to stand in for the legacy
+    // list, and a host that reports it still renders -- reading a field the panel
+    // does not edit must not take the settings popup down.
     const hub = {
-      ...s.hub,
       settings: async () => ({
         revision: 1,
         defaults: {
@@ -222,12 +224,21 @@ describe('the fence rule editor', () => {
           fenceRules: [],
         },
       }),
+      updateSettings: async () => ({ revision: 2, defaults: { approvalMode: 'high-risk' } }),
     } as unknown as ConsoleHub
     const view = render(<FenceRulesEditor hub={hub} sessionId="session-a" />)
+    // Wait on the save button becoming ENABLED: it is gated on `loaded`, so this
+    // is the signal that the host read finished. Asserting the empty box alone
+    // would pass before the load ever ran.
     await waitFor(() => {
-      expect(view.getByText(/遗留/)).toBeTruthy()
+      expect(saveButton(view.container).disabled).toBe(false)
     })
-    expect(view.getByText(/config\|conf\|configure/)).toBeTruthy()
+    expect(box(view.container).value).toBe('')
+    // The fallback is still named, so an empty box never implies "nothing is
+    // enforced" -- the one thing the panel must not leave ambiguous.
+    expect(view.container.textContent).toContain('未命中任何规则时')
+    // And the legacy pattern is not rendered as though it were an editable rule.
+    expect(view.container.textContent).not.toContain('config|conf|configure')
   })
 
   it('does not offer to save when the host reports no rules at all', async () => {

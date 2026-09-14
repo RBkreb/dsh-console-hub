@@ -627,11 +627,19 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
         host: { type: 'string' },
         port: { type: 'number' },
         secure: { type: 'boolean' },
+        // Whether this call ATTACHED to a console that was already open, and the
+        // session that opened it. Both are declared because the body always
+        // returns them: `output.schema` is enforced with
+        // `additionalProperties: false`, so a field the body adds without the
+        // schema gains is not a cosmetic omission -- it makes EVERY successful
+        // call fail with `"value.reused" is not a declared property`.
+        reused: { type: 'boolean' },
+        openedBy: { type: 'string' },
         banner: { type: 'string' },
         prompt: { type: 'string' },
         lastErrorCode: { type: 'string' },
         lastErrorMessage: { type: 'string' },
-      }, ['consoleId', 'state', 'label', 'host', 'port', 'secure', 'banner']),
+      }, ['consoleId', 'state', 'label', 'host', 'port', 'secure', 'reused', 'openedBy', 'banner']),
       render: (_args: unknown, value: unknown) => {
         const result = value as {
           consoleId: string
@@ -641,17 +649,28 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
           port: number
           banner: string
           prompt?: string
+          reused?: boolean
+          openedBy?: string
           lastErrorCode?: string
         }
         if (result.state === 'open') {
           const prompt = result.prompt === undefined ? '' : `, prompt ${handle(result.prompt)}`
           const banner = result.banner === '' ? '' : `\n--- connect output ---\n${result.banner}`
+          // The rendered text is the channel the model actually reads, and the
+          // attach case is the one where the obvious next move is destructive:
+          // closing a console it did not open pulls the device link out from
+          // under whoever is using it. Saying so here, not only in the canonical
+          // value, is what makes `reused` do any work.
+          const attached = result.reused === true
+            ? ` This ATTACHED to the console already open on this device (opened by session `
+              + `${result.openedBy ?? 'unknown'}); it is SHARED, so do not close it to tidy up.`
+            : ''
           // The handle is quoted and labelled, and no separator follows it: a
           // bare trailing handle invites copying the sentence's punctuation into
           // the id, which is exactly what happened against a real device.
           return text(
             `Connected to "${result.label}" (${result.host}:${String(result.port)}). `
-            + `Handle ${handle(result.consoleId)}${prompt}.${banner}`,
+            + `Handle ${handle(result.consoleId)}${prompt}.${attached}${banner}`,
           )
         }
         return text(
@@ -1090,6 +1109,9 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
         port: { type: 'number' },
         kind: { type: 'string' },
         state: { type: 'string' },
+        // Provenance for a shared pool. Declared because the body always returns
+        // it: an undeclared field is a hard failure, not a dropped extra.
+        openedBy: { type: 'string' },
         encoding: { type: 'string' },
         idleMs: { type: 'number' },
         bytesReceived: { type: 'number' },
@@ -1108,7 +1130,7 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
           }, ['at', 'actor', 'action', 'detail']),
         },
       }, [
-        'consoleId', 'label', 'host', 'port', 'kind', 'state', 'encoding', 'idleMs',
+        'consoleId', 'label', 'host', 'port', 'kind', 'state', 'openedBy', 'encoding', 'idleMs',
         'bytesReceived', 'bytesWritten', 'pagingActive', 'pagesConsumed', 'audit',
       ]),
       render: (_args: unknown, value: unknown) => {
@@ -1119,6 +1141,7 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
           bytesReceived: number
           bytesWritten: number
           prompt?: string
+          openedBy?: string
           pagesConsumed: number
           audit: { at: string, actor: string, action: string, detail: string }[]
         }
@@ -1126,6 +1149,10 @@ export function registerConsoleTools(deps: ConsoleToolDeps): () => void {
           + `${String(result.bytesReceived)} bytes in / ${String(result.bytesWritten)} out, `
           + `${String(result.pagesConsumed)} pages consumed`
           + `${result.prompt === undefined ? '' : `, prompt ${result.prompt}`}`
+          // The pool is shared, so `console_describe` -- the tool whose whole job
+          // is "what is the situation on this console" -- would be misleading if
+          // it left out who opened the device link.
+          + `${result.openedBy === undefined ? '' : `, opened by ${result.openedBy} (shared pool)`}`
         const trail = result.audit.slice(-10).map(entry => `  ${entry.at} ${entry.actor} ${entry.action}: ${entry.detail}`)
         return text([head, ...trail].join('\n'))
       },
