@@ -133,9 +133,20 @@ export interface PortManagerOptions {
   promptPattern: string
   /** Marker source for a device that half-closed an idle console. */
   dormantPattern: string
-  /** Whether a detected dormancy is answered with one bare Enter. */
+  /**
+   * Whether a detected dormancy is answered with one bare Enter.
+   *
+   * Also the master switch for the keepalive ({@link dormantProbeMs}): the panel
+   * shows one checkbox for "automate the Enters", so this off means no automatic
+   * Enter at all.
+   */
   dormantAutoWake: boolean
-  /** Idle milliseconds before a keepalive Enter; `0` disables it. */
+  /**
+   * Idle milliseconds before a keepalive Enter; `0` disables it.
+   *
+   * Subject to {@link dormantAutoWake}: a non-zero window sends nothing while
+   * that flag is off.
+   */
   dormantProbeMs: number
   /**
    * Send one bare Enter when a device says nothing on connect.
@@ -205,12 +216,33 @@ export class PortManager {
    *   re-armed when it changes.
    * - `maxConsoles`: only consulted at `connect`, so a limit lowered below the
    *   current count stops new consoles without evicting open ones.
+   * - `dormantAutoWake` / `dormantProbeMs`: PUSHED into every open session, which
+   *   is the one case that is neither "next connect" nor "read live". These two
+   *   are the operator's dormancy policy, edited from controls that sit right
+   *   next to the open consoles, and freezing them meant the panel showed the
+   *   new value while the device kept receiving Enters on the old schedule --
+   *   the reported "取消勾选还是会继续空闲保活 / 改成 10s 还是 120s 延时". A
+   *   connection's timeouts and patterns genuinely must not change under a
+   *   console in use; a keepalive window must, or the switch does nothing.
    *
    * @param next - the policy to adopt.
    */
   updateOptions(next: PortManagerOptions): void {
     const sweepChanged = next.idleSweepMs !== this.options.idleSweepMs
+    const dormancyChanged = next.dormantProbeMs !== this.options.dormantProbeMs
+      || next.dormantAutoWake !== this.options.dormantAutoWake
     this.options = next
+    if (dormancyChanged) {
+      // Pushed, not merely stored: an open session has no other way to learn
+      // that the operator moved the control. Nothing is written to the device --
+      // this re-arms a timer and re-reads a flag.
+      for (const tracked of this.consoles.values()) {
+        tracked.session.adoptDormancyPolicy({
+          dormantProbeMs: next.dormantProbeMs,
+          dormantAutoWake: next.dormantAutoWake,
+        })
+      }
+    }
     if (sweepChanged && this.reaper !== undefined) {
       // Re-arm so the new cadence takes effect; `startReaper` is idempotent, so
       // clearing first is what makes it start again.

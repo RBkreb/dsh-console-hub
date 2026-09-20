@@ -1065,4 +1065,116 @@ describe('ConsoleSession dormancy', () => {
     await wait(80)
     expect(server.received.join('')).toBe('')
   })
+
+  /**
+   * Adopting a dormancy-policy change on a session that is ALREADY open.
+   *
+   * The reported defect: the panel's 保活 control sits next to the open consoles,
+   * so an operator changes it while one is connected -- and nothing happened.
+   * Unchecking it (or lowering 120s to 10s) left the console probing on the value
+   * it was opened with, because every session froze the whole options object at
+   * construction. `adoptDormancyPolicy` is the seam that lets the manager push
+   * the change in; these tests are is own statement of what it must do.
+   *
+   * The keepalive window and the auto-wake flag are the ONLY two options that
+   * follow a live console on purpose. The connection's timeouts, encoding and
+   * patterns stay frozen, because changing those mid-session would re-interpret
+   * a console in use -- see the manager's `updateOptions`.
+   */
+  describe('adopting a dormancy policy on an open session', () => {
+    it('STOPS probing the moment the keepalive is disabled', async () => {
+      // The "取消勾选还是会继续空闲保活" half of the report. The device is silent,
+      // so every received byte is a probe and nothing else.
+      const server = await startFakeConsole({ greeting: '<DUT1>' })
+      const session = track(sessionFor(server, { dormantAutoWake: true, dormantProbeMs: 60 }), server)
+      await session.open()
+      await until(() => session.status().dormancy.keepalivesSent >= 1, 2500)
+
+      session.adoptDormancyPolicy({ dormantProbeMs: 0, dormantAutoWake: true })
+      const before = session.status().dormancy.keepalivesSent
+      // Several original probe periods: without the re-arm the old timer would
+      // keep firing ~5 more times here.
+      await wait(300)
+      expect(session.status().dormancy.keepalivesSent).toBe(before)
+      expect(server.received.join('')).toBe('\r'.repeat(before))
+    })
+
+    it('starts probing when a DISABLED console is given a window', async () => {
+      // The other direction: arming from `0` has to take effect too, or the
+      // control becomes a one-way switch that can only ever be turned off.
+      const server = await startFakeConsole({ greeting: '<DUT1>' })
+      const session = track(sessionFor(server, { dormantAutoWake: true, dormantProbeMs: 0 }), server)
+      await session.open()
+      await wait(80)
+      expect(session.status().dormancy.keepalivesSent).toBe(0)
+
+      session.adoptDormancyPolicy({ dormantProbeMs: 70, dormantAutoWake: true })
+      await until(() => session.status().dormancy.keepalivesSent >= 1, 2500)
+    })
+
+    it('shortens a long interval, which is the "120s stays 120s" half of the report', async () => {
+      // A window far longer than the test: if the change were ignored, no probe
+      // could arrive inside the budget, so this fails rather than flaking.
+      const server = await startFakeConsole({ greeting: '<DUT1>' })
+      const session = track(sessionFor(server, { dormantAutoWake: true, dormantProbeMs: 30_000 }), server)
+      await session.open()
+      await wait(80)
+      expect(session.status().dormancy.keepalivesSent).toBe(0)
+
+      session.adoptDormancyPolicy({ dormantProbeMs: 60, dormantAutoWake: true })
+      await until(() => session.status().dormancy.keepalivesSent >= 1, 2500)
+    })
+
+    it('stops answering a half-close when auto-wake is turned off', async () => {
+      // The sibling checkbox. Detection is not the thing being switched off --
+      // the console must still be REPORTED dormant, so a caller can wake it by
+      // hand; only the automatic Enter stops.
+      const server = await startFakeConsole({ greeting: '<DUT1>', onBareEnter: () => '\r\n<DUT1>' })
+      const session = track(sessionFor(server, { dormantAutoWake: true, dormantProbeMs: 0 }), server)
+      await session.open()
+      await until(() => session.status().prompt !== null)
+
+      session.adoptDormancyPolicy({ dormantProbeMs: 0, dormantAutoWake: false })
+      const writesBefore = server.received.length
+      server.push(MARKER)
+
+      await until(() => session.status().dormancy.dormant)
+      await wait(150)
+      // The marker was seen and reported, and nothing was sent to hardware.
+      expect(session.status().dormancy.marker).toContain('Please press ENTER')
+      expect(server.received.length).toBe(writesBefore)
+      expect(session.status().dormancy.wakesSent).toBe(0)
+    })
+
+    it('stops the KEEPALIVE too when auto-wake is turned off', async () => {
+      // The panel offers ONE switch for "automate the Enters": its label is
+      // 空闲休眠自动唤醒 and its tooltip describes both the marker answer and the
+      // probe under a single "开启后". So unchecking it has to silence the
+      // keepalive as well -- otherwise the box says "off" while the device keeps
+      // receiving a bare Enter on a timer, which is the reported "取消勾选还是
+      // 会继续空闲保活".
+      const server = await startFakeConsole({ greeting: '<DUT1>' })
+      const session = track(sessionFor(server, { dormantAutoWake: true, dormantProbeMs: 60 }), server)
+      await session.open()
+      await until(() => session.status().dormancy.keepalivesSent >= 1, 2500)
+
+      session.adoptDormancyPolicy({ dormantProbeMs: 60, dormantAutoWake: false })
+      const before = session.status().dormancy.keepalivesSent
+      await wait(300)
+      expect(session.status().dormancy.keepalivesSent).toBe(before)
+    })
+
+    it('resumes the keepalive on the SAME window when auto-wake is re-checked', async () => {
+      // The window is preserved rather than zeroed, so re-checking resumes on
+      // the value the operator already chose instead of demanding they retype it.
+      const server = await startFakeConsole({ greeting: '<DUT1>' })
+      const session = track(sessionFor(server, { dormantAutoWake: false, dormantProbeMs: 70 }), server)
+      await session.open()
+      await wait(120)
+      expect(session.status().dormancy.keepalivesSent).toBe(0)
+
+      session.adoptDormancyPolicy({ dormantProbeMs: 70, dormantAutoWake: true })
+      await until(() => session.status().dormancy.keepalivesSent >= 1, 2500)
+    })
+  })
 })

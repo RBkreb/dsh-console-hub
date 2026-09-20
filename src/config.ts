@@ -118,7 +118,9 @@ export const ConsoleHubSettingsSchema: z<ConsoleHubSettings> = z.object({
   dormantPattern: z.string().default(DEFAULT_CONSOLE_HUB_SETTINGS.dormantPattern),
   dormantAutoWake: z.boolean().default(true),
   // 0 disables the keepalive; the minimum is one second so a mis-set value
-  // cannot turn the probe into a keystroke flood on the device.
+  // cannot turn the probe into a keystroke flood on the device. A non-zero value
+  // still sends nothing while `dormantAutoWake` is off -- the panel shows that
+  // flag as the master switch for every automatic Enter.
   dormantProbeMs: z.number().step(1).min(0).max(86_400_000).default(120_000),
   // ON by default: without it a silent console eats the caller's first command
   // as the wake keystroke, which reads as a broken console rather than a

@@ -273,6 +273,9 @@ export interface ConsoleSessionOptions {
    * On by default, because the marker IS a request for a keypress: a console
    * that prints it and receives nothing stays silent forever, and every later
    * read is empty.
+   *
+   * It is also the master switch for the keepalive: the panel presents this as
+   * one "automate the Enters" box, so `false` stops {@link dormantProbeMs} too.
    */
   dormantAutoWake: boolean
   /**
@@ -283,6 +286,11 @@ export interface ConsoleSessionOptions {
    * the device never half-closes in the first place and keeps printing its
    * events. Detecting the half-close afterwards is strictly worse — the device
    * has already stopped printing by then.
+   *
+   * Gated by {@link dormantAutoWake}, which the panel shows as the single
+   * "automate the Enters" switch: a non-zero window here sends nothing while
+   * that flag is off. The window itself is preserved, so re-checking the box
+   * resumes on the interval the operator already chose.
    */
   dormantProbeMs: number
   scrollbackLimitBytes: number
@@ -711,12 +719,17 @@ export class ConsoleSession {
    *
    * A keepalive deliberately does not restart the countdown from itself: it
    * checks the clock and re-arms from the last real input.
+   *
+   * The `dormantAutoWake` flag gates it together with the marker answer: the
+   * panel offers ONE switch for "automate the Enters", so unchecking it must
+   * silence the probe as well as the recovery. The window is kept rather than
+   * zeroed, so re-checking resumes on the interval already chosen.
    */
   private armKeepalive(): void {
     if (this.keepaliveTimer !== undefined) clearTimeout(this.keepaliveTimer)
     this.keepaliveTimer = undefined
     const probeMs = this.options.dormantProbeMs
-    if (probeMs <= 0 || this.phase !== 'open') return
+    if (probeMs <= 0 || this.options.dormantAutoWake !== true || this.phase !== 'open') return
     this.keepaliveTimer = setTimeout(() => {
       this.keepaliveTimer = undefined
       if (this.phase !== 'open') return
@@ -736,6 +749,47 @@ export class ConsoleSession {
   /** Whether the device is currently believed dormant. */
   isDormant(): boolean {
     return this.dormancy.dormant
+  }
+
+  /**
+   * Adopt a changed dormancy policy on a session that is ALREADY OPEN.
+   *
+   * This is the one part of the session's options that is deliberately NOT
+   * frozen at construction, and the reason is who owns the decision. The
+   * timeouts, encodings and patterns describe the CONNECTION, so changing one
+   * mid-session would re-interpret a console that is in use. `dormantAutoWake`
+   * and `dormantProbeMs` describe a POLICY THE OPERATOR IS EDITING, and the two
+   * controls that carry them sit in the panel next to the consoles they govern:
+   *
+   * - Turning the keepalive off (or shortening it) has to stop the Enters going
+   *   to the hardware. Leaving it frozen meant the panel showed the new value
+   *   while the device kept receiving probes on the old schedule -- reported as
+   *   "取消勾选还是会继续空闲保活" and "改成 10s 还是 120s 延时".
+   * - Turning auto-wake off has to stop the session answering a half-close. It
+   *   also stops the KEEPALIVE, because the panel presents this one switch as
+   *   "automate the Enters for me": the box is labelled 空闲休眠自动唤醒 and its
+   *   tooltip describes both the marker answer and the probe under a single
+   *   "开启后". Unchecking it while probes kept going out was the other half of
+   *   the same report, so the flag now gates every automatic Enter, and the
+   *   seconds value is PRESERVED rather than zeroed -- re-checking resumes the
+   *   keepalive on the window the operator already chose.
+   *
+   * Nothing is sent to the device here, and no state is invented: `dormantAutoWake`
+   * is read at the moment a marker arrives, so mutating the option is the whole
+   * of that half, and the keepalive is simply re-armed from the new window.
+   * Re-arming DISARMS first, which is what makes `0` take effect at once.
+   *
+   * @param policy - the dormancy fields to adopt.
+   */
+  adoptDormancyPolicy(policy: { dormantProbeMs: number, dormantAutoWake: boolean }): void {
+    const timerChanged = policy.dormantProbeMs !== this.options.dormantProbeMs
+      || policy.dormantAutoWake !== this.options.dormantAutoWake
+    this.options.dormantProbeMs = policy.dormantProbeMs
+    this.options.dormantAutoWake = policy.dormantAutoWake
+    // The flag gates the timer as well as the marker answer, so a change to
+    // EITHER field re-arms: re-checking the box must resume a keepalive that
+    // unchecking it stopped.
+    if (timerChanged) this.armKeepalive()
   }
 
   /** Debounce the pager decision so a partly-rendered pager is not answered twice. */

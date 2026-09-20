@@ -857,6 +857,34 @@ describe('the engine settings controls', () => {
     expect((view.getByLabelText('空闲休眠自动唤醒') as HTMLInputElement).checked).toBe(false)
   })
 
+  it('says the keepalive is stopped while the master switch is off, and keeps its name', async () => {
+    // The two settings are ONE checkbox in the panel: unchecking 空闲休眠自动唤醒
+    // stops every automatic Enter, keepalive included. The seconds box keeps
+    // displaying its stored value though -- because that value is PRESERVED and
+    // resumes the keepalive when the box is re-checked -- so the pairing needs a
+    // note or it reads as "the keepalive is still 120s", which is precisely the
+    // confusion that produced the bug report.
+    const scene = settingsHub({ dormantAutoWake: true, dormantProbeMs: 120_000 })
+    const view = renderView(scene.hub)
+    await waitFor(() => {
+      expect(view.getByLabelText('空闲休眠自动唤醒')).toBeTruthy()
+    })
+    // Nothing is claimed while the switch is on.
+    expect(view.container.querySelector('[data-console-hub-keepalive-note]')).toBeNull()
+
+    fireEvent.click(view.getByLabelText('空闲休眠自动唤醒'))
+    await waitFor(() => {
+      expect((view.getByLabelText('空闲休眠自动唤醒') as HTMLInputElement).checked).toBe(false)
+    })
+    // The note appears, and the seconds box still shows its retained value.
+    expect(view.container.querySelector('[data-console-hub-keepalive-note]')).not.toBeNull()
+    expect(view.getByDisplayValue('120')).toBeTruthy()
+    // And the checkbox is STILL found by its own name: the note must live
+    // outside the `<label>`, because text inside one becomes part of the
+    // control's accessible name.
+    expect(view.getByLabelText('空闲休眠自动唤醒')).toBeTruthy()
+  })
+
   it('edits the keepalive window in SECONDS and writes milliseconds', async () => {
     // The document field is a millisecond count, but an operator thinks in
     // seconds. Converting at the boundary is what keeps the control honest:

@@ -245,3 +245,178 @@ describe('ManagerHolder', () => {
     expect(holder.get().openCount()).toBe(0)
   })
 })
+
+/**
+ * The dormancy policy as a LIVE setting.
+ *
+ * These are the two exceptions to "a live console keeps what it was opened
+ * with", and they exist because of what the fields MEAN rather than for
+ * convenience. `readTimeoutMs` and the patterns describe the connection, so a
+ * change mid-session would re-interpret a console in use. `dormantAutoWake` and
+ * `dormantProbeMs` are the operator's dormancy policy, edited from controls that
+ * sit beside the open consoles -- so freezing them made the panel show a new
+ * value while the device kept receiving Enters on the old schedule. Reported as
+ * "取消勾选还是会继续空闲保活" and "默认 120s，改成 10s 发现还是 120s".
+ *
+ * Driven through `ManagerHolder.reconfigure`, which is the path every settings
+ * write takes, rather than by calling `updateOptions` directly: the defect was a
+ * policy that did not arrive, so the test has to travel the same route the user's
+ * edit does.
+ */
+describe('the dormancy policy reaches an OPEN console', () => {
+  /** A device that greets and answers a bare Enter, counting what it received. */
+  interface ProbingDevice extends Device {
+    /** Everything the device received, decoded. */
+    received: string[]
+    /** How many bare Enters (a lone CR) arrived. */
+    bareEnters: () => number
+  }
+
+  async function startProbingDevice(): Promise<ProbingDevice> {
+    const sockets: Socket[] = []
+    const received: string[] = []
+    const server: Server = createServer((socket) => {
+      sockets.push(socket)
+      socket.on('close', () => {
+        const index = sockets.indexOf(socket)
+        if (index >= 0) sockets.splice(index, 1)
+      })
+      socket.write('<DUT1>')
+      socket.on('data', (chunk: Buffer) => {
+        const text = chunk.toString('utf8')
+        received.push(text)
+        // A bare Enter is the keepalive/keepalive-style probe, answered with a
+        // prompt. Ordinary lines are answered too, so the same device can prove a
+        // console is still USABLE after a policy edit -- which is the other half
+        // of "the change must not break the session".
+        if (text === '\r') {
+          socket.write('\r\n<DUT1>')
+          return
+        }
+        for (const line of text.split(/[\r\n]+/)) {
+          if (line === '') continue
+          socket.write(`\r\nanswer:${line}\r\n<DUT1>`)
+        }
+      })
+    })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    const address = server.address()
+    if (address === null || typeof address === 'string') throw new Error('no port')
+    return {
+      port: address.port,
+      received,
+      bareEnters: () => received.filter(entry => entry === '\r').length,
+      async close() {
+        for (const socket of sockets.splice(0)) socket.destroy()
+        await new Promise<void>(resolve => server.close(() => resolve()))
+      },
+    }
+  }
+
+  it('stops probing an open console when the keepalive is turned OFF', async () => {
+    // The exact gesture reported: the box is filled with 0 (or the switch
+    // unchecked), and the console is already connected.
+    const device = await startProbingDevice()
+    openDevices.push(device)
+    const holder = holderFor({ ...basePolicy(), dormantProbeMs: 60, dormantAutoWake: true })
+    const consoleId = await connect(holder, device)
+    await until(() => device.bareEnters() >= 1, 2500)
+
+    expect(holder.reconfigure({ ...holder.currentPolicy(), dormantProbeMs: 0 })).toBe('applied')
+    const before = device.bareEnters()
+    // Several original probe periods: a frozen timer would send ~5 more here.
+    await new Promise(resolve => setTimeout(resolve, 300))
+    expect(device.bareEnters()).toBe(before)
+    expect(holder.get().describe(consoleId)?.entry.state).toBe('open')
+  })
+
+  it('stops probing an open console when AUTO-WAKE is unchecked', async () => {
+    // The reported "取消勾选还是会继续空闲保活", taken literally. The panel shows
+    // ONE checkbox (空闲休眠自动唤醒) for every automatic Enter, so unchecking it
+    // must silence the keepalive even though the seconds box is untouched.
+    const device = await startProbingDevice()
+    openDevices.push(device)
+    const holder = holderFor({ ...basePolicy(), dormantProbeMs: 60, dormantAutoWake: true })
+    await connect(holder, device)
+    await until(() => device.bareEnters() >= 1, 2500)
+
+    holder.reconfigure({ ...holder.currentPolicy(), dormantAutoWake: false })
+    const before = device.bareEnters()
+    await new Promise(resolve => setTimeout(resolve, 300))
+    expect(device.bareEnters()).toBe(before)
+
+    // Re-checking resumes on the window that was already stored, so the operator
+    // never has to retype the seconds.
+    holder.reconfigure({ ...holder.currentPolicy(), dormantAutoWake: true })
+    await until(() => device.bareEnters() > before, 2500)
+  })
+
+  it('shortens the interval on an open console, so 120s does not stay 120s', async () => {
+    const device = await startProbingDevice()
+    openDevices.push(device)
+    // 30s is far beyond the test budget: an ignored change sends nothing at all.
+    const holder = holderFor({ ...basePolicy(), dormantProbeMs: 30_000, dormantAutoWake: true })
+    await connect(holder, device)
+    await new Promise(resolve => setTimeout(resolve, 80))
+    expect(device.bareEnters()).toBe(0)
+
+    holder.reconfigure({ ...holder.currentPolicy(), dormantProbeMs: 60 })
+    await until(() => device.bareEnters() >= 1, 2500)
+  })
+
+  it('arms a console that was opened with the keepalive disabled', async () => {
+    // The reverse direction, which a one-way switch would fail: the console is
+    // open under `0`, and the user gives it a window.
+    const device = await startProbingDevice()
+    openDevices.push(device)
+    const holder = holderFor({ ...basePolicy(), dormantProbeMs: 0, dormantAutoWake: true })
+    await connect(holder, device)
+    await new Promise(resolve => setTimeout(resolve, 100))
+    expect(device.bareEnters()).toBe(0)
+
+    holder.reconfigure({ ...holder.currentPolicy(), dormantProbeMs: 60 })
+    await until(() => device.bareEnters() >= 1, 2500)
+  })
+
+  it('leaves the connection options frozen while the dormancy policy moves', async () => {
+    // The property the push must NOT break, asserted on something observable.
+    // `readTimeoutMs` is the session-wide default wait budget, so it is the one
+    // connection option whose value a test can read back: a `waitFor` with no
+    // explicit `timeoutMs` must spend the budget the console was OPENED with.
+    //
+    // Without the push being narrowly scoped, a forwarded policy would shorten
+    // this console's default wait from 600ms to 20ms -- breaking every caller
+    // holding the console, which is exactly why a connection's options are not
+    // live settings.
+    const device = await startProbingDevice()
+    openDevices.push(device)
+    const holder = holderFor({ ...basePolicy(), readTimeoutMs: 600, dormantProbeMs: 0 })
+    const consoleId = await connect(holder, device)
+
+    holder.reconfigure({ ...holder.currentPolicy(), readTimeoutMs: 20, dormantProbeMs: 60 })
+    const waited = await holder.get().waitFor(consoleId, {
+      for: 'pattern',
+      pattern: 'NEVER-APPEARS',
+    })
+    expect(waited.matched).toBe(false)
+    // The frozen budget, not the 20ms the policy now declares.
+    expect(waited.elapsedMs).toBeGreaterThan(300)
+    // And the console is still open and genuinely usable after both edits.
+    expect(holder.get().describe(consoleId)?.entry.state).toBe('open')
+    await holder.get().send(consoleId, 'show version')
+    await until(() => holder.get().read(consoleId, {}).text.includes('answer:show version'))
+  })
+
+  it('reports an unrelated policy edit as unchanged for the dormancy fields', async () => {
+    // A guard on the trigger: an edit that does not touch the dormancy policy
+    // must not push anything, so a session's own timer is only re-armed by the
+    // control that owns it.
+    const device = await startProbingDevice()
+    openDevices.push(device)
+    const holder = holderFor({ ...basePolicy(), dormantProbeMs: 0 })
+    await connect(holder, device)
+    holder.reconfigure({ ...holder.currentPolicy(), maxConsoles: 9 })
+    await new Promise(resolve => setTimeout(resolve, 80))
+    expect(device.bareEnters()).toBe(0)
+  })
+})

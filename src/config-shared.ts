@@ -314,6 +314,13 @@ export interface ConsoleHubSettings {
    * Answer that marker with one bare Enter, which is what the device is asking
    * for. On by default because the alternative is a console that silently prints
    * nothing: the marker exists precisely to request a keystroke.
+   *
+   * This is also the MASTER SWITCH for every automatic Enter: the panel shows it
+   * as one checkbox (空闲休眠自动唤醒) whose tooltip covers both the marker answer
+   * and the keepalive, so turning it off silences {@link dormantProbeMs} as well.
+   * Keeping the two independent made the box say "off" while probes kept going
+   * out -- reported as "取消勾选还是会继续空闲保活". The probe WINDOW is
+   * preserved while this is off, so re-checking resumes the chosen interval.
    */
   dormantAutoWake: boolean
   /**
@@ -330,6 +337,10 @@ export interface ConsoleHubSettings {
    * exactly 300s of silence (`scripts/probe-dormant.mjs`), and any real traffic
    * resets that timer. The default sits well under that so the probe always wins
    * the race; a deployment whose devices idle out faster lowers it.
+   *
+   * Gated by {@link dormantAutoWake}, which the panel presents as the single
+   * "automate the Enters" switch: a non-zero window here does nothing while that
+   * flag is off.
    */
   dormantProbeMs: number
   /**

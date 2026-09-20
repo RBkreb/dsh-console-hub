@@ -616,23 +616,44 @@ export function ConsoleHubView(props: ConsoleHubViewProps): ReactElement {
           </label>
         )}
         {defaults !== undefined && (
-          <label
-            title="设备在长时间没有收到按键后会半关闭这条会话（打印 “Vty connection is timed out. Please press ENTER.”）并从此不再输出。开启后检测到该提示会自动补一个回车；保活则在休眠发生之前就定时补回车。"
-            style={{ marginLeft: 12, opacity: busy ? 0.6 : 1, cursor: 'pointer', fontFamily: 'var(--dsw-font-family, inherit)' }}
-          >
-            <input
-              type="checkbox"
-              checked={defaults.dormantAutoWake}
-              disabled={busy}
-              onChange={event => { void updateEngineSetting('dormantAutoWake', event.target.checked) }}
-            />
-            {' '}
-            空闲休眠自动唤醒
-          </label>
+          <>
+            <label
+              title="自动替你补回车的总开关。开启后，设备在半关闭会话时会自动补一个回车把它唤醒；同时在「保活（秒）」到点前定时补一个回车，让设备根本不进入休眠。关闭则两者都停：不再有任何自动回车发出，只能手动点「回车」或「唤醒」。"
+              style={{ marginLeft: 12, opacity: busy ? 0.6 : 1, cursor: 'pointer', fontFamily: 'var(--dsw-font-family, inherit)' }}
+            >
+              <input
+                type="checkbox"
+                checked={defaults.dormantAutoWake}
+                disabled={busy}
+                onChange={event => { void updateEngineSetting('dormantAutoWake', event.target.checked) }}
+              />
+              {' '}
+              空闲休眠自动唤醒
+            </label>
+            {!defaults.dormantAutoWake && (
+              // OUTSIDE the `<label>` on purpose. Text inside a label becomes
+              // part of the control's accessible name, so putting this hint
+              // there renamed the checkbox from 空闲休眠自动唤醒 to
+              // "空闲休眠自动唤醒（已停止自动回车）" and broke every lookup by
+              // label. It is a note about the PAIR of controls, not part of this
+              // one's name.
+              //
+              // It exists because the seconds box keeps showing its value while
+              // the master switch is off: that value is PRESERVED and resumes the
+              // keepalive when the box is re-checked, so without this note the
+              // pairing reads as "the keepalive is still 120s".
+              <span
+                style={{ opacity: 0.6, fontFamily: 'var(--dsw-font-family, inherit)' }}
+                data-console-hub-keepalive-note="off"
+              >
+                （已停止自动回车）
+              </span>
+            )}
+          </>
         )}
         {defaults !== undefined && (
           <label
-            title="设备实测在「300 秒没有收到按键」后半关闭会话（它自己发的事件不算）。小于该值时会定时补一个回车，让设备根本不会休眠；填 0 关闭保活。保活不会被计入「有人在使用」，所以遗忘的标签页仍会被回收。"
+            title="设备实测在「300 秒没有收到按键」后半关闭会话（它自己发的事件不算）。小于该值时会定时补一个回车，让设备根本不会休眠；填 0 关闭保活。保活不会被计入「有人在使用」，所以遗忘的标签页仍会被回收。需要「空闲休眠自动唤醒」处于勾选状态，本设置才生效。"
             style={{ marginLeft: 12, opacity: busy ? 0.6 : 1, fontFamily: 'var(--dsw-font-family, inherit)' }}
           >
             {' '}
